@@ -2,9 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://citizenchris100.github.io/songwriter_notebook/feels/feel.schema.json",
   "title": "Songwriter Notebook progression feel",
-  "description": "A chord-progression template: an ordered list of diatonic scale-degree indices applied to whatever key/mode the app is set to.",
+  "description": "A chord-progression template. Either DIATONIC (an ordered list of scale-degree indices voiced in the app's current major/minor mode) or CHROMATIC (an ordered list of Roman-numeral tokens, absolute relative to the tonic and free to be non-diatonic). Exactly one of `degrees` or `progression`.",
   "type": "object",
-  "required": ["id", "name", "degrees"],
+  "required": ["id", "name"],
+  "oneOf": [
+    { "required": ["degrees"], "not": { "required": ["progression"] } },
+    { "required": ["progression"], "not": { "required": ["degrees"] } }
+  ],
   "additionalProperties": false,
   "properties": {
     "$schema": {
@@ -25,7 +29,16 @@
       "type": "array",
       "minItems": 1,
       "items": { "type": "integer", "minimum": 0, "maximum": 6 },
-      "description": "Diatonic scale-degree indices (0 = I, 1 = ii, ... 6 = vii). Repeats are allowed and significant."
+      "description": "DIATONIC feel: scale-degree indices (0 = I, 1 = ii, ... 6 = vii) voiced in the app's current major/minor mode. Repeats are allowed and significant."
+    },
+    "progression": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "pattern": "^(b|#)?(VII|VI|V|IV|III|II|I|vii|vi|v|iv|iii|ii|i)(5|o|dim|\\+|aug|7|maj7|m7|sus2|sus4)?$"
+      },
+      "description": "CHROMATIC feel: Roman-numeral chord tokens relative to the tonic (e.g. \"I\",\"bVII\",\"bVI\",\"v\",\"II7\",\"#iv\",\"I5\"). Numeral case = base quality (UPPER major, lower minor); b/# alters the root chromatically; optional suffix sets chord type (5 power, o/dim diminished, +/aug augmented, 7, maj7, m7, sus2, sus4). Mode-independent and free to be non-diatonic. Repeats are allowed and significant."
     },
     "description": {
       "type": "string",
@@ -42,8 +55,8 @@
     },
     "schemaVersion": {
       "type": "integer",
-      "enum": [1],
-      "description": "Schema version this file targets. Currently 1."
+      "enum": [1, 2],
+      "description": "Schema version this file targets. 1 = diatonic (degrees); 2 = chromatic (progression tokens)."
     }
   }
 }

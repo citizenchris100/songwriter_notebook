@@ -8,11 +8,16 @@
 // (vi in major / III in minor), so we read their roots straight off the
 // already-correctly-spelled diatonic scale. Same pitches as the original in
 // every key, correct spelling in every key. Pure.
+//
+// These are diatonic reinterpretations (read off the parent scale), so they do not
+// apply to chromatic/token feels — those return no alternatives.
 import { scaleOf } from '../theory/scale.js';
 import { buildSection } from './section.js';
+import { isTokenFeel } from '../feels.js';
 
 export function alternatives(ctx) {
   const { tonic, mode, feel, modes } = ctx;
+  if (isTokenFeel(feel)) return [];
   const scale = scaleOf(tonic, mode);
   const relativeMode = modes[mode.opposingModeId];
 

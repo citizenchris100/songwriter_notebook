@@ -48,6 +48,8 @@ h1 {
   cursor: pointer; line-height: 1; min-width: 38px;
 }
 .seg button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.seg.disabled button { opacity: 0.4; cursor: not-allowed; }
+.seg.disabled button.on { opacity: 0.55; }
 .seg.acc button { min-width: 34px; font-size: 16px; }
 
 select {

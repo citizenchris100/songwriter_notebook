@@ -13,7 +13,7 @@ import { scaleOf } from './js/theory/scale.js';
 import { noteName } from './js/theory/pitch.js';
 import { MODE_BY_ID } from './js/data/modes.js';
 import { DEFAULT_STATE, validate, randomize, ROOTS, MODE_IDS } from './js/session.js';
-import { validateFeel } from './js/feels.js';
+import { validateFeel, normalizeFeel } from './js/feels.js';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const readJSON = (p) => JSON.parse(readFileSync(here(p), 'utf8'));
@@ -178,6 +178,52 @@ eq('index.json lists exactly the feel files present', BUILTIN_IDS.slice().sort()
 const sw = readFileSync(here('./sw.js'), 'utf8');
 ok('sw.js caches the manifest', sw.includes('"./feels/index.json"'));
 for (const id of BUILTIN_IDS) ok('sw.js caches feel ' + id, sw.includes(`"./feels/${id}.json"`));
+ok('sw.js caches the roman.js module', sw.includes('"./js/theory/roman.js"'));
+
+// ============================================================================
+// 9. Chromatic (Roman-numeral token) feels — non-diatonic progressions
+// ============================================================================
+// Feels are injected here (not committed as built-ins) so the engine is proven
+// without prescribing any particular content — the /songwriter-pwa-feel skill is
+// what authors real chromatic feels from analysis.
+const tfChrom = normalizeFeel({ id: 'wf-chromatic', name: 'WF Chromatic', progression: ['i', 'bVII', 'bVI', 'bVII'], schemaVersion: 2 });
+const tfPower = normalizeFeel({ id: 'wf-power', name: 'WF Power', progression: ['I5', 'bIII5', 'IV5', 'I5'], schemaVersion: 2 });
+const tfSeven = normalizeFeel({ id: 'wf-7', name: 'WF7', progression: ['I', 'V7', 'ii7', 'bII'], schemaVersion: 2 });
+const tfById = { ...feelsById, [tfChrom.id]: tfChrom, [tfPower.id]: tfPower, [tfSeven.id]: tfSeven };
+const tokenMain = (root, acc, mode, id) =>
+  deriveOutput(stateOf(root, acc, mode, id), tfById).sections.find((s) => s.role === 'main').chords.map((c) => c.name).join(' ');
+
+// Same loop is transposed correctly and spelled key-correctly in every key.
+eq('chromatic i bVII bVI bVII in A', tokenMain('A', 'natural', 'minor', 'wf-chromatic'), 'Am G F G');
+eq('chromatic same loop in C', tokenMain('C', 'natural', 'minor', 'wf-chromatic'), 'Cm B♭ A♭ B♭');
+eq('chromatic same loop in E', tokenMain('E', 'natural', 'minor', 'wf-chromatic'), 'Em D C D');
+// Mode-independent: tokens carry their own quality, so major mode gives the same chords.
+eq('chromatic mode-independent', tokenMain('A', 'natural', 'major', 'wf-chromatic'), 'Am G F G');
+
+const chromModel = deriveOutput(stateOf('A', 'natural', 'minor', 'wf-chromatic'), tfById);
+ok('chromatic flag is set', chromModel.chromatic === true);
+ok('chromatic feel yields only the main section (no alternatives)', chromModel.sections.length === 1);
+eq('chromatic keyLabel is just the root', chromModel.keyLabel, 'A');
+eq('chromatic chords-used dedups, first-seen order', chromModel.allChords.map((c) => c.name).join(' '), 'Am G F');
+eq('chromatic bVI triad notes in A', chromModel.sections[0].chords[2].notes.join(','), 'F,A,C');
+
+// Power chords are thirdless (root + fifth only) — the honest rhythm-tab shape.
+const powerModel = deriveOutput(stateOf('E', 'natural', 'minor', 'wf-power'), tfById);
+eq('power-chord names in E', powerModel.sections[0].chords.map((c) => c.name).join(' '), 'E5 G5 A5 E5');
+ok('power chords are thirdless (2 notes)', powerModel.sections[0].chords.every((c) => c.notes.length === 2));
+eq('power I5 notes in E', powerModel.sections[0].chords[0].notes.join(','), 'E,B');
+
+// Sevenths (dom vs min by case) and a borrowed bII.
+eq('sevenths + bII in C', tokenMain('C', 'natural', 'major', 'wf-7'), 'C G7 Dm7 D♭');
+eq('V7 is a dominant seventh (4 notes)', deriveOutput(stateOf('C', 'natural', 'major', 'wf-7'), tfById).sections[0].chords[1].notes.join(','), 'G,B,D,F');
+
+// Schema acceptance / rejection for the token shape.
+ok('schema accepts a token feel', validateFeel({ id: 'x', name: 'X', progression: ['I', 'bVII'], schemaVersion: 2 }).ok);
+ok('schema accepts schemaVersion 2', validateFeel({ id: 'x', name: 'X', progression: ['I'], schemaVersion: 2 }).ok);
+ok('schema rejects a malformed token', !validateFeel({ id: 'x', name: 'X', progression: ['H9'] }).ok);
+ok('schema rejects degrees AND progression together', !validateFeel({ id: 'x', name: 'X', degrees: [0], progression: ['I'] }).ok);
+ok('schema rejects neither degrees nor progression', !validateFeel({ id: 'x', name: 'X' }).ok);
+ok('schema rejects an empty progression', !validateFeel({ id: 'x', name: 'X', progression: [] }).ok);
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail ? 1 : 0);

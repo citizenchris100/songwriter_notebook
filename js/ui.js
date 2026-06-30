@@ -14,7 +14,7 @@ const h = (tag, cls, txt) => {
 const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 const label = (t) => h('span', 'lbl', t);
 
-// A segmented button group. Returns { el, set(value) }.
+// A segmented button group. Returns { el, set(value), setEnabled(on) }.
 function seg(options, onPick, extraCls) {
   const el = h('span', 'seg' + (extraCls ? ' ' + extraCls : ''));
   const btns = options.map((o) => {
@@ -24,7 +24,11 @@ function seg(options, onPick, extraCls) {
     el.appendChild(b);
     return b;
   });
-  return { el, set: (v) => btns.forEach((b) => b.classList.toggle('on', b.dataset.value === String(v))) };
+  return {
+    el,
+    set: (v) => btns.forEach((b) => b.classList.toggle('on', b.dataset.value === String(v))),
+    setEnabled: (on) => { el.classList.toggle('disabled', !on); btns.forEach((b) => { b.disabled = !on; }); },
+  };
 }
 
 const ACC_SYMBOL = Object.fromEntries(ACCIDENTALS.map((a) => [a.id, a.symbol || '♮']));
@@ -161,7 +165,8 @@ export function mountApp(root, handlers) {
     user.forEach((f) => {
       const row = h('div', 'saved');
       row.appendChild(h('span', 'nm', f.name));
-      row.appendChild(h('span', 'stuning', '[' + f.degrees.join(' ') + ']'));
+      const sig = Array.isArray(f.progression) ? f.progression.join(' ') : '[' + f.degrees.join(' ') + ']';
+      row.appendChild(h('span', 'stuning', sig));
       const del = h('button', 'btn mini danger', '✕');
       del.title = 'Delete';
       del.addEventListener('click', () => onDeleteFeel(f.id));
@@ -176,6 +181,7 @@ export function mountApp(root, handlers) {
     rootSeg.set(state.root);
     accSeg.set(state.accidental);
     modeSeg.set(state.mode);
+    modeSeg.setEnabled(!model.chromatic); // chromatic feels are mode-independent
     instSeg.set(state.instrument);
     renderOutput(out, model);
   }
@@ -203,13 +209,23 @@ function sectionBlock(title, children) {
 function renderOutput(out, model) {
   out.textContent = '';
   const info = h('div', 'info');
-  info.append(h('b', null, model.feelName), document.createTextNode(' · ' + model.keyLabel));
+  info.append(
+    h('b', null, model.feelName),
+    document.createTextNode(' · ' + model.keyLabel + (model.chromatic ? ' · chromatic feel' : '')),
+  );
   out.appendChild(info);
 
   const main = model.sections.find((s) => s.role === 'main');
-  const alts = model.sections.filter((s) => s.role !== 'main');
   out.appendChild(sectionBlock('Main Progression', [chipRow(main.chords)]));
 
+  if (model.chromatic) {
+    out.appendChild(sectionBlock('Alternatives', [h('div', 'feel-empty',
+      'A chromatic feel is fixed relative to the root, so the diatonic relative / dominant / subdominant alternatives and the major/minor switch do not apply. Transpose with the Key buttons.')]));
+    out.appendChild(sectionBlock('Chords used', [chipRow(model.allChords, 'allchords')]));
+    return;
+  }
+
+  const alts = model.sections.filter((s) => s.role !== 'main');
   const altBlocks = alts.map((s) => {
     const block = h('div', 'altblock');
     block.appendChild(h('div', 'subtitle', s.title));
@@ -227,6 +243,8 @@ function helpPanel() {
     'A feel is a chord-progression template: a sequence of scale degrees. Pick a feel and a key, and the progression is those degrees voiced as the diatonic chords of that key. Each chord shows its three notes underneath.'));
   d.appendChild(h('p', null,
     'The three alternatives are the neighbouring keys most likely to sit well with the main one: its relative, its dominant (the key a fifth up), and its subdominant (a fifth down), each running the same feel.'));
+  d.appendChild(h('p', null,
+    'Some feels are chromatic: instead of scale degrees they list Roman-numeral chords (like I, ♭VII, ♭VI) that can be non-diatonic. These are fixed relative to the root, so the Key buttons transpose them but the major/minor switch and the diatonic alternatives do not apply.'));
   d.appendChild(h('p', null,
     'Add your own feels under "Add / manage feels": paste or upload a feel JSON. Exported feels are plain JSON files you can keep or commit as built-ins. Instrument is reserved for chord diagrams in a later version.'));
   return d;
