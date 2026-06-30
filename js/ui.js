@@ -130,14 +130,13 @@ function renderOutput(out, model) {
 
   out.appendChild(sectionBlock('Main Progression', [chipRow(main.chords)]));
 
-  const altGrid = h('div', 'altgrid');
-  alts.forEach((s) => {
-    const col = h('div', 'altcol');
-    col.appendChild(h('div', 'subtitle', s.title));
-    col.appendChild(chipRow(s.chords));
-    altGrid.appendChild(col);
+  const altBlocks = alts.map((s) => {
+    const block = h('div', 'altblock');
+    block.appendChild(h('div', 'subtitle', s.title));
+    block.appendChild(chipRow(s.chords));
+    return block;
   });
-  out.appendChild(sectionBlock('Alternatives', [altGrid]));
+  out.appendChild(sectionBlock('Alternatives', altBlocks));
 
   out.appendChild(sectionBlock('All Chords in Key', [chipRow(model.allChords, 'allchords')]));
 }
