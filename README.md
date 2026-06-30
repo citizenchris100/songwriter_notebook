@@ -71,3 +71,11 @@ keys. Run it before every deploy.
 
 Audio, export, real chord diagrams (the Instrument picker is a persisted placeholder for a later
 phase), build tooling/frameworks, modes beyond major and natural minor, and seventh/extended chords.
+
+## License
+
+© 2026 citizenchris100
+
+Licensed under the **Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License (CC BY-NC-SA 4.0)**.
+
+You are free to use, study, share, and adapt this — **as long as you keep it open under the same license, give credit, and do not sell it or use it commercially.** Full terms are in [`LICENSE`](LICENSE); plain-language summary at <https://creativecommons.org/licenses/by-nc-sa/4.0/>.
