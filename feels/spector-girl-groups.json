@@ -1,0 +1,13 @@
+{
+  "$schema": "./feel.schema.json",
+  "id": "spector-girl-groups",
+  "name": "Spector Girl Groups",
+  "sections": [
+    { "label": "Main", "progression": ["I", "vi", "IV", "V"] },
+    { "label": "Bridge", "progression": ["III7", "VI7", "II7", "V7"] }
+  ],
+  "description": "The Phil Spector girl-group signature: a I-vi-IV-V doo-wop hook plus a cycle-of-fifths secondary-dominant bridge (III7-VI7-II7-V7). Distilled from Ronettes, Crystals and Darlene Love sides.",
+  "tags": ["girl-group", "doo-wop", "wall-of-sound", "secondary-dominants", "phil-spector"],
+  "source": "Ultimate Guitar chord sheets, 8-song Phil Spector girl-group aggregate",
+  "schemaVersion": 3
+}

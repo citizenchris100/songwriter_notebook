@@ -9,16 +9,20 @@ import { chordFromToken } from '../theory/roman.js';
 import { noteName } from '../theory/pitch.js';
 import { isTokenFeel } from '../feels.js';
 
+// Build a chromatic Section from a list of Roman-numeral tokens. Reused for flat
+// token feels and for each labeled block of a sectioned feel.
+export function tokenSection(role, tonic, tokens, title) {
+  const keyLabel = noteName(tonic); // chromatic feels are absolute — no mode label
+  return {
+    role,
+    keyLabel,
+    title: title != null ? title : keyLabel,
+    chords: tokens.map((t) => chordFromToken(tonic, t)), // repeats kept, in token order
+  };
+}
+
 export function buildSection(role, tonic, mode, feel) {
-  if (isTokenFeel(feel)) {
-    const keyLabel = noteName(tonic); // chromatic feels are absolute — no mode label
-    return {
-      role,
-      keyLabel,
-      title: keyLabel,
-      chords: feel.progression.map((t) => chordFromToken(tonic, t)), // repeats kept, in feel order
-    };
-  }
+  if (isTokenFeel(feel)) return tokenSection(role, tonic, feel.progression);
   const keyLabel = noteName(tonic) + ' ' + mode.name;
   const chords = diatonicChords(scaleOf(tonic, mode), mode);
   return {

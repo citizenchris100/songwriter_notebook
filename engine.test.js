@@ -94,7 +94,7 @@ for (const [label, want] of Object.entries(ALL_CHORDS)) {
 // ============================================================================
 const MAIN_C_MAJOR = {
   Alternative: 'Am F C G', Canon: 'C G Am Em F C F G', 'Cliché': 'C G Am F',
-  'Cliché 2': 'C Am Em Bdim', Creepy: 'C Am F G', 'Creepy 2': 'C Am Dm G',
+  'Cliché 2': 'C Am Em Bdim', 'Doo Wop': 'C Am F G', 'Doo Wop 2': 'C Am Dm G',
   Endless: 'C Am Dm F', Energetic: 'C Em F Am', Grungy: 'C F Em Am',
   Memories: 'C F C G', Rebellious: 'F C F G', Sad: 'C F G G',
   Simple: 'C F', 'Simple 2': 'C G', 'Twelve Bar Blues': 'C C C C F F C C G F C G',
@@ -102,7 +102,7 @@ const MAIN_C_MAJOR = {
 };
 const MAIN_A_MINOR = {
   Alternative: 'F Dm Am Em', Canon: 'Am Em F C Dm Am Dm Em', 'Cliché': 'Am Em F Dm',
-  'Cliché 2': 'Am F C G', Creepy: 'Am F Dm Em', 'Creepy 2': 'Am F Bdim Em',
+  'Cliché 2': 'Am F C G', 'Doo Wop': 'Am F Dm Em', 'Doo Wop 2': 'Am F Bdim Em',
   Endless: 'Am F Bdim Dm', Energetic: 'Am C Dm F', Grungy: 'Am Dm C F',
   Memories: 'Am Dm Am Em', Rebellious: 'Dm Am Dm Em', Sad: 'Am Dm Em Em',
   Simple: 'Am Dm', 'Simple 2': 'Am Em', 'Twelve Bar Blues': 'Am Am Am Am Dm Dm Am Am Em Dm Am Em',
@@ -224,6 +224,41 @@ ok('schema rejects a malformed token', !validateFeel({ id: 'x', name: 'X', progr
 ok('schema rejects degrees AND progression together', !validateFeel({ id: 'x', name: 'X', degrees: [0], progression: ['I'] }).ok);
 ok('schema rejects neither degrees nor progression', !validateFeel({ id: 'x', name: 'X' }).ok);
 ok('schema rejects an empty progression', !validateFeel({ id: 'x', name: 'X', progression: [] }).ok);
+
+// ============================================================================
+// 10. Sectioned (labeled-block) feels — Main / Bridge, schemaVersion 3
+// ============================================================================
+const tfSpec = normalizeFeel({
+  id: 'wf-sectioned', name: 'WF Sectioned', schemaVersion: 3,
+  sections: [
+    { label: 'Main', progression: ['I', 'vi', 'IV', 'V'] },
+    { label: 'Bridge', progression: ['III7', 'VI7', 'II7', 'V7'] },
+  ],
+});
+const sById = { ...feelsById, [tfSpec.id]: tfSpec };
+const sModel = deriveOutput(stateOf('C', 'natural', 'major', 'wf-sectioned'), sById);
+ok('sectioned feel is chromatic', sModel.chromatic === true);
+ok('sectioned feel yields one section per block, no alternatives', sModel.sections.length === 2);
+eq('sectioned section roles', sModel.sections.map((s) => s.role).join(','), 'main,section');
+eq('sectioned section titles are the labels', sModel.sections.map((s) => s.title).join(','), 'Main,Bridge');
+eq('sectioned Main in C', sModel.sections[0].chords.map((c) => c.name).join(' '), 'C Am F G');
+eq('sectioned Bridge in C (secondary dominants)', sModel.sections[1].chords.map((c) => c.name).join(' '), 'E7 A7 D7 G7');
+eq('sectioned chords-used pools both blocks, deduped', sModel.allChords.map((c) => c.name).join(' '), 'C Am F G E7 A7 D7 G7');
+// transposes as a unit, key-correct spelling
+eq('sectioned Main in E', deriveOutput(stateOf('E', 'natural', 'major', 'wf-sectioned'), sById).sections[0].chords.map((c) => c.name).join(' '), 'E C♯m A B');
+// schema acceptance / rejection for the sectioned shape
+ok('schema accepts a sectioned feel', validateFeel({ id: 'x', name: 'X', schemaVersion: 3, sections: [{ label: 'Main', progression: ['I', 'V'] }] }).ok);
+ok('schema rejects a section without a label', !validateFeel({ id: 'x', name: 'X', sections: [{ progression: ['I'] }] }).ok);
+ok('schema rejects a section with a bad token', !validateFeel({ id: 'x', name: 'X', sections: [{ label: 'M', progression: ['H9'] }] }).ok);
+ok('schema rejects an empty sections array', !validateFeel({ id: 'x', name: 'X', sections: [] }).ok);
+ok('schema rejects sections AND progression together', !validateFeel({ id: 'x', name: 'X', progression: ['I'], sections: [{ label: 'M', progression: ['I'] }] }).ok);
+ok('schema rejects a section with an unknown property', !validateFeel({ id: 'x', name: 'X', sections: [{ label: 'M', progression: ['I'], bogus: 1 }] }).ok);
+ok('schema accepts schemaVersion 3', validateFeel({ id: 'x', name: 'X', schemaVersion: 3, sections: [{ label: 'M', progression: ['I'] }] }).ok);
+
+// The renamed built-ins resolve and the new sectioned built-in validates.
+ok('doo-wop built-in present + valid', !!feelsById['doo-wop'] && validateFeel(readJSON('./feels/doo-wop.json')).ok);
+ok('spector-girl-groups built-in present + valid', !!feelsById['spector-girl-groups'] && validateFeel(readJSON('./feels/spector-girl-groups.json')).ok);
+ok('old creepy ids are gone', !feelsById['creepy'] && !feelsById['creepy2']);
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail ? 1 : 0);

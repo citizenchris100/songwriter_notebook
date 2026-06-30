@@ -13,11 +13,11 @@
 // apply to chromatic/token feels — those return no alternatives.
 import { scaleOf } from '../theory/scale.js';
 import { buildSection } from './section.js';
-import { isTokenFeel } from '../feels.js';
+import { isChromaticFeel } from '../feels.js';
 
 export function alternatives(ctx) {
   const { tonic, mode, feel, modes } = ctx;
-  if (isTokenFeel(feel)) return [];
+  if (isChromaticFeel(feel)) return [];
   const scale = scaleOf(tonic, mode);
   const relativeMode = modes[mode.opposingModeId];
 

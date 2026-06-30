@@ -165,7 +165,9 @@ export function mountApp(root, handlers) {
     user.forEach((f) => {
       const row = h('div', 'saved');
       row.appendChild(h('span', 'nm', f.name));
-      const sig = Array.isArray(f.progression) ? f.progression.join(' ') : '[' + f.degrees.join(' ') + ']';
+      const sig = Array.isArray(f.sections) ? f.sections.map((s) => s.label).join(' / ')
+        : Array.isArray(f.progression) ? f.progression.join(' ')
+          : '[' + f.degrees.join(' ') + ']';
       row.appendChild(h('span', 'stuning', sig));
       const del = h('button', 'btn mini danger', '✕');
       del.title = 'Delete';
@@ -215,16 +217,18 @@ function renderOutput(out, model) {
   );
   out.appendChild(info);
 
-  const main = model.sections.find((s) => s.role === 'main');
-  out.appendChild(sectionBlock('Main Progression', [chipRow(main.chords)]));
-
   if (model.chromatic) {
+    // One block per section: a flat feel has a single "Main Progression"; a sectioned
+    // feel renders each labeled block (Main, Bridge, …) under its own heading.
+    model.sections.forEach((s) => out.appendChild(sectionBlock(s.title, [chipRow(s.chords)])));
     out.appendChild(sectionBlock('Alternatives', [h('div', 'feel-empty',
       'A chromatic feel is fixed relative to the root, so the diatonic relative / dominant / subdominant alternatives and the major/minor switch do not apply. Transpose with the Key buttons.')]));
     out.appendChild(sectionBlock('Chords used', [chipRow(model.allChords, 'allchords')]));
     return;
   }
 
+  const main = model.sections.find((s) => s.role === 'main');
+  out.appendChild(sectionBlock('Main Progression', [chipRow(main.chords)]));
   const alts = model.sections.filter((s) => s.role !== 'main');
   const altBlocks = alts.map((s) => {
     const block = h('div', 'altblock');

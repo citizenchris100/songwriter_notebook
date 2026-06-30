@@ -35,13 +35,14 @@ function commit() {
 // Build a clean feels/<id>.json-shaped object for export.
 function toFeelFile(f) {
   const out = { '$schema': './feel.schema.json', id: f.id, name: f.name };
-  const chromatic = Array.isArray(f.progression);
-  if (chromatic) out.progression = f.progression.slice();
-  else out.degrees = f.degrees.slice();
+  let schemaVersion = 1;
+  if (Array.isArray(f.sections)) { out.sections = f.sections.map((s) => ({ label: s.label, progression: s.progression.slice() })); schemaVersion = 3; }
+  else if (Array.isArray(f.progression)) { out.progression = f.progression.slice(); schemaVersion = 2; }
+  else { out.degrees = f.degrees.slice(); }
   if (typeof f.description === 'string') out.description = f.description;
   if (Array.isArray(f.tags)) out.tags = f.tags.slice();
   if (typeof f.source === 'string') out.source = f.source;
-  out.schemaVersion = chromatic ? 2 : 1;
+  out.schemaVersion = schemaVersion;
   return out;
 }
 function download(filename, obj) {
