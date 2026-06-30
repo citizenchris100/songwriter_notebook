@@ -1,7 +1,7 @@
 // ui.js — DOM construction and rendering. The only module (besides main.js) that
-// touches the DOM. It knows nothing about how chords are computed; it renders the
-// output model from derive.js and reports control changes via callbacks.
-import { FEELS } from './data/feels.js';
+// touches the DOM. It renders the output model from derive.js, reports control
+// changes via callbacks, and hosts the Feels import/export panel. It knows nothing
+// about how chords are computed or where feels are stored.
 import { ROOTS, ACCIDENTAL_IDS, MODE_IDS, INSTRUMENTS } from './session.js';
 import { ACCIDENTALS } from './theory/pitch.js';
 
@@ -14,8 +14,7 @@ const h = (tag, cls, txt) => {
 const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 const label = (t) => h('span', 'lbl', t);
 
-// A segmented button group. Returns { el, set(value) } so the active button can
-// be synced to state after load/randomize.
+// A segmented button group. Returns { el, set(value) }.
 function seg(options, onPick, extraCls) {
   const el = h('span', 'seg' + (extraCls ? ' ' + extraCls : ''));
   const btns = options.map((o) => {
@@ -25,16 +24,13 @@ function seg(options, onPick, extraCls) {
     el.appendChild(b);
     return b;
   });
-  return {
-    el,
-    set: (value) => btns.forEach((b) => b.classList.toggle('on', b.dataset.value === String(value))),
-  };
+  return { el, set: (v) => btns.forEach((b) => b.classList.toggle('on', b.dataset.value === String(v))) };
 }
 
 const ACC_SYMBOL = Object.fromEntries(ACCIDENTALS.map((a) => [a.id, a.symbol || '♮']));
 
-// Build the whole app shell once. Returns { update(state, model) }.
-export function mountApp(root, { onChange, onRandomize }) {
+export function mountApp(root, handlers) {
+  const { onChange, onRandomize, onImportText, onDeleteFeel, onExportCurrent, onExportAll } = handlers;
   root.textContent = '';
   const wrap = h('div', 'wrap');
   wrap.appendChild(h('h1', null, 'Songwriter Notebook'));
@@ -53,15 +49,13 @@ export function mountApp(root, { onChange, onRandomize }) {
     return r;
   };
 
-  // ---- Feel ----
+  // Feels-panel element refs (assigned by manageFeelsPanel, used by update()).
+  let importBox, importStatus, userList;
+
+  // ---- Feel (picker rebuilt from the loaded feels in update()) ----
   const feelSel = h('select');
-  FEELS.forEach((f, i) => {
-    const o = h('option', null, f.name);
-    o.value = i;
-    feelSel.appendChild(o);
-  });
-  feelSel.addEventListener('change', () => onChange({ feel: Number(feelSel.value) }));
-  controls.appendChild(card([label('Feel'), feelSel]));
+  feelSel.addEventListener('change', () => onChange({ feel: feelSel.value }));
+  controls.appendChild(card([label('Feel'), feelSel, manageFeelsPanel()]));
 
   // ---- Key ----
   const keyLine = h('div', 'keyline');
@@ -89,8 +83,96 @@ export function mountApp(root, { onChange, onRandomize }) {
   outputCol.appendChild(h('div', 'foot', 'Works fully offline · settings saved on this device'));
   root.appendChild(wrap);
 
-  function update(state, model) {
-    feelSel.value = String(state.feel);
+  // ----- the Feels import/export panel -----
+  function manageFeelsPanel() {
+    const d = h('details', 'feels-panel');
+    d.appendChild(h('summary', null, 'Add / manage feels'));
+
+    importBox = h('textarea');
+    importBox.placeholder = 'Paste a feel JSON here…';
+    importBox.rows = 4;
+    d.appendChild(importBox);
+
+    const btnRow = h('div', 'feel-btns');
+    const importBtn = h('button', 'btn mini', 'Import');
+    importBtn.addEventListener('click', () => showImport(onImportText(importBox.value)));
+    const fileLabel = h('label', 'btn mini', 'Upload .json');
+    const fileInput = h('input');
+    fileInput.type = 'file';
+    fileInput.accept = 'application/json,.json';
+    fileInput.style.display = 'none';
+    fileInput.addEventListener('change', () => {
+      const f = fileInput.files[0];
+      if (!f) return;
+      const reader = new FileReader();
+      reader.onload = () => { showImport(onImportText(String(reader.result))); fileInput.value = ''; };
+      reader.readAsText(f);
+    });
+    fileLabel.appendChild(fileInput);
+    const exportBtn = h('button', 'btn mini', 'Export current');
+    exportBtn.addEventListener('click', onExportCurrent);
+    const exportAllBtn = h('button', 'btn mini', 'Export all');
+    exportAllBtn.addEventListener('click', onExportAll);
+    btnRow.append(importBtn, fileLabel, exportBtn, exportAllBtn);
+    d.appendChild(btnRow);
+
+    importStatus = h('div', 'feel-status');
+    d.appendChild(importStatus);
+
+    userList = h('div', 'savedlist');
+    d.appendChild(userList);
+    return d;
+  }
+
+  function showImport(res) {
+    if (!res) return;
+    importStatus.className = 'feel-status ' + (res.ok ? 'ok' : 'err');
+    importStatus.textContent = res.ok ? ('Imported "' + res.name + '"') : ('Could not import: ' + res.error);
+    if (res.ok) importBox.value = '';
+  }
+
+  function rebuildFeelOptions(feels, selectedId) {
+    feelSel.textContent = '';
+    const builtin = feels.filter((f) => f.builtin);
+    const user = feels.filter((f) => !f.builtin);
+    const group = (lbl, items) => {
+      if (!items.length) return;
+      const og = document.createElement('optgroup');
+      og.label = lbl;
+      items.forEach((f) => {
+        const o = h('option', null, f.name);
+        o.value = f.id;
+        og.appendChild(o);
+      });
+      feelSel.appendChild(og);
+    };
+    group('Built-in', builtin);
+    group('Your feels', user);
+    feelSel.value = selectedId;
+  }
+
+  function rebuildUserList(feels) {
+    userList.textContent = '';
+    const user = feels.filter((f) => !f.builtin);
+    if (!user.length) {
+      userList.appendChild(h('div', 'feel-empty', 'No imported feels yet.'));
+      return;
+    }
+    user.forEach((f) => {
+      const row = h('div', 'saved');
+      row.appendChild(h('span', 'nm', f.name));
+      row.appendChild(h('span', 'stuning', '[' + f.degrees.join(' ') + ']'));
+      const del = h('button', 'btn mini danger', '✕');
+      del.title = 'Delete';
+      del.addEventListener('click', () => onDeleteFeel(f.id));
+      row.appendChild(del);
+      userList.appendChild(row);
+    });
+  }
+
+  function update(state, model, feels) {
+    rebuildFeelOptions(feels, state.feel);
+    rebuildUserList(feels);
     rootSeg.set(state.root);
     accSeg.set(state.accidental);
     modeSeg.set(state.mode);
@@ -120,14 +202,12 @@ function sectionBlock(title, children) {
 
 function renderOutput(out, model) {
   out.textContent = '';
-
   const info = h('div', 'info');
   info.append(h('b', null, model.feelName), document.createTextNode(' · ' + model.keyLabel));
   out.appendChild(info);
 
   const main = model.sections.find((s) => s.role === 'main');
   const alts = model.sections.filter((s) => s.role !== 'main');
-
   out.appendChild(sectionBlock('Main Progression', [chipRow(main.chords)]));
 
   const altBlocks = alts.map((s) => {
@@ -137,7 +217,6 @@ function renderOutput(out, model) {
     return block;
   });
   out.appendChild(sectionBlock('Alternatives', altBlocks));
-
   out.appendChild(sectionBlock('All Chords in Key', [chipRow(model.allChords, 'allchords')]));
 }
 
@@ -149,6 +228,6 @@ function helpPanel() {
   d.appendChild(h('p', null,
     'The three alternatives are the neighbouring keys most likely to sit well with the main one: its relative, its dominant (the key a fifth up), and its subdominant (a fifth down), each running the same feel.'));
   d.appendChild(h('p', null,
-    'All Chords in Key lists every diatonic chord, in case you want to swap one in. Instrument is reserved for chord diagrams in a later version; it has no effect yet.'));
+    'Add your own feels under "Add / manage feels": paste or upload a feel JSON. Exported feels are plain JSON files you can keep or commit as built-ins. Instrument is reserved for chord diagrams in a later version.'));
   return d;
 }

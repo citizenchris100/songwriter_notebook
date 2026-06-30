@@ -1,17 +1,29 @@
 // engine.test.js — verifies the pure music-theory core against vectors captured
 // from the live autochords.com app. Zero dependencies; run with `node engine.test.js`.
 //
-// Because the core is DOM-free ES modules, we import it directly (no build step,
-// no slice-and-eval). All vectors below were harvested from the original app's
-// Angular scope, EXCEPT the flat-key alternative roots, which the original
-// mis-spells with a sharp bias; those are asserted with the corrected spelling
-// (same pitches, key-correct names). See generators/alternatives.js.
+// Phase 2: feels are loaded from feels/*.json (read from disk here) and injected,
+// so this also proves the JSON migration is LOSSLESS (identical output to the old
+// hard-coded array) and that the schema + manifest + service-worker asset list are
+// all consistent. The flat-key alternative roots use the corrected (key-aware)
+// spelling; everything else matches the original (see generators/alternatives.js).
+import { readFileSync, readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { deriveOutput } from './js/derive.js';
 import { scaleOf } from './js/theory/scale.js';
 import { noteName } from './js/theory/pitch.js';
-import { FEELS } from './js/data/feels.js';
 import { MODE_BY_ID } from './js/data/modes.js';
 import { DEFAULT_STATE, validate, randomize, ROOTS, MODE_IDS } from './js/session.js';
+import { validateFeel } from './js/feels.js';
+
+const here = (p) => fileURLToPath(new URL(p, import.meta.url));
+const readJSON = (p) => JSON.parse(readFileSync(here(p), 'utf8'));
+
+// ---- load feels from disk (the app fetches the same files at runtime) ----
+const BUILTIN_IDS = readJSON('./feels/index.json');
+const BUILTIN = BUILTIN_IDS.map((id) => readJSON(`./feels/${id}.json`));
+const feelsById = Object.fromEntries(BUILTIN.map((f) => [f.id, f]));
+const idByName = Object.fromEntries(BUILTIN.map((f) => [f.name, f.id]));
+const FEEL_IDS = BUILTIN_IDS.slice();
 
 let pass = 0, fail = 0;
 function eq(label, got, want) {
@@ -23,23 +35,20 @@ function ok(label, cond) {
 }
 
 const stateOf = (root, accidental, mode, feel) => ({ feel, root, accidental, mode, instrument: 'guitar' });
-const feelIdx = (name) => FEELS.findIndex((f) => f.name === name);
+const feelId = (name) => idByName[name];
 
-// ---- helpers that stringify engine output for comparison ----
 function allChordsAt(root, acc, mode) {
-  return deriveOutput(stateOf(root, acc, mode, 0)).allChords
+  return deriveOutput(stateOf(root, acc, mode, 'cliche'), feelsById).allChords
     .map((c) => `${c.name}[${c.notes.join(',')}]`).join(' ');
 }
 function sectionsAt(root, acc, mode, feelName) {
-  return deriveOutput(stateOf(root, acc, mode, feelIdx(feelName))).sections;
+  return deriveOutput(stateOf(root, acc, mode, feelId(feelName)), feelsById).sections;
 }
 function mainAt(root, acc, mode, feelName) {
-  return sectionsAt(root, acc, mode, feelName).find((s) => s.role === 'main')
-    .chords.map((c) => c.name).join(' ');
+  return sectionsAt(root, acc, mode, feelName).find((s) => s.role === 'main').chords.map((c) => c.name).join(' ');
 }
 function altAt(root, acc, mode, feelName, role) {
-  return sectionsAt(root, acc, mode, feelName).find((s) => s.role === role)
-    .chords.map((c) => c.name).join(' ');
+  return sectionsAt(root, acc, mode, feelName).find((s) => s.role === role).chords.map((c) => c.name).join(' ');
 }
 function scaleStr(root, acc, mode) {
   return scaleOf({ letter: ROOTS.indexOf(root), acc: { flat: -1, natural: 0, sharp: 1 }[acc] }, MODE_BY_ID[mode])
@@ -81,7 +90,7 @@ for (const [label, want] of Object.entries(ALL_CHORDS)) {
 }
 
 // ============================================================================
-// 2. Main progressions — all 16 feels x {C major, A minor} (oracle)
+// 2. Main progressions — all 16 feels x {C major, A minor} (lossless migration)
 // ============================================================================
 const MAIN_C_MAJOR = {
   Alternative: 'Am F C G', Canon: 'C G Am Em F C F G', 'Cliché': 'C G Am F',
@@ -111,7 +120,6 @@ eq('alt subdom    C major Cliché', altAt('C', 'natural', 'major', 'Cliché', 's
 eq('alt relative  A minor Cliché', altAt('A', 'natural', 'minor', 'Cliché', 'relative'), 'C G Am F');
 eq('alt dominant  A minor Cliché', altAt('A', 'natural', 'minor', 'Cliché', 'dominant'), 'Em Bm C Am');
 eq('alt subdom    A minor Cliché', altAt('A', 'natural', 'minor', 'Cliché', 'subdominant'), 'Dm Am B♭ Gm');
-// section labels carry correctly-spelled key names
 eq('alt label dominant C major', sectionsAt('C', 'natural', 'major', 'Cliché').find((s) => s.role === 'dominant').title, 'Dominant · G major');
 
 // ============================================================================
@@ -131,25 +139,45 @@ eq('scale A♭ minor', scaleStr('A', 'flat', 'minor'), 'A♭ B♭ C♭ D♭ E♭
 eq('scale E♭ major', scaleStr('E', 'flat', 'major'), 'E♭ F G A♭ B♭ C D');
 
 // ============================================================================
-// 6. Output model structure + state model
+// 6. Output model structure + state model (feel is now an id)
 // ============================================================================
-const sample = deriveOutput(DEFAULT_STATE);
+const sample = deriveOutput(DEFAULT_STATE, feelsById);
 ok('default state derives 4 sections (main + 3 alts)', sample.sections.length === 4);
 eq('section roles in order', sample.sections.map((s) => s.role).join(','), 'main,relative,dominant,subdominant');
 ok('default key label is C major', sample.keyLabel === 'C major');
+eq('default feel is Cliché', sample.feelName, 'Cliché');
 ok('every chord chip has 3 triad notes', sample.sections.every((s) => s.chords.every((c) => c.notes.length === 3)));
 
-// validate falls back per field
-eq('validate garbage → defaults', JSON.stringify(validate({ feel: 99, root: 'Q', mode: 'lydian', accidental: 'x', instrument: 'kazoo' })), JSON.stringify(DEFAULT_STATE));
-eq('validate string feel index', validate({ feel: '7', root: 'C', accidental: 'natural', mode: 'major', instrument: 'guitar' }).feel, 7);
+eq('validate garbage → defaults', JSON.stringify(validate({ feel: 'nope', root: 'Q', mode: 'lydian', accidental: 'x', instrument: 'kazoo' }, FEEL_IDS)), JSON.stringify(DEFAULT_STATE));
+eq('validate keeps a known feel id', validate({ feel: 'sad', root: 'C', accidental: 'natural', mode: 'major', instrument: 'guitar' }, FEEL_IDS).feel, 'sad');
 
-// randomize: deterministic rng → valid state, accidental reset to natural
-const seq = [0.99, 0.5, 0.0, 0.5]; let i = 0; const rng = () => seq[i++ % seq.length];
-const r = randomize(rng);
-ok('randomize feel in range', Number.isInteger(r.feel) && r.feel >= 0 && r.feel < FEELS.length);
+const seq = [0.99, 0.5, 0.0, 0.5, 0.2]; let i = 0; const rng = () => seq[i++ % seq.length];
+const r = randomize(rng, FEEL_IDS);
+ok('randomize feel is a known id', FEEL_IDS.includes(r.feel));
 ok('randomize root valid', ROOTS.includes(r.root));
 ok('randomize mode valid', MODE_IDS.includes(r.mode));
 eq('randomize accidental reset to natural', r.accidental, 'natural');
+
+// ============================================================================
+// 7. Feel schema (validateFeel mirrors feels/feel.schema.json)
+// ============================================================================
+for (const id of BUILTIN_IDS) ok('schema accepts ' + id, validateFeel(readJSON(`./feels/${id}.json`)).ok);
+ok('schema rejects out-of-range degree', !validateFeel({ id: 'x', name: 'X', degrees: [0, 7] }).ok);
+ok('schema rejects bad id', !validateFeel({ id: 'Bad ID', name: 'X', degrees: [0] }).ok);
+ok('schema rejects missing degrees', !validateFeel({ id: 'x', name: 'X' }).ok);
+ok('schema rejects empty degrees', !validateFeel({ id: 'x', name: 'X', degrees: [] }).ok);
+ok('schema rejects unknown property', !validateFeel({ id: 'x', name: 'X', degrees: [0], bogus: 1 }).ok);
+ok('schema accepts optional fields', validateFeel({ id: 'x', name: 'X', degrees: [0, 3], description: 'd', tags: ['t'], schemaVersion: 1 }).ok);
+
+// ============================================================================
+// 8. Manifest + service-worker asset-list integrity
+// ============================================================================
+const feelFiles = readdirSync(here('./feels')).filter((f) => f.endsWith('.json') && f !== 'index.json' && f !== 'feel.schema.json');
+const fileIds = feelFiles.map((f) => f.replace(/\.json$/, '')).sort();
+eq('index.json lists exactly the feel files present', BUILTIN_IDS.slice().sort().join(','), fileIds.join(','));
+const sw = readFileSync(here('./sw.js'), 'utf8');
+ok('sw.js caches the manifest', sw.includes('"./feels/index.json"'));
+for (const id of BUILTIN_IDS) ok('sw.js caches feel ' + id, sw.includes(`"./feels/${id}.json"`));
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail ? 1 : 0);

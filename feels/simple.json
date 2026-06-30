@@ -1,0 +1,7 @@
+{
+  "$schema": "./feel.schema.json",
+  "id": "simple",
+  "name": "Simple",
+  "degrees": [0, 3],
+  "schemaVersion": 1
+}

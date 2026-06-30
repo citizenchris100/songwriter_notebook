@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://citizenchris100.github.io/songwriter_notebook/feels/feel.schema.json",
+  "title": "Songwriter Notebook progression feel",
+  "description": "A chord-progression template: an ordered list of diatonic scale-degree indices applied to whatever key/mode the app is set to.",
+  "type": "object",
+  "required": ["id", "name", "degrees"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional pointer to this schema (for editor validation), e.g. \"./feel.schema.json\"."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "Unique slug. Lowercase letters, digits and hyphens; this is also the deep-link value (?feel=<id>) and the file name feels/<id>.json."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Display name shown in the picker."
+    },
+    "degrees": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "integer", "minimum": 0, "maximum": 6 },
+      "description": "Diatonic scale-degree indices (0 = I, 1 = ii, ... 6 = vii). Repeats are allowed and significant."
+    },
+    "description": {
+      "type": "string",
+      "description": "Optional human note about the feel."
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Optional free-form tags for grouping/search."
+    },
+    "source": {
+      "type": "string",
+      "description": "Optional attribution or origin."
+    },
+    "schemaVersion": {
+      "type": "integer",
+      "enum": [1],
+      "description": "Schema version this file targets. Currently 1."
+    }
+  }
+}
