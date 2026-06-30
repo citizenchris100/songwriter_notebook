@@ -1,0 +1,92 @@
+/* styles.css — clean dark UI, matching the metronome/fretboard family tokens. */
+:root {
+  --bg: #15171c;
+  --panel: #1b1e25;
+  --panel-2: #222631;
+  --line: #2c313c;
+  --text: #e9ecf1;
+  --muted: #8b93a3;
+  --accent: #ff5a3c;
+  --accent-soft: #ff7a60;
+  --radius: 14px;
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  padding: max(env(safe-area-inset-top), 10px) 12px calc(env(safe-area-inset-bottom) + 16px);
+  -webkit-text-size-adjust: 100%;
+}
+h1 {
+  font-size: 14px; letter-spacing: .22em; text-transform: uppercase;
+  color: var(--muted); font-weight: 700; text-align: center; margin: 4px 0 16px;
+}
+.wrap { max-width: 1200px; margin: 0 auto; }
+
+/* Two-pane on wide screens: controls sidebar + output filling the rest.
+   Collapses to a single stacked column on iPad-portrait / phone widths. */
+.layout { display: flex; gap: 18px; align-items: flex-start; }
+.controls { flex: 0 0 340px; }
+.outputcol { flex: 1 1 auto; min-width: 0; }
+@media (max-width: 860px) {
+  .layout { flex-direction: column; }
+  .controls { flex: 1 1 auto; width: 100%; }
+}
+
+.row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 11px 13px; }
+.card.grow { flex: 1 1 auto; min-width: 240px; }
+.lbl { font-size: 10px; letter-spacing: .13em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; display: block; }
+.keyline { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+
+.seg { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+.seg button {
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 9px; padding: 8px 12px; font-size: 15px; font-weight: 600;
+  cursor: pointer; line-height: 1; min-width: 38px;
+}
+.seg button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.seg.acc button { min-width: 34px; font-size: 16px; }
+
+select {
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 9px; padding: 10px 30px 10px 12px; font-size: 16px; width: 100%; outline: none;
+  -webkit-appearance: none; appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 15px) 50%, calc(100% - 10px) 50%;
+  background-size: 5px 5px; background-repeat: no-repeat;
+}
+
+.btn {
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+  border-radius: var(--radius); padding: 13px 16px; font-size: 15px; font-weight: 700; cursor: pointer;
+}
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.grow { flex: 1 1 auto; }
+.btn:active { transform: translateY(1px); }
+
+.info { text-align: center; color: var(--muted); font-size: 13px; margin: 2px 0 16px; }
+.info b { color: var(--text); }
+
+.sec { margin: 18px 0; }
+.seclabel { font-size: 11px; letter-spacing: .16em; text-transform: uppercase; color: var(--muted); font-weight: 700; margin: 0 0 10px; }
+.subtitle { font-size: 12px; color: var(--accent-soft); font-weight: 700; margin: 0 0 7px; }
+
+/* On wide screens the three alternatives sit side by side and fill the row. */
+.altgrid { display: flex; flex-wrap: wrap; gap: 16px 24px; }
+.altcol { flex: 1 1 250px; min-width: 0; }
+
+.prow { display: flex; flex-wrap: wrap; gap: 8px; }
+.pchip { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; min-width: 66px; text-align: center; }
+.pchip-name { font-size: 20px; font-weight: 700; line-height: 1.1; }
+.pchip-notes { font-size: 11px; color: var(--muted); margin-top: 4px; letter-spacing: .04em; }
+.allchords .pchip { background: var(--panel-2); }
+
+details { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
+details > summary { cursor: pointer; font-size: 10px; letter-spacing: .13em; text-transform: uppercase; color: var(--muted); list-style: none; }
+details > summary::-webkit-details-marker { display: none; }
+details[open] > summary { margin-bottom: 8px; }
+details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px 0; }
+.foot { text-align: center; color: var(--muted); font-size: 12px; margin-top: 22px; }

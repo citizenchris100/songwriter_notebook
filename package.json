@@ -1,0 +1,6 @@
+{
+  "name": "songwriter_notebook",
+  "private": true,
+  "type": "module",
+  "description": "Offline chord-progression generator PWA. No build step; native ES modules. `node engine.test.js` verifies the pure music-theory core."
+}

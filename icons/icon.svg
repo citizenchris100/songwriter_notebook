@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <rect width="512" height="512" fill="#15171c"/>
+  <!-- a four-chord progression as ascending bars -->
+  <rect x="134" y="300" width="46" height="105" rx="23" fill="#ff5a3c"/>
+  <rect x="200" y="230" width="46" height="175" rx="23" fill="#ff7a60"/>
+  <rect x="266" y="265" width="46" height="140" rx="23" fill="#ff5a3c"/>
+  <rect x="332" y="195" width="46" height="210" rx="23" fill="#f3b13b"/>
+</svg>
