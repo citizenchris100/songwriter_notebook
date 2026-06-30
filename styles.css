@@ -115,3 +115,47 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
 .saved .nm { flex: 1; font-size: 13px; }
 .saved .stuning { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .feel-empty { font-size: 12px; color: var(--muted); }
+.feel-empty.pad { padding: 22px 4px; text-align: center; }
+
+/* ===== Tabs + views ===== */
+.tabs { display: flex; gap: 6px; justify-content: center; margin: 0 0 16px; }
+.tab {
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+  border-radius: 10px; padding: 8px 16px; font-size: 13px; font-weight: 700; letter-spacing: .04em; cursor: pointer;
+}
+.tab.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.hidden { display: none !important; }
+
+/* ===== Generator: selectable rows + create/add action bar ===== */
+.selhead { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.pcheck { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; margin: 0; flex: none; }
+.selflash { font-size: 13px; color: #43d39e; text-align: center; margin-bottom: 8px; }
+.selbar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: var(--panel); border: 1px solid var(--accent); border-radius: 10px; padding: 10px 12px; margin: 0 0 6px;
+}
+.selnote { font-size: 12px; color: var(--muted); margin-right: auto; }
+.btn.mini2 { padding: 8px 12px; font-size: 13px; font-weight: 700; border-radius: 9px; }
+
+/* ===== Songs tab ===== */
+.songswrap { max-width: 760px; margin: 0 auto; }
+.songsec { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 11px 13px; margin: 12px 0; }
+.pchead { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.pchead .spacer { flex: 1; }
+.plabel { width: auto; min-width: 132px; padding: 7px 28px 7px 10px; font-size: 14px; }
+.songsec .subtitle { margin-bottom: 8px; }
+.lyrics {
+  width: 100%; margin-top: 2px; background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px;
+  font: 14px/1.5 inherit; resize: vertical; outline: none;
+}
+.songactions { align-items: center; gap: 10px; }
+.savehint { font-size: 12px; color: var(--muted); margin-right: auto; }
+.btn.danger { color: #ff8a7a; }
+.namebar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; width: 100%; }
+.nameinput {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 9px; padding: 8px 10px; font-size: 14px; flex: 1 1 160px; outline: none;
+}
+.switchconfirm:not(:empty) { margin-top: 8px; }
+.songs-panel { max-width: 760px; }

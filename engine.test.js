@@ -14,6 +14,11 @@ import { noteName } from './js/theory/pitch.js';
 import { MODE_BY_ID } from './js/data/modes.js';
 import { DEFAULT_STATE, validate, randomize, ROOTS, MODE_IDS } from './js/session.js';
 import { validateFeel, normalizeFeel } from './js/feels.js';
+import {
+  validateSong, normalizeSong, nextUntitledName, slugifySongId, buildCapturedProgression,
+  createSong, appendProgressions, reorderProgression, removeProgression,
+  setProgressionLabel, setLyrics, renameSong, finalizeDraft,
+} from './js/songs.js';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const readJSON = (p) => JSON.parse(readFileSync(here(p), 'utf8'));
@@ -179,6 +184,7 @@ const sw = readFileSync(here('./sw.js'), 'utf8');
 ok('sw.js caches the manifest', sw.includes('"./feels/index.json"'));
 for (const id of BUILTIN_IDS) ok('sw.js caches feel ' + id, sw.includes(`"./feels/${id}.json"`));
 ok('sw.js caches the roman.js module', sw.includes('"./js/theory/roman.js"'));
+for (const f of ['dom', 'songs', 'songStore', 'songsView']) ok('sw.js caches ' + f + '.js', sw.includes(`"./js/${f}.js"`));
 
 // ============================================================================
 // 9. Chromatic (Roman-numeral token) feels — non-diatonic progressions
@@ -259,6 +265,85 @@ ok('schema accepts schemaVersion 3', validateFeel({ id: 'x', name: 'X', schemaVe
 ok('doo-wop built-in present + valid', !!feelsById['doo-wop'] && validateFeel(readJSON('./feels/doo-wop.json')).ok);
 ok('spector-girl-groups built-in present + valid', !!feelsById['spector-girl-groups'] && validateFeel(readJSON('./feels/spector-girl-groups.json')).ok);
 ok('old creepy ids are gone', !feelsById['creepy'] && !feelsById['creepy2']);
+
+// ============================================================================
+// 11. Songs — record validation, untitled numbering, snapshot capture, transforms
+// ============================================================================
+const goodSong = {
+  schemaVersion: 1, id: 'my-song', name: 'My Song', createdAt: 't', updatedAt: 't', lyrics: 'la la',
+  progressions: [{
+    label: 'Verse', title: 'Main Progression',
+    chords: [{ name: 'C', notes: ['C', 'E', 'G'] }, { name: 'G', notes: ['G', 'B', 'D'] }],
+    provenance: { feelId: 'cliche', feelName: 'Cliché', root: 'C', accidental: 'natural', mode: 'major', chromatic: false, keyLabel: 'C major', role: 'main' },
+  }],
+};
+ok('validateSong accepts a good song', validateSong(goodSong).ok);
+ok('validateSong accepts a minimal song', validateSong({ id: 's', name: 'S', progressions: [{ chords: [{ name: 'C', notes: ['C'] }] }] }).ok);
+ok('validateSong accepts a chromatic snapshot', validateSong({ id: 's2', name: 'S2', progressions: [{ label: 'Bridge', title: 'Bridge', chords: [{ name: 'E7', notes: ['E', 'G♯', 'B', 'D'] }], provenance: { feelId: 'x', feelName: 'X', root: 'C', accidental: 'natural', mode: 'major', chromatic: true, keyLabel: 'C', role: 'section' } }] }).ok);
+ok('validateSong rejects missing name', !validateSong({ id: 'x', progressions: [{ chords: [{ name: 'C', notes: ['C'] }] }] }).ok);
+ok('validateSong rejects empty progressions', !validateSong({ id: 'x', name: 'X', progressions: [] }).ok);
+ok('validateSong rejects non-array progressions', !validateSong({ id: 'x', name: 'X', progressions: 'nope' }).ok);
+ok('validateSong rejects a chord without notes', !validateSong({ id: 'x', name: 'X', progressions: [{ chords: [{ name: 'C' }] }] }).ok);
+ok('validateSong rejects empty chords', !validateSong({ id: 'x', name: 'X', progressions: [{ chords: [] }] }).ok);
+ok('validateSong rejects a non-preset label', !validateSong({ id: 'x', name: 'X', progressions: [{ label: 'Refrain', chords: [{ name: 'C', notes: ['C'] }] }] }).ok);
+ok('validateSong rejects schemaVersion 2', !validateSong({ id: 'x', name: 'X', schemaVersion: 2, progressions: [{ chords: [{ name: 'C', notes: ['C'] }] }] }).ok);
+ok('validateSong rejects a bad id slug', !validateSong({ id: 'Bad ID', name: 'X', progressions: [{ chords: [{ name: 'C', notes: ['C'] }] }] }).ok);
+ok('validateSong rejects an extra chord property', !validateSong({ id: 'x', name: 'X', progressions: [{ chords: [{ name: 'C', notes: ['C'], bogus: 1 }] }] }).ok);
+ok('validateSong rejects non-boolean provenance.chromatic', !validateSong({ id: 'x', name: 'X', progressions: [{ chords: [{ name: 'C', notes: ['C'] }], provenance: { chromatic: 'yes' } }] }).ok);
+// forward-compatible: unknown top-level keys tolerated, but normalize strips them
+ok('validateSong tolerates an unknown top-level key', validateSong({ ...goodSong, tempo: 120 }).ok);
+ok('normalizeSong strips unknown keys', !('tempo' in normalizeSong({ ...goodSong, tempo: 120 })));
+
+eq('nextUntitledName empty', nextUntitledName([]), 'untitled000');
+eq('nextUntitledName increments', nextUntitledName(['untitled000']), 'untitled001');
+eq('nextUntitledName fills the lowest gap', nextUntitledName(['untitled000', 'untitled002']), 'untitled001');
+eq('nextUntitledName ignores non-matching names', nextUntitledName(['My Song', 'demo']), 'untitled000');
+
+eq('slugifySongId basic', slugifySongId('My Song!', []), 'my-song');
+eq('slugifySongId suffixes a collision', slugifySongId('My Song', ['my-song']), 'my-song-2');
+eq('slugifySongId empty falls back', slugifySongId('', []), 'song');
+
+// buildCapturedProgression — diatonic main snapshot
+const capModel = deriveOutput(stateOf('C', 'natural', 'major', 'cliche'), feelsById);
+const capMain = buildCapturedProgression(stateOf('C', 'natural', 'major', 'cliche'), capModel, capModel.sections.find((s) => s.role === 'main'));
+eq('capture title', capMain.title, 'Main Progression');
+ok('capture chords are name+notes only', capMain.chords.every((c) => Object.keys(c).sort().join(',') === 'name,notes'));
+eq('capture provenance feelId', capMain.provenance.feelId, 'cliche');
+ok('capture provenance chromatic false', capMain.provenance.chromatic === false);
+eq('capture provenance keyLabel', capMain.provenance.keyLabel, 'C major');
+eq('capture provenance role', capMain.provenance.role, 'main');
+eq('capture label empty', capMain.label, '');
+ok('a captured snapshot validates inside a song', validateSong({ id: 'cap', name: 'Cap', progressions: [capMain] }).ok);
+
+// buildCapturedProgression — sectioned bridge snapshot (chromatic)
+const secModel = deriveOutput(stateOf('C', 'natural', 'major', 'wf-sectioned'), sById);
+const capBridge = buildCapturedProgression(stateOf('C', 'natural', 'major', 'wf-sectioned'), secModel, secModel.sections[1]);
+ok('capture sectioned chromatic true', capBridge.provenance.chromatic === true);
+eq('capture sectioned role', capBridge.provenance.role, 'section');
+eq('capture sectioned keyLabel', capBridge.provenance.keyLabel, 'C');
+eq('capture sectioned title', capBridge.title, 'Bridge');
+
+// immutable transforms (a fixed injected `now`)
+const draft = appendProgressions(createSong('t0'), [capMain, capBridge], 't1');
+eq('createSong+append length', draft.progressions.length, 2);
+eq('createSong schemaVersion', draft.schemaVersion, 1);
+eq('createSong empty id (draft)', draft.id, '');
+const reordered = reorderProgression(draft, 0, 1, 't2');
+eq('reorder swaps order', reordered.progressions[0].title, 'Bridge');
+ok('reorder is immutable', draft.progressions[0].title === 'Main Progression');
+eq('reorder bumps updatedAt', reordered.updatedAt, 't2');
+ok('reorder no-op at boundary', reorderProgression(draft, 0, -1, 't2') === draft);
+eq('remove drops one', removeProgression(draft, 0, 't3').progressions.length, 1);
+eq('setLabel applies a preset', setProgressionLabel(draft, 0, 'Chorus', 't4').progressions[0].label, 'Chorus');
+eq('setLabel rejects non-preset -> empty', setProgressionLabel(draft, 0, 'Nope', 't4').progressions[0].label, '');
+eq('setLyrics applies', setLyrics(draft, 'words', 't5').lyrics, 'words');
+const finalized = finalizeDraft(draft, 'My Song', [], 't6');
+eq('finalizeDraft assigns id', finalized.id, 'my-song');
+eq('finalizeDraft sets name', finalized.name, 'My Song');
+const renamed = renameSong(finalized, 'New Name', 't7');
+eq('renameSong keeps id stable', renamed.id, 'my-song');
+eq('renameSong changes name', renamed.name, 'New Name');
+ok('finalized song round-trips through validateSong', validateSong(finalized).ok);
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail ? 1 : 0);

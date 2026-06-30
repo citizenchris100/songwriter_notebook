@@ -1,16 +1,13 @@
-// ui.js — DOM construction and rendering. The only module (besides main.js) that
-// touches the DOM. It renders the output model from derive.js, reports control
-// changes via callbacks, and hosts the Feels import/export panel. It knows nothing
-// about how chords are computed or where feels are stored.
+// ui.js — DOM construction for the app shell (tab nav + the two view containers),
+// the generator (Progressions) tab, and the Feels import/export panel. Shares the
+// low-level render primitives with the Songs tab via dom.js, and mounts the Songs view
+// (songsView.js). It reports control changes via callbacks and knows nothing about how
+// chords are computed or where feels/songs are stored.
 import { ROOTS, ACCIDENTAL_IDS, MODE_IDS, INSTRUMENTS } from './session.js';
 import { ACCIDENTALS } from './theory/pitch.js';
+import { h, chipRow, sectionBlock } from './dom.js';
+import { mountSongsView } from './songsView.js';
 
-const h = (tag, cls, txt) => {
-  const e = document.createElement(tag);
-  if (cls) e.className = cls;
-  if (txt != null) e.textContent = txt;
-  return e;
-};
 const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 const label = (t) => h('span', 'lbl', t);
 
@@ -34,16 +31,33 @@ function seg(options, onPick, extraCls) {
 const ACC_SYMBOL = Object.fromEntries(ACCIDENTALS.map((a) => [a.id, a.symbol || '♮']));
 
 export function mountApp(root, handlers) {
-  const { onChange, onRandomize, onImportText, onDeleteFeel, onExportCurrent, onExportAll } = handlers;
+  const {
+    onChange, onRandomize, onImportText, onDeleteFeel, onExportCurrent, onExportAll,
+    onTab, onCreateSong, onAddToCurrent, songs: songHandlers,
+  } = handlers;
   root.textContent = '';
   const wrap = h('div', 'wrap');
   wrap.appendChild(h('h1', null, 'Songwriter Notebook'));
+
+  // ---- top tab nav ----
+  const tabs = h('div', 'tabs');
+  const tabProg = h('button', 'tab on', 'Progressions');
+  const tabSongs = h('button', 'tab', 'Songs');
+  tabProg.addEventListener('click', () => onTab('progressions'));
+  tabSongs.addEventListener('click', () => onTab('songs'));
+  tabs.append(tabProg, tabSongs);
+  wrap.appendChild(tabs);
+
+  // ---- the two views ----
+  const viewGen = h('div', 'view');
+  const viewSongs = h('div', 'view hidden');
+  wrap.append(viewGen, viewSongs);
 
   const layout = h('div', 'layout');
   const controls = h('aside', 'controls');
   const outputCol = h('main', 'outputcol');
   layout.append(controls, outputCol);
-  wrap.appendChild(layout);
+  viewGen.appendChild(layout);
 
   const card = (children) => {
     const c = h('div', 'card grow');
@@ -86,6 +100,9 @@ export function mountApp(root, handlers) {
   outputCol.appendChild(helpPanel());
   outputCol.appendChild(h('div', 'foot', 'Works fully offline · settings saved on this device'));
   root.appendChild(wrap);
+
+  // ---- mount the Songs view into its container ----
+  const songsApp = mountSongsView(viewSongs, songHandlers);
 
   // ----- the Feels import/export panel -----
   function manageFeelsPanel() {
@@ -177,7 +194,71 @@ export function mountApp(root, handlers) {
     });
   }
 
-  function update(state, model, feels) {
+  // A selectable progression block: a checkbox + title header over the chord row. The
+  // checkbox toggles `idx` (an index into model.sections) in the live selection set.
+  function selBlock(idx, title, chords, selection, onToggle, sub) {
+    const sec = h('div', sub ? 'altblock' : 'sec');
+    const head = h('label', (sub ? 'subtitle' : 'seclabel') + ' selhead');
+    const cb = h('input', 'pcheck');
+    cb.type = 'checkbox';
+    cb.checked = selection.has(idx);
+    cb.addEventListener('change', () => { if (cb.checked) selection.add(idx); else selection.delete(idx); onToggle(); });
+    head.append(cb, h('span', null, title));
+    sec.append(head, chipRow(chords));
+    return sec;
+  }
+
+  // Render the generator output with a per-row select checkbox and the song action bar.
+  function renderGenerator(model, vm) {
+    out.textContent = '';
+    if (vm && vm.genFlash) out.appendChild(h('div', 'selflash', vm.genFlash));
+
+    const info = h('div', 'info');
+    info.append(
+      h('b', null, model.feelName),
+      document.createTextNode(' · ' + model.keyLabel + (model.chromatic ? ' · chromatic feel' : '')),
+    );
+    out.appendChild(info);
+
+    // Selection state + action bar (toggled locally as boxes change, no full re-render).
+    const selection = new Set();
+    const selbar = h('div', 'selbar hidden');
+    const selnote = h('span', 'selnote');
+    const createBtn = h('button', 'btn primary mini2', 'Create song');
+    const addBtn = h('button', 'btn mini2', 'Add to current song');
+    createBtn.addEventListener('click', () => { if (selection.size) onCreateSong([...selection].sort((a, b) => a - b)); });
+    addBtn.addEventListener('click', () => { if (selection.size) onAddToCurrent([...selection].sort((a, b) => a - b)); });
+    selbar.append(selnote, createBtn, addBtn);
+    const refreshBar = () => {
+      selbar.classList.toggle('hidden', selection.size < 1);
+      selnote.textContent = selection.size ? (selection.size + ' selected') : '';
+      addBtn.classList.toggle('hidden', !(vm && vm.hasCurrentSong));
+      addBtn.textContent = vm && vm.currentSongName ? ('Add to ' + vm.currentSongName) : 'Add to current song';
+    };
+    out.appendChild(selbar);
+
+    if (model.chromatic) {
+      // One block per section: a flat feel has a single "Main Progression"; a sectioned
+      // feel renders each labeled block (Main, Bridge, …). Each is selectable.
+      model.sections.forEach((s, idx) => out.appendChild(selBlock(idx, s.title, s.chords, selection, refreshBar, false)));
+      out.appendChild(sectionBlock('Alternatives', [h('div', 'feel-empty',
+        'A chromatic feel is fixed relative to the root, so the diatonic relative / dominant / subdominant alternatives and the major/minor switch do not apply. Transpose with the Key buttons.')]));
+      out.appendChild(sectionBlock('Chords used', [chipRow(model.allChords, 'allchords')]));
+    } else {
+      let mainBlock = null;
+      const altBlocks = [];
+      model.sections.forEach((s, idx) => {
+        if (s.role === 'main') mainBlock = selBlock(idx, 'Main Progression', s.chords, selection, refreshBar, false);
+        else altBlocks.push(selBlock(idx, s.title, s.chords, selection, refreshBar, true));
+      });
+      if (mainBlock) out.appendChild(mainBlock);
+      out.appendChild(sectionBlock('Alternatives', altBlocks));
+      out.appendChild(sectionBlock('All Chords in Key', [chipRow(model.allChords, 'allchords')]));
+    }
+    refreshBar();
+  }
+
+  function update(state, model, feels, vm) {
     rebuildFeelOptions(feels, state.feel);
     rebuildUserList(feels);
     rootSeg.set(state.root);
@@ -185,59 +266,16 @@ export function mountApp(root, handlers) {
     modeSeg.set(state.mode);
     modeSeg.setEnabled(!model.chromatic); // chromatic feels are mode-independent
     instSeg.set(state.instrument);
-    renderOutput(out, model);
+    renderGenerator(model, vm);
+
+    const onSongs = !!(vm && vm.view === 'songs');
+    viewGen.classList.toggle('hidden', onSongs);
+    viewSongs.classList.toggle('hidden', !onSongs);
+    tabProg.classList.toggle('on', !onSongs);
+    tabSongs.classList.toggle('on', onSongs);
+    songsApp.update(vm);
   }
   return { update };
-}
-
-function chip(c) {
-  const el = h('div', 'pchip');
-  el.appendChild(h('div', 'pchip-name', c.name));
-  el.appendChild(h('div', 'pchip-notes', c.notes.join(' ')));
-  return el;
-}
-function chipRow(chords, cls) {
-  const row = h('div', 'prow' + (cls ? ' ' + cls : ''));
-  chords.forEach((c) => row.appendChild(chip(c)));
-  return row;
-}
-function sectionBlock(title, children) {
-  const sec = h('div', 'sec');
-  sec.appendChild(h('div', 'seclabel', title));
-  children.forEach((c) => sec.appendChild(c));
-  return sec;
-}
-
-function renderOutput(out, model) {
-  out.textContent = '';
-  const info = h('div', 'info');
-  info.append(
-    h('b', null, model.feelName),
-    document.createTextNode(' · ' + model.keyLabel + (model.chromatic ? ' · chromatic feel' : '')),
-  );
-  out.appendChild(info);
-
-  if (model.chromatic) {
-    // One block per section: a flat feel has a single "Main Progression"; a sectioned
-    // feel renders each labeled block (Main, Bridge, …) under its own heading.
-    model.sections.forEach((s) => out.appendChild(sectionBlock(s.title, [chipRow(s.chords)])));
-    out.appendChild(sectionBlock('Alternatives', [h('div', 'feel-empty',
-      'A chromatic feel is fixed relative to the root, so the diatonic relative / dominant / subdominant alternatives and the major/minor switch do not apply. Transpose with the Key buttons.')]));
-    out.appendChild(sectionBlock('Chords used', [chipRow(model.allChords, 'allchords')]));
-    return;
-  }
-
-  const main = model.sections.find((s) => s.role === 'main');
-  out.appendChild(sectionBlock('Main Progression', [chipRow(main.chords)]));
-  const alts = model.sections.filter((s) => s.role !== 'main');
-  const altBlocks = alts.map((s) => {
-    const block = h('div', 'altblock');
-    block.appendChild(h('div', 'subtitle', s.title));
-    block.appendChild(chipRow(s.chords));
-    return block;
-  });
-  out.appendChild(sectionBlock('Alternatives', altBlocks));
-  out.appendChild(sectionBlock('All Chords in Key', [chipRow(model.allChords, 'allchords')]));
 }
 
 function helpPanel() {
@@ -247,6 +285,8 @@ function helpPanel() {
     'A feel is a chord-progression template: a sequence of scale degrees. Pick a feel and a key, and the progression is those degrees voiced as the diatonic chords of that key. Each chord shows its three notes underneath.'));
   d.appendChild(h('p', null,
     'The three alternatives are the neighbouring keys most likely to sit well with the main one: its relative, its dominant (the key a fifth up), and its subdominant (a fifth down), each running the same feel.'));
+  d.appendChild(h('p', null,
+    'Tick the checkbox on any progression, then use "Create song" to start a song with it (or "Add to current song" to append it to the song open in the Songs tab). Name and write lyrics over there.'));
   d.appendChild(h('p', null,
     'Some feels are chromatic: instead of scale degrees they list Roman-numeral chords (like I, ♭VII, ♭VI) that can be non-diatonic. These are fixed relative to the root, so the Key buttons transpose them but the major/minor switch and the diatonic alternatives do not apply.'));
   d.appendChild(h('p', null,
