@@ -18,7 +18,9 @@ import {
   validateSong, normalizeSong, nextUntitledName, slugifySongId, buildCapturedProgression,
   createSong, appendProgressions, reorderProgression, removeProgression,
   setProgressionLabel, setLyrics, renameSong, finalizeDraft,
+  appendRow, addChord, setChord, removeChord,
 } from './js/songs.js';
+import { chordFromRootAndQuality, chordForTone, CHROMATIC_TONES } from './js/theory/roman.js';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const readJSON = (p) => JSON.parse(readFileSync(here(p), 'utf8'));
@@ -344,6 +346,44 @@ const renamed = renameSong(finalized, 'New Name', 't7');
 eq('renameSong keeps id stable', renamed.id, 'my-song');
 eq('renameSong changes name', renamed.name, 'New Name');
 ok('finalized song round-trips through validateSong', validateSong(finalized).ok);
+
+// ============================================================================
+// 12. Hand-editing: chord builder, 12-tone picker, and row/chord transforms
+// ============================================================================
+const chordStr = (c) => c.name + ': ' + c.notes.join(' ');
+eq('C major from root+quality', chordStr(chordFromRootAndQuality({ letter: 0, acc: 0 }, 'maj')), 'C: C E G');
+eq('C minor from root+quality', chordStr(chordFromRootAndQuality({ letter: 0, acc: 0 }, 'min')), 'Cm: C E♭ G');
+ok('chordFromRootAndQuality returns null on a bad quality', chordFromRootAndQuality({ letter: 0, acc: 0 }, 'nope') === null);
+eq('CHROMATIC_TONES has 12 tones', CHROMATIC_TONES.length, 12);
+
+// The black-key spelling rule: flat root for major, sharp root for minor (no doubles).
+const tone = (label) => CHROMATIC_TONES.find((t) => t.label === label);
+eq('E♭ major uses the flat root', chordStr(chordForTone(tone('D♯ / E♭'), 'maj')), 'E♭: E♭ G B♭');
+eq('C♯ minor uses the sharp root', chordStr(chordForTone(tone('C♯ / D♭'), 'min')), 'C♯m: C♯ E G♯');
+eq('A♭ major uses the flat root', chordStr(chordForTone(tone('G♯ / A♭'), 'maj')), 'A♭: A♭ C E♭');
+eq('G♯ minor uses the sharp root', chordStr(chordForTone(tone('G♯ / A♭'), 'min')), 'G♯m: G♯ B D♯');
+eq('a natural tone is unaffected by the rule', chordStr(chordForTone(tone('G'), 'maj')), 'G: G B D');
+
+// Row/chord transforms — immutable and invariant-preserving (rows never empty).
+const cMaj = chordFromRootAndQuality({ letter: 0, acc: 0 }, 'maj');
+const withRow = appendRow(createSong('t0'), cMaj, 't1');
+eq('appendRow adds a seeded row', withRow.progressions.length, 1);
+eq('appendRow seeds C major', withRow.progressions[0].chords[0].name, 'C');
+ok('appendRow stores name+notes only', Object.keys(withRow.progressions[0].chords[0]).sort().join(',') === 'name,notes');
+const twoRows = appendRow(withRow, cMaj, 't2');
+const added = addChord(twoRows, 0, chordFromRootAndQuality({ letter: 4, acc: 0 }, 'maj'), 't3');
+eq('addChord appends to the row', added.progressions[0].chords.map((c) => c.name).join(' '), 'C G');
+ok('addChord is immutable', twoRows.progressions[0].chords.length === 1);
+const setted = setChord(added, 0, 1, chordFromRootAndQuality({ letter: 5, acc: 0 }, 'min'), 't4');
+eq('setChord replaces chord j', setted.progressions[0].chords.map((c) => c.name).join(' '), 'C Am');
+const rmChord = removeChord(setted, 0, 1, 't5');
+eq('removeChord drops one chord, row keeps the rest', rmChord.progressions[0].chords.map((c) => c.name).join(' '), 'C');
+ok('removeChord is immutable', setted.progressions[0].chords.length === 2);
+const rmRow = removeChord(rmChord, 0, 0, 't6'); // row 0 has one chord left, but 2 rows exist -> drop the row
+eq('removeChord on a row\'s last chord drops the row', rmRow.progressions.length, 1);
+const soleSong = appendRow(createSong('t0'), cMaj, 't1');
+ok('removeChord no-ops on the last chord of the only row', removeChord(soleSong, 0, 0, 't2') === soleSong);
+ok('a hand-built song passes validateSong', validateSong(finalizeDraft(added, 'Hand Built', [], 't7')).ok);
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail ? 1 : 0);

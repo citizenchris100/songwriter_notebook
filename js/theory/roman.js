@@ -98,3 +98,46 @@ export function chordFromToken(tonic, token) {
     notes: notes.map(noteName),
   };
 }
+
+// Build a chord directly from an absolute root Note and a quality id (any key of
+// QUALITIES; the Songs-tab picker uses 'maj' / 'min'). Same speller as chordFromToken,
+// so the triad is spelled correctly relative to the root. Returns
+// { root, symbol, quality, name, notes:[name strings] }, or null for a bad quality.
+export function chordFromRootAndQuality(root, quality) {
+  const q = QUALITIES[quality];
+  if (!q) return null;
+  const notes = q.ivals.map(([lo, semi]) => spell(root, lo, semi));
+  return {
+    root,
+    symbol: q.symbol,
+    quality,
+    name: noteName(root) + q.symbol,
+    notes: notes.map(noteName),
+  };
+}
+
+// The 12 chromatic tones from C, each carrying BOTH spellings of its root. The
+// Songs-tab picker lists these; naturals have identical sharp/flat, the 5 black keys
+// carry both (label shows both, e.g. "C♯ / D♭").
+export const CHROMATIC_TONES = [
+  { label: 'C', sharp: { letter: 0, acc: 0 }, flat: { letter: 0, acc: 0 } },
+  { label: 'C♯ / D♭', sharp: { letter: 0, acc: 1 }, flat: { letter: 1, acc: -1 } },
+  { label: 'D', sharp: { letter: 1, acc: 0 }, flat: { letter: 1, acc: 0 } },
+  { label: 'D♯ / E♭', sharp: { letter: 1, acc: 1 }, flat: { letter: 2, acc: -1 } },
+  { label: 'E', sharp: { letter: 2, acc: 0 }, flat: { letter: 2, acc: 0 } },
+  { label: 'F', sharp: { letter: 3, acc: 0 }, flat: { letter: 3, acc: 0 } },
+  { label: 'F♯ / G♭', sharp: { letter: 3, acc: 1 }, flat: { letter: 4, acc: -1 } },
+  { label: 'G', sharp: { letter: 4, acc: 0 }, flat: { letter: 4, acc: 0 } },
+  { label: 'G♯ / A♭', sharp: { letter: 4, acc: 1 }, flat: { letter: 5, acc: -1 } },
+  { label: 'A', sharp: { letter: 5, acc: 0 }, flat: { letter: 5, acc: 0 } },
+  { label: 'A♯ / B♭', sharp: { letter: 5, acc: 1 }, flat: { letter: 6, acc: -1 } },
+  { label: 'B', sharp: { letter: 6, acc: 0 }, flat: { letter: 6, acc: 0 } },
+];
+
+// Build the chord for a CHROMATIC_TONES entry + quality, choosing the root spelling
+// that avoids double accidentals: flat root for major (E♭, A♭ …), sharp root for minor
+// (C♯m, G♯m …). Naturals are unaffected (their sharp and flat spellings are identical).
+export function chordForTone(tone, quality) {
+  const root = quality === 'min' ? tone.sharp : tone.flat;
+  return chordFromRootAndQuality(root, quality);
+}

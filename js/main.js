@@ -18,11 +18,16 @@ import {
   validateSong, normalizeSong, nextUntitledName, slugifySongId, buildCapturedProgression,
   createSong, appendProgressions, reorderProgression, removeProgression,
   setProgressionLabel, setLyrics, renameSong, finalizeDraft,
+  appendRow, addChord, setChord, removeChord,
 } from './songs.js';
+import { chordFromRootAndQuality } from './theory/roman.js';
 import { mountApp } from './ui.js';
 
 const rootEl = document.getElementById('app');
 const nowISO = () => new Date().toISOString();
+
+// The default chord for a new row / the + button: C major.
+const cMajor = () => chordFromRootAndQuality({ letter: 0, acc: 0 }, 'maj');
 
 let builtinFeels = [];
 let builtinIds = [];
@@ -213,6 +218,21 @@ const handlers = {
     onSetLabel: (i, lblValue) => { updateActive((s, now) => setProgressionLabel(s, i, lblValue, now)); render(); },
     onReorder: (i, dir) => { updateActive((s, now) => reorderProgression(s, i, dir, now)); render(); },
     onRemoveProgression: (i) => { updateActive((s, now) => removeProgression(s, i, now)); render(); },
+
+    // ---- hand-editing: build a song by hand in the Songs tab ----
+    // Start a new draft song with one seeded C-major row (works with no song selected).
+    onNewSong: () => {
+      const now = nowISO();
+      draftSong = appendRow(createSong(now), cMajor(), now);
+      currentSongId = null;
+      currentView = 'songs';
+      genFlash = null;
+      render();
+    },
+    onNewRow: () => { updateActive((s, now) => appendRow(s, cMajor(), now)); render(); },
+    onAddChord: (i) => { updateActive((s, now) => addChord(s, i, cMajor(), now)); render(); },
+    onSetChord: (i, j, chord) => { updateActive((s, now) => setChord(s, i, j, chord, now)); render(); },
+    onRemoveChord: (i, j) => { updateActive((s, now) => removeChord(s, i, j, now)); render(); },
 
     // Capture lyrics without re-rendering (keeps the textarea caret); autosaves a saved song.
     onLyricsChange: (text) => { updateActive((s, now) => setLyrics(s, text, now)); },

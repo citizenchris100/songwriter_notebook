@@ -167,6 +167,55 @@ export function removeProgression(song, index, now) {
   return { ...song, progressions: ps, updatedAt: now };
 }
 
+// ---- hand-editing: build rows/chords by hand in the Songs tab ----
+// Chords are stored as the contractual {name, notes} snapshot only; strip any extra
+// fields a builder (chordFromRootAndQuality) carries so the row stays schema-valid.
+const cleanChord = (c) => ({ name: String(c.name), notes: c.notes.slice() });
+
+// A fresh section row seeded with one chord (rows are never empty — see the schema's
+// "≥1 chord" rule, which this preserves).
+export function newSectionRow(chord) {
+  return { label: '', title: '', chords: [cleanChord(chord)] };
+}
+
+// Append a new seeded row at the bottom.
+export function appendRow(song, chord, now) {
+  return { ...song, progressions: song.progressions.concat([newSectionRow(chord)]), updatedAt: now };
+}
+
+// Push a chord onto row i.
+export function addChord(song, i, chord, now) {
+  if (i < 0 || i >= song.progressions.length) return song;
+  const ps = song.progressions.map((p, k) => (k === i ? { ...p, chords: p.chords.concat([cleanChord(chord)]) } : p));
+  return { ...song, progressions: ps, updatedAt: now };
+}
+
+// Replace chord j in row i.
+export function setChord(song, i, j, chord, now) {
+  if (i < 0 || i >= song.progressions.length) return song;
+  const row = song.progressions[i];
+  if (j < 0 || j >= row.chords.length) return song;
+  const chords = row.chords.map((c, k) => (k === j ? cleanChord(chord) : c));
+  const ps = song.progressions.map((p, k) => (k === i ? { ...p, chords } : p));
+  return { ...song, progressions: ps, updatedAt: now };
+}
+
+// Remove chord j from row i. If it was the row's only chord, drop the whole row —
+// unless it is the song's only row, in which case no-op (a song keeps ≥1 row, ≥1 chord).
+export function removeChord(song, i, j, now) {
+  if (i < 0 || i >= song.progressions.length) return song;
+  const row = song.progressions[i];
+  if (j < 0 || j >= row.chords.length) return song;
+  if (row.chords.length > 1) {
+    const chords = row.chords.slice(); chords.splice(j, 1);
+    const ps = song.progressions.map((p, k) => (k === i ? { ...p, chords } : p));
+    return { ...song, progressions: ps, updatedAt: now };
+  }
+  if (song.progressions.length <= 1) return song; // keep the song non-empty
+  const ps = song.progressions.slice(); ps.splice(i, 1);
+  return { ...song, progressions: ps, updatedAt: now };
+}
+
 export function setProgressionLabel(song, index, label, now) {
   if (index < 0 || index >= song.progressions.length) return song;
   const lbl = LABEL_SET.has(label) ? label : '';

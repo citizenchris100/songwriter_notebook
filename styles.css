@@ -159,3 +159,42 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
 }
 .switchconfirm:not(:empty) { margin-top: 8px; }
 .songs-panel { max-width: 760px; }
+
+/* ===== Songs tab: hand-editing (tappable chips, add chord, new row/song, picker) ===== */
+.prow.songchips { flex-wrap: wrap; overflow-x: visible; align-items: stretch; }
+.pchip.editable { cursor: pointer; transition: border-color .1s ease, background .1s ease; }
+.pchip.editable:hover { border-color: var(--accent-soft); }
+.pchip.editable:active { transform: translateY(1px); }
+.pchip.addchord {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 46px; font-size: 22px; font-weight: 700; color: var(--muted);
+  background: var(--panel-2); border: 1px dashed var(--line); cursor: pointer;
+}
+.pchip.addchord:hover { color: var(--text); border-color: var(--accent-soft); }
+.pchip.addchord:active { transform: translateY(1px); }
+.btn.newrow { width: 100%; border-style: dashed; color: var(--muted); }
+.btn.newrow:hover { color: var(--text); }
+.btn.newsong { min-width: 160px; }
+
+.chordpicker {
+  position: fixed; z-index: 100; width: 190px;
+  background: var(--panel); border: 1px solid var(--accent); border-radius: 12px;
+  padding: 8px; box-shadow: 0 12px 34px rgba(0, 0, 0, .5);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.cp-arrow {
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 8px; padding: 4px 0; font-size: 12px; line-height: 1; cursor: pointer;
+}
+.cp-arrow:active { transform: translateY(1px); }
+.cp-list { display: flex; flex-direction: column; gap: 4px; max-height: 216px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+.cp-tone {
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 8px; padding: 9px 10px; font-size: 15px; font-weight: 600; line-height: 1;
+  cursor: pointer; text-align: center;
+}
+.cp-tone.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.cp-quality { display: flex; align-items: center; gap: 6px; border-top: 1px solid var(--line); padding-top: 6px; }
+.cp-qname { font-size: 13px; font-weight: 700; color: var(--accent-soft); margin-right: auto; }
+.cp-remove { border-top: 1px solid var(--line); padding-top: 6px; display: flex; }
+.cp-remove .btn.mini.danger { width: 100%; justify-content: center; }
