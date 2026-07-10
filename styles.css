@@ -198,3 +198,16 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
 .cp-qname { font-size: 13px; font-weight: 700; color: var(--accent-soft); margin-right: auto; }
 .cp-remove { border-top: 1px solid var(--line); padding-top: 6px; display: flex; }
 .cp-remove .btn.mini.danger { width: 100%; justify-content: center; }
+
+/* ===== Sketches (audio attachments) ===== */
+.sketchnote { margin: 8px 0 4px; }
+.saved.sketch { cursor: pointer; }
+.saved.sketch.on { border-color: var(--accent); }
+.saved.sketch .nm { word-break: break-word; }
+.sketch-detail {
+  border-top: 1px solid var(--line); margin-top: 5px; padding-top: 8px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.sketch-player { display: flex; align-items: center; gap: 6px; }
+.sketch-pstat { font-size: 12px; color: var(--muted); margin-left: 2px; }
+.sketch-notes { margin-top: 0; }

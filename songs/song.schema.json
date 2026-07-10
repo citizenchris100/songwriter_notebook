@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://citizenchris100.github.io/songwriter_notebook/songs/song.schema.json",
   "title": "Songwriter Notebook song",
-  "description": "A saved song: an ordered list of captured chord progressions plus lyrics and metadata. Captured progressions are FIXED SNAPSHOTS — each chord's name + notes are frozen at capture time and never re-derived — with provenance (which feel/key it came from) and a presets-only section label. Songs are user content stored per-device in localStorage (key sn_songs); there are no built-in song files, so this schema is documentation/editor-validation only and is NOT fetched at runtime (js/songs.js validateSong mirrors it). Forward-compatible: future per-song or per-progression fields (tempo, time signature, tags) may be added without breaking older records.",
+  "description": "A saved song: an ordered list of captured chord progressions plus lyrics, audio sketches, and metadata. Captured progressions are FIXED SNAPSHOTS — each chord's name + notes are frozen at capture time and never re-derived — with provenance (which feel/key it came from) and a presets-only section label. Songs are user content stored per-device in localStorage (key sn_songs); there are no built-in song files, so this schema is documentation/editor-validation only and is NOT fetched at runtime (js/songs.js validateSong mirrors it). Forward-compatible: future per-song or per-progression fields (tempo, time signature, tags) may be added without breaking older records. NOTE on export: an exported song BUNDLE additionally carries a top-level `audio` object mapping each sketch id to its base64 bytes; that map is decoded into IndexedDB (sn_audio) on import and is NOT part of this persisted record.",
   "type": "object",
   "required": ["id", "name", "progressions"],
   "properties": {
@@ -73,6 +73,24 @@
               "role": { "type": "string", "description": "main / relative / dominant / subdominant / section." }
             }
           }
+        }
+      }
+    },
+    "sketches": {
+      "type": "array",
+      "description": "Attached audio sketches (metadata only). The audio bytes live out-of-band in IndexedDB (sn_audio), keyed by the sketch id; an exported bundle carries them as base64 in a top-level `audio` map. Additive optional field; absent on older records.",
+      "items": {
+        "type": "object",
+        "required": ["id", "filename", "format"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "description": "Globally-unique id (independent of the song id); also the IndexedDB key for the audio bytes." },
+          "filename": { "type": "string", "minLength": 1, "description": "Original file name of the uploaded recording." },
+          "mimeType": { "type": "string", "description": "Advisory MIME type (e.g. audio/mp4)." },
+          "format": { "type": "string", "enum": ["m4a"], "description": "Accepted audio format. Only .m4a is supported." },
+          "size": { "type": "integer", "description": "Byte size of the audio file." },
+          "addedAt": { "type": "string", "description": "ISO-8601 timestamp the sketch was attached." },
+          "notes": { "type": "string", "description": "Free-form notes for this sketch (like song lyrics)." }
         }
       }
     }

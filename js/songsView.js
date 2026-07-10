@@ -6,6 +6,7 @@
 import { h } from './dom.js';
 import { SECTION_LABELS } from './songs.js';
 import { CHROMATIC_TONES, chordForTone } from './theory/roman.js';
+import { sketchesSection, makeSketchPlayer } from './sketchesView.js';
 
 export function mountSongsView(container, handlers) {
   const {
@@ -13,12 +14,18 @@ export function mountSongsView(container, handlers) {
     onNewSong, onNewRow, onAddChord, onSetChord, onRemoveChord,
     onLyricsChange, onSaveSong, onRenameSong, onDeleteSong,
     onImportSong, onExportCurrent, onExportAllSongs,
+    onAddSketch, onSelectSketch, onDeleteSketch, onSketchNotesChange, onLoadSketchBlob,
   } = handlers;
 
   const rowOf = (child) => { const r = h('div', 'row'); r.appendChild(child); return r; };
 
+  // One persistent audio controller for inline sketch playback — survives the full-view
+  // rebuilds below, so it can own the single <audio> element and revoke object URLs.
+  const player = makeSketchPlayer(onLoadSketchBlob);
+
   function update(vm) {
     closePicker();               // drop any open chord picker before the view is rebuilt
+    player.stop();               // pause any inline sketch playback before the DOM is torn down
     container.textContent = '';
     const wrap = h('div', 'songswrap');
 
@@ -75,6 +82,9 @@ export function mountSongsView(container, handlers) {
     ta.addEventListener('input', () => onLyricsChange(ta.value)); // capture only — no re-render (keeps the caret)
     lyrCard.appendChild(ta);
     wrap.appendChild(rowOf(lyrCard));
+
+    // ---- sketches (audio attachments) ----
+    wrap.appendChild(sketchesSection(song, vm, { onAddSketch, onSelectSketch, onDeleteSketch, onSketchNotesChange }, player));
 
     // ---- save / rename / delete ----
     wrap.appendChild(actionRow(vm));
@@ -210,7 +220,7 @@ export function mountSongsView(container, handlers) {
 
     const btnRow = h('div', 'feel-btns');
     const importBtn = h('button', 'btn mini', 'Import');
-    importBtn.addEventListener('click', () => showStatus(status, onImportSong(box.value)));
+    importBtn.addEventListener('click', async () => showStatus(status, await onImportSong(box.value)));
     const fileLabel = h('label', 'btn mini', 'Upload .json');
     const fileInput = h('input');
     fileInput.type = 'file';
@@ -220,7 +230,7 @@ export function mountSongsView(container, handlers) {
       const f = fileInput.files[0];
       if (!f) return;
       const reader = new FileReader();
-      reader.onload = () => { showStatus(status, onImportSong(String(reader.result))); fileInput.value = ''; };
+      reader.onload = async () => { showStatus(status, await onImportSong(String(reader.result))); fileInput.value = ''; };
       reader.readAsText(f);
     });
     fileLabel.appendChild(fileInput);

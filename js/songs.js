@@ -8,6 +8,8 @@
 // and never re-derived — together with provenance (which feel/key it came from) and a
 // presets-only section label (Verse, Chorus, …).
 
+import { validateSketchMeta, normalizeSketch } from './sketches.js';
+
 const SLUG = /^[a-z0-9][a-z0-9-]*$/;
 
 // Presets-only labels for a captured progression ('' = unlabeled).
@@ -35,6 +37,13 @@ export function validateSong(s) {
 
   if (!Array.isArray(s.progressions) || s.progressions.length < 1) errors.push('progressions must be a non-empty array');
   else s.progressions.forEach((p, i) => validateProgression(p, i, errors));
+
+  // sketches[] is an additive optional field (audio bytes live out-of-band in IndexedDB);
+  // tolerate its absence so v1 songs still validate.
+  if ('sketches' in s) {
+    if (!Array.isArray(s.sketches)) errors.push('sketches must be an array');
+    else s.sketches.forEach((sk, i) => { const v = validateSketchMeta(sk); if (!v.ok) errors.push('sketch ' + i + ': ' + v.errors[0]); });
+  }
 
   return { ok: errors.length === 0, errors };
 }
@@ -75,6 +84,9 @@ export function normalizeSong(s) {
     updatedAt: str(s.updatedAt),
     lyrics: str(s.lyrics),
     progressions: (s.progressions || []).map(normalizeProgression),
+    // Preserve sketch metadata across load (must be a KNOWN field, or the old
+    // strip-unknown-keys behavior would delete it on every relaunch and orphan the audio).
+    sketches: (s.sketches || []).map(normalizeSketch),
   };
 }
 
@@ -144,7 +156,7 @@ export function buildCapturedProgression(state, model, section) {
 
 // A fresh, unsaved draft: no id yet (assigned at first save via finalizeDraft).
 export function createSong(now) {
-  return { schemaVersion: 1, id: '', name: '', createdAt: now, updatedAt: now, lyrics: '', progressions: [] };
+  return { schemaVersion: 1, id: '', name: '', createdAt: now, updatedAt: now, lyrics: '', progressions: [], sketches: [] };
 }
 
 export function appendProgressions(song, snaps, now) {

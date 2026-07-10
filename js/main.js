@@ -20,11 +20,27 @@ import {
   setProgressionLabel, setLyrics, renameSong, finalizeDraft,
   appendRow, addChord, setChord, removeChord,
 } from './songs.js';
+import { isAcceptedAudio, makeSketchMeta, addSketchMeta, removeSketchMeta, setSketchNotes } from './sketches.js';
+import * as audioStore from './audioStore.js';
 import { chordFromRootAndQuality } from './theory/roman.js';
 import { mountApp } from './ui.js';
 
 const rootEl = document.getElementById('app');
 const nowISO = () => new Date().toISOString();
+// A globally-unique, song-independent sketch id — also the IndexedDB key for its audio.
+const newSketchId = () => (typeof crypto !== 'undefined' && crypto.randomUUID
+  ? crypto.randomUUID()
+  : 's-' + Date.now() + '-' + Math.random().toString(36).slice(2));
+
+// Best-effort durable storage so iOS is less likely to evict a user's audio. Requested
+// once, lazily, the first time a sketch is stored.
+let persistRequested = false;
+function ensurePersist() {
+  if (persistRequested) return Promise.resolve();
+  persistRequested = true;
+  try { if (navigator.storage && navigator.storage.persist) return navigator.storage.persist().catch(() => {}); } catch {}
+  return Promise.resolve();
+}
 
 // The default chord for a new row / the + button: C major.
 const cMajor = () => chordFromRootAndQuality({ letter: 0, acc: 0 }, 'maj');
@@ -45,6 +61,8 @@ let currentView = 'progressions';
 let currentSongId = null;   // id of the selected saved song (null when none/draft)
 let draftSong = null;       // an unsaved new song (from "Create song"); no id yet
 let genFlash = null;        // transient note on the generator (e.g. "Added to …")
+let currentSketchId = null; // id of the selected sketch in the active song (master-detail)
+let sketchFlash = null;     // transient sketch add accept/reject status (survives one render)
 
 function recompute() {
   const merged = mergeFeels(builtinFeels, userFeels);
@@ -72,6 +90,8 @@ function songViewModel() {
     currentSongName: active ? (draftSong ? '(unsaved draft)' : active.name) : '',
     selectedId: draftSong ? '__draft__' : (currentSongId || null),
     nextName: nextUntitledName(songs.map((s) => s.name)),
+    currentSketchId,
+    sketchFlash,
   };
 }
 
@@ -121,7 +141,8 @@ function toFeelFile(f) {
   return out;
 }
 
-// Build a clean songs/<id>.json-shaped object for export.
+// Build a clean songs/<id>.json-shaped object for export (metadata only; audio bytes
+// are added by toSongBundle).
 function toSongFile(s) {
   return {
     '$schema': './song.schema.json',
@@ -136,7 +157,95 @@ function toSongFile(s) {
       if (p.provenance) out.provenance = { ...p.provenance };
       return out;
     }),
+    sketches: (s.sketches || []).map((sk) => ({
+      id: sk.id, filename: sk.filename, mimeType: sk.mimeType, format: sk.format, size: sk.size, addedAt: sk.addedAt, notes: sk.notes,
+    })),
   };
+}
+
+// Read a Blob as base64 (no "data:...," prefix).
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => { const s = String(r.result); const i = s.indexOf(','); resolve(i >= 0 ? s.slice(i + 1) : s); };
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+// Decode base64 back into a Blob of the given mime type.
+function base64ToBlob(b64, mimeType) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: mimeType || '' });
+}
+
+// A self-contained bundle: the song file plus a base64 audio map keyed by sketch id.
+// Keeping bytes in a separate `audio` map (not inside each sketch record) leaves the
+// sketches[] metadata byte-identical to what's stored, so import validates it unchanged.
+async function toSongBundle(song) {
+  const base = toSongFile(song);
+  const audio = {};
+  for (const sk of (song.sketches || [])) {
+    let blob;
+    try { blob = await audioStore.getBlob(sk.id); } catch { blob = null; }
+    if (!blob) continue;
+    audio[sk.id] = { mimeType: sk.mimeType || blob.type || '', b64: await blobToBase64(blob) };
+  }
+  base.audio = audio;
+  return base;
+}
+
+// Import one raw song/bundle object: validate, normalize, resolve id collisions, decode
+// its audio under FRESH sketch ids (so re-import never clobbers existing blobs), and
+// persist. Returns { ok, name } or { ok:false, error }. Sets currentSongId on success.
+async function importOneSong(raw) {
+  const v = validateSong(raw);
+  if (!v.ok) return { ok: false, error: v.errors[0] };
+  let s = normalizeSong(raw);
+  const now = nowISO();
+  if (!s.createdAt) s = { ...s, createdAt: now };
+  if (!s.updatedAt) s = { ...s, updatedAt: now };
+  if (songs.some((x) => x.id === s.id)) s = { ...s, id: slugifySongId(s.name, songs.map((x) => x.id)) };
+
+  const audioMap = (raw && raw.audio) || {};
+  const rekeyed = [];
+  for (const sk of s.sketches) {
+    const entry = audioMap[sk.id];
+    if (!entry || typeof entry.b64 !== 'string') continue;  // no bytes → drop this sketch's metadata
+    const newId = newSketchId();
+    try { await audioStore.putBlob(newId, base64ToBlob(entry.b64, entry.mimeType || sk.mimeType || '')); rekeyed.push({ ...sk, id: newId }); }
+    catch { /* write failed → drop this sketch */ }
+  }
+  s = { ...s, sketches: rekeyed };
+
+  songs = songs.concat(s);
+  saveSongs(songs);
+  currentSongId = s.id;
+  return { ok: true, name: s.name };
+}
+
+// After load, drop any sketch metadata whose blob is missing (evicted / never written)
+// and garbage-collect blobs no song references. Self-guarding: an IDB failure leaves the
+// songs list untouched.
+async function reconcileSketches(list) {
+  let keys;
+  try { keys = new Set(await audioStore.allKeys()); }
+  catch { return list; }
+  const referenced = new Set();
+  let changed = false;
+  const out = list.map((song) => {
+    const sk = song.sketches || [];
+    const kept = sk.filter((x) => keys.has(x.id));
+    kept.forEach((x) => referenced.add(x.id));
+    if (kept.length !== sk.length) { changed = true; return { ...song, sketches: kept }; }
+    return song;
+  });
+  if (changed) saveSongs(out);
+  const orphans = [...keys].filter((k) => !referenced.has(k));
+  if (orphans.length) audioStore.deleteMany(orphans).catch(() => {});
+  return out;
 }
 
 function download(filename, obj) {
@@ -192,6 +301,8 @@ const handlers = {
     const now = nowISO();
     draftSong = appendProgressions(createSong(now), snaps, now);
     currentSongId = null;
+    currentSketchId = null;
+    sketchFlash = null;
     currentView = 'songs';
     genFlash = null;
     render();
@@ -213,6 +324,8 @@ const handlers = {
       if (target === '__draft__') return; // already the active draft
       draftSong = null;
       currentSongId = target || null;
+      currentSketchId = null;
+      sketchFlash = null;
       render();
     },
     onSetLabel: (i, lblValue) => { updateActive((s, now) => setProgressionLabel(s, i, lblValue, now)); render(); },
@@ -225,6 +338,8 @@ const handlers = {
       const now = nowISO();
       draftSong = appendRow(createSong(now), cMajor(), now);
       currentSongId = null;
+      currentSketchId = null;
+      sketchFlash = null;
       currentView = 'songs';
       genFlash = null;
       render();
@@ -236,6 +351,48 @@ const handlers = {
 
     // Capture lyrics without re-rendering (keeps the textarea caret); autosaves a saved song.
     onLyricsChange: (text) => { updateActive((s, now) => setLyrics(s, text, now)); },
+
+    // ---- sketches (audio attachments) ----
+    // Add an .m4a: write the BYTES to IndexedDB first, then (if the same song is still
+    // active) the metadata to localStorage — so a mid-op failure never leaves metadata
+    // pointing at a missing blob. The audio never touches localStorage.
+    onAddSketch: async (file) => {
+      sketchFlash = null;
+      const check = isAcceptedAudio(file.name, file.type);
+      if (!check.ok) { sketchFlash = { ok: false, error: check.error }; render(); return; }
+      if (file.size > 25 * 1024 * 1024) { sketchFlash = { ok: false, error: 'That file is too large (25 MB max).' }; render(); return; }
+      if (!activeSong()) return;
+      const wasDraft = !!draftSong;
+      const beforeId = currentSongId;
+      const id = newSketchId();
+      try { await ensurePersist(); await audioStore.putBlob(id, file); }
+      catch { sketchFlash = { ok: false, error: 'Could not store audio (storage full or unavailable).' }; render(); return; }
+      // Only commit metadata if the intended song is still the active one.
+      const stillSame = wasDraft ? !!draftSong : (!draftSong && currentSongId === beforeId && songs.some((s) => s.id === beforeId));
+      if (!stillSame) { audioStore.deleteBlob(id).catch(() => {}); return; }
+      updateActive((s, now) => addSketchMeta(s, makeSketchMeta({ id, filename: file.name, mimeType: file.type, size: file.size }, now), now));
+      currentSketchId = id;
+      sketchFlash = { ok: true, name: file.name };
+      render();
+    },
+
+    onSelectSketch: (id) => { currentSketchId = id; render(); },
+
+    // Delete: drop the METADATA first (removes the reference), then best-effort delete the
+    // blob. An orphaned blob is garbage-collected by reconcileSketches on next load.
+    onDeleteSketch: (id) => {
+      updateActive((s, now) => removeSketchMeta(s, id, now));
+      if (currentSketchId === id) currentSketchId = null;
+      sketchFlash = null;
+      render();
+      audioStore.deleteBlob(id).catch(() => {});
+    },
+
+    // Capture sketch notes without re-rendering (keeps the caret) — the lyrics pattern.
+    onSketchNotesChange: (id, text) => { updateActive((s, now) => setSketchNotes(s, id, text, now)); },
+
+    // Load a sketch's audio blob for the inline player (impure; IndexedDB).
+    onLoadSketchBlob: (id) => audioStore.getBlob(id),
 
     onSaveSong: (name) => {
       if (draftSong) {
@@ -258,36 +415,42 @@ const handlers = {
       render();
     },
     onDeleteSong: (id) => {
+      const gone = songs.find((s) => s.id === id);
       songs = songs.filter((s) => s.id !== id);
       saveSongs(songs);
-      if (currentSongId === id) currentSongId = null;
+      if (currentSongId === id) { currentSongId = null; currentSketchId = null; sketchFlash = null; }
       render();
+      // Best-effort: drop the deleted song's audio blobs (reconcile also GCs them later).
+      if (gone && gone.sketches && gone.sketches.length) audioStore.deleteMany(gone.sketches.map((sk) => sk.id)).catch(() => {});
     },
 
-    // Import a pasted/uploaded song JSON. Returns { ok, name } or { ok:false, error }.
-    onImportSong: (text) => {
+    // Import a pasted/uploaded song bundle (single object or an array). Reconstructs the
+    // audio in IndexedDB from the embedded base64. Returns { ok, name }/{ ok:false, error }.
+    onImportSong: async (text) => {
       let obj;
       try { obj = JSON.parse(text); } catch { return { ok: false, error: 'not valid JSON' }; }
-      const v = validateSong(obj);
-      if (!v.ok) return { ok: false, error: v.errors[0] };
-      let s = normalizeSong(obj);
-      const now = nowISO();
-      if (!s.createdAt) s = { ...s, createdAt: now };
-      if (!s.updatedAt) s = { ...s, updatedAt: now };
-      if (songs.some((x) => x.id === s.id)) s = { ...s, id: slugifySongId(s.name, songs.map((x) => x.id)) };
-      songs = songs.concat(s);
-      saveSongs(songs);
+      const items = Array.isArray(obj) ? obj : [obj];
+      const results = [];
+      for (const raw of items) results.push(await importOneSong(raw));
       draftSong = null;
-      currentSongId = s.id;
+      currentSketchId = null;
+      sketchFlash = null;
       currentView = 'songs';
       render();
-      return { ok: true, name: s.name };
+      if (results.length === 1) return results[0];
+      const okCount = results.filter((r) => r.ok).length;
+      return okCount ? { ok: true, name: okCount + ' songs' } : { ok: false, error: (results[0] && results[0].error) || 'nothing to import' };
     },
-    onExportCurrent: () => {
+    onExportCurrent: async () => {
       const a = activeSong();
-      if (a && a.id) download(a.id + '.json', toSongFile(a)); // a draft has no id yet; save it first
+      if (a && a.id) download(a.id + '.json', await toSongBundle(a)); // a draft has no id yet; save it first
     },
-    onExportAllSongs: () => { if (songs.length) download('songwriter-songs.json', songs.map(toSongFile)); },
+    onExportAllSongs: async () => {
+      if (!songs.length) return;
+      const bundles = [];
+      for (const s of songs) bundles.push(await toSongBundle(s));
+      download('songwriter-songs.json', bundles);
+    },
   },
 };
 
@@ -309,6 +472,7 @@ const handlers = {
 
   state = load(feelIds, builtinIds);
   songs = loadSongs();
+  songs = await reconcileSketches(songs);   // drop dangling sketch metadata, GC orphan blobs
   app = mountApp(rootEl, handlers);
   commit();
 })();

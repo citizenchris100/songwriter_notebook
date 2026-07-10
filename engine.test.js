@@ -20,6 +20,10 @@ import {
   setProgressionLabel, setLyrics, renameSong, finalizeDraft,
   appendRow, addChord, setChord, removeChord,
 } from './js/songs.js';
+import {
+  isAcceptedAudio, makeSketchMeta, validateSketchMeta,
+  addSketchMeta, removeSketchMeta, setSketchNotes,
+} from './js/sketches.js';
 import { chordFromRootAndQuality, chordForTone, CHROMATIC_TONES } from './js/theory/roman.js';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
@@ -186,7 +190,7 @@ const sw = readFileSync(here('./sw.js'), 'utf8');
 ok('sw.js caches the manifest', sw.includes('"./feels/index.json"'));
 for (const id of BUILTIN_IDS) ok('sw.js caches feel ' + id, sw.includes(`"./feels/${id}.json"`));
 ok('sw.js caches the roman.js module', sw.includes('"./js/theory/roman.js"'));
-for (const f of ['dom', 'songs', 'songStore', 'songsView']) ok('sw.js caches ' + f + '.js', sw.includes(`"./js/${f}.js"`));
+for (const f of ['dom', 'songs', 'songStore', 'songsView', 'sketches', 'audioStore', 'sketchesView']) ok('sw.js caches ' + f + '.js', sw.includes(`"./js/${f}.js"`));
 
 // ============================================================================
 // 9. Chromatic (Roman-numeral token) feels — non-diatonic progressions
@@ -384,6 +388,60 @@ eq('removeChord on a row\'s last chord drops the row', rmRow.progressions.length
 const soleSong = appendRow(createSong('t0'), cMaj, 't1');
 ok('removeChord no-ops on the last chord of the only row', removeChord(soleSong, 0, 0, 't2') === soleSong);
 ok('a hand-built song passes validateSong', validateSong(finalizeDraft(added, 'Hand Built', [], 't7')).ok);
+
+// ============================================================================
+// 13. Sketches (pure) — format acceptance, metadata, and song sketch transforms
+// ============================================================================
+// isAcceptedAudio: only .m4a, extension-authoritative, case-insensitive.
+ok('isAcceptedAudio accepts .m4a', isAcceptedAudio('idea.m4a', 'audio/mp4').ok);
+ok('isAcceptedAudio accepts .M4A (case-insensitive)', isAcceptedAudio('IDEA.M4A', '').ok);
+eq('isAcceptedAudio reports the format', isAcceptedAudio('idea.m4a', '').format, 'm4a');
+ok('isAcceptedAudio rejects .mp3', !isAcceptedAudio('idea.mp3', 'audio/mpeg').ok);
+ok('isAcceptedAudio rejects .wav', !isAcceptedAudio('idea.wav', 'audio/wav').ok);
+ok('isAcceptedAudio rejects .flac', !isAcceptedAudio('idea.flac', 'audio/flac').ok);
+ok('isAcceptedAudio rejects no extension', !isAcceptedAudio('idea', '').ok);
+ok('isAcceptedAudio error names m4a', /m4a/.test(isAcceptedAudio('x.ogg', '').error));
+
+// makeSketchMeta: fields set, addedAt injected, notes empty.
+const skMeta = makeSketchMeta({ id: 'sk1', filename: 'idea.m4a', mimeType: 'audio/mp4', size: 4096 }, 'T');
+eq('makeSketchMeta id', skMeta.id, 'sk1');
+eq('makeSketchMeta filename', skMeta.filename, 'idea.m4a');
+eq('makeSketchMeta format', skMeta.format, 'm4a');
+eq('makeSketchMeta size', skMeta.size, 4096);
+eq('makeSketchMeta addedAt is the injected now', skMeta.addedAt, 'T');
+eq('makeSketchMeta notes empty', skMeta.notes, '');
+
+// validateSketchMeta.
+ok('validateSketchMeta accepts a good record', validateSketchMeta(skMeta).ok);
+ok('validateSketchMeta rejects a missing id', !validateSketchMeta({ filename: 'x.m4a', format: 'm4a' }).ok);
+ok('validateSketchMeta rejects a missing filename', !validateSketchMeta({ id: 'a', format: 'm4a' }).ok);
+ok('validateSketchMeta rejects a bad format', !validateSketchMeta({ id: 'a', filename: 'x', format: 'wav' }).ok);
+
+// Song sketch transforms — immutable, updatedAt bumped, notes applied, remove by id.
+const skSong0 = { ...goodSong, sketches: [] };
+const skA = addSketchMeta(skSong0, skMeta, 'T1');
+eq('addSketchMeta appends', skA.sketches.length, 1);
+eq('addSketchMeta bumps updatedAt', skA.updatedAt, 'T1');
+ok('addSketchMeta is immutable', skSong0.sketches.length === 0);
+const skB = setSketchNotes(skA, 'sk1', 'beatbox verse', 'T2');
+eq('setSketchNotes applies', skB.sketches[0].notes, 'beatbox verse');
+eq('setSketchNotes bumps updatedAt', skB.updatedAt, 'T2');
+ok('setSketchNotes is immutable', skA.sketches[0].notes === '');
+ok('setSketchNotes no-ops on a missing id', setSketchNotes(skA, 'nope', 'x', 'T2') === skA);
+const skC = removeSketchMeta(skB, 'sk1', 'T3');
+eq('removeSketchMeta drops by id', skC.sketches.length, 0);
+eq('removeSketchMeta bumps updatedAt', skC.updatedAt, 'T3');
+ok('removeSketchMeta no-ops on a missing id', removeSketchMeta(skB, 'nope', 'T3') === skB);
+
+// validateSong / normalizeSong with sketches (schemaVersion stays 1; additive field).
+ok('validateSong accepts a song with a valid sketches[]', validateSong({ ...goodSong, sketches: [skMeta] }).ok);
+ok('validateSong rejects a sketch with a bad format', !validateSong({ ...goodSong, sketches: [{ id: 'a', filename: 'x.m4a', format: 'wav' }] }).ok);
+ok('validateSong rejects a non-array sketches', !validateSong({ ...goodSong, sketches: 'nope' }).ok);
+ok('normalizeSong defaults missing sketches to []', normalizeSong(goodSong).sketches.length === 0);
+eq('normalizeSong keeps schemaVersion 1', normalizeSong(goodSong).schemaVersion, 1);
+const skNorm = normalizeSong({ ...goodSong, sketches: [{ ...skMeta, bogus: 1 }] });
+ok('normalizeSong strips unknown sketch keys', !('bogus' in skNorm.sketches[0]));
+eq('normalizeSong keeps the sketch id', skNorm.sketches[0].id, 'sk1');
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail ? 1 : 0);
