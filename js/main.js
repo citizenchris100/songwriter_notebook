@@ -248,13 +248,64 @@ async function reconcileSketches(list) {
   return out;
 }
 
-function download(filename, obj) {
-  const blob = new Blob([JSON.stringify(obj, null, 2) + '\n'], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
+// Export sink: give the user a real "save as" experience where the platform supports it,
+// and degrade gracefully where it doesn't. Three tiers, best-first:
+//   1. File System Access API (desktop Chromium): a true OS save dialog — the user edits both
+//      the file NAME and the FOLDER. Opened under the click gesture; the returned handle can be
+//      written to after an async payload build, without needing the gesture again.
+//   2. Web Share with files (iOS Safari / installed iPad PWA, where showSaveFilePicker is absent):
+//      the share sheet's "Save to Files" lets the user pick a folder. Closest thing iOS offers.
+//   3. Anchor download (Firefox, older Safari): drops the file in the browser Downloads folder.
+//
+// openJsonSink() is Phase 1 — call it SYNCHRONOUSLY at the top of the click handler, before
+// building the (possibly async) payload, so the save dialog still has transient activation.
+// It returns a handle sink, a deferred sink (share/download decided once we hold the bytes),
+// or null if the user cancels the save dialog.
+async function openJsonSink(suggestedName) {
+  if (typeof window !== 'undefined' && window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName,
+        types: [{ description: 'Songwriter JSON', accept: { 'application/json': ['.json'] } }],
+      });
+      return { handle, name: suggestedName };
+    } catch (e) {
+      if (e && e.name === 'AbortError') return null;   // user dismissed the save dialog
+      // insecure context / blocked → fall through to the share-or-download path
+    }
+  }
+  return { name: suggestedName };   // decide share vs. download once we hold the bytes
+}
+
+// Phase 2 — write `obj` (built by the caller, possibly after an await) to the sink.
+async function writeJsonSink(sink, obj) {
+  if (!sink) return;                                       // user cancelled in Phase 1
+  const text = JSON.stringify(obj, null, 2) + '\n';
+  const blob = new Blob([text], { type: 'application/json' });
+
+  if (sink.handle) {                                       // tier 1: File System Access handle
+    const writable = await sink.handle.createWritable();
+    try { await writable.write(blob); } finally { await writable.close(); }
+    return;
+  }
+
+  const file = new File([blob], sink.name, { type: 'application/json' });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {   // tier 2: iOS share sheet
+    try { await navigator.share({ files: [file], title: sink.name }); return; }
+    catch (e) { if (e && e.name === 'AbortError') return; /* else fall through to a download */ }
+  }
+
+  const url = URL.createObjectURL(blob);                   // tier 3: anchor download
   const a = document.createElement('a');
-  a.href = url; a.download = filename;
+  a.href = url; a.download = sink.name;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// Convenience for a synchronously-built payload (feels): the object is already in hand, so
+// opening the picker first keeps the click gesture intact.
+async function download(filename, obj) {
+  await writeJsonSink(await openJsonSink(filename), obj);
 }
 
 const handlers = {
@@ -443,13 +494,18 @@ const handlers = {
     },
     onExportCurrent: async () => {
       const a = activeSong();
-      if (a && a.id) download(a.id + '.json', await toSongBundle(a)); // a draft has no id yet; save it first
+      if (!a || !a.id) return;                          // a draft has no id yet; save it first
+      const sink = await openJsonSink(a.id + '.json');  // open the save dialog under the gesture
+      if (!sink) return;                                // user cancelled
+      await writeJsonSink(sink, await toSongBundle(a)); // build the bundle, then write it
     },
     onExportAllSongs: async () => {
       if (!songs.length) return;
+      const sink = await openJsonSink('songwriter-songs.json');
+      if (!sink) return;                                // user cancelled
       const bundles = [];
       for (const s of songs) bundles.push(await toSongBundle(s));
-      download('songwriter-songs.json', bundles);
+      await writeJsonSink(sink, bundles);
     },
   },
 };
