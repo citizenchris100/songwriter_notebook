@@ -10,7 +10,7 @@ import { sketchesSection, makeSketchPlayer } from './sketchesView.js';
 
 export function mountSongsView(container, handlers) {
   const {
-    onSelectSong, onSetLabel, onReorder, onRemoveProgression,
+    onSelectSong, onSetLabel, onReorder, onRemoveProgression, onCopyProgression,
     onNewSong, onNewRow, onAddChord, onSetChord, onRemoveChord,
     onLyricsChange, onSaveSong, onRenameSong, onDeleteSong,
     onImportSong, onExportCurrent, onExportAllSongs,
@@ -107,7 +107,9 @@ export function mountSongsView(container, handlers) {
     const rm = h('button', 'btn mini danger', '✕'); rm.title = 'Remove section';
     rm.disabled = last === 0;     // keep the song non-empty: can't remove its only section
     rm.addEventListener('click', () => onRemoveProgression(i));
-    head.append(lblSel, spacer, up, down, rm);
+    const copy = h('button', 'btn mini', '⧉'); copy.title = 'Duplicate section';
+    copy.addEventListener('click', () => onCopyProgression(i));
+    head.append(lblSel, spacer, up, down, copy, rm);
     sec.appendChild(head);
 
     const prov = p.provenance || {};

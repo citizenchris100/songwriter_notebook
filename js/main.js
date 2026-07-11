@@ -16,7 +16,7 @@ import { validateFeel, normalizeFeel, mergeFeels } from './feels.js';
 import { loadSongs, saveSongs } from './songStore.js';
 import {
   validateSong, normalizeSong, nextUntitledName, slugifySongId, buildCapturedProgression,
-  createSong, appendProgressions, reorderProgression, removeProgression,
+  createSong, appendProgressions, reorderProgression, removeProgression, copyProgression,
   setProgressionLabel, setLyrics, renameSong, finalizeDraft,
   appendRow, addChord, setChord, removeChord,
 } from './songs.js';
@@ -382,6 +382,7 @@ const handlers = {
     onSetLabel: (i, lblValue) => { updateActive((s, now) => setProgressionLabel(s, i, lblValue, now)); render(); },
     onReorder: (i, dir) => { updateActive((s, now) => reorderProgression(s, i, dir, now)); render(); },
     onRemoveProgression: (i) => { updateActive((s, now) => removeProgression(s, i, now)); render(); },
+    onCopyProgression: (i) => { updateActive((s, now) => copyProgression(s, i, now)); render(); },
 
     // ---- hand-editing: build a song by hand in the Songs tab ----
     // Start a new draft song with one seeded C-major row (works with no song selected).

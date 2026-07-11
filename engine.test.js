@@ -16,7 +16,7 @@ import { DEFAULT_STATE, validate, randomize, ROOTS, MODE_IDS } from './js/sessio
 import { validateFeel, normalizeFeel } from './js/feels.js';
 import {
   validateSong, normalizeSong, nextUntitledName, slugifySongId, buildCapturedProgression,
-  createSong, appendProgressions, reorderProgression, removeProgression,
+  createSong, appendProgressions, reorderProgression, removeProgression, copyProgression,
   setProgressionLabel, setLyrics, renameSong, finalizeDraft,
   appendRow, addChord, setChord, removeChord,
 } from './js/songs.js';
@@ -340,6 +340,16 @@ ok('reorder is immutable', draft.progressions[0].title === 'Main Progression');
 eq('reorder bumps updatedAt', reordered.updatedAt, 't2');
 ok('reorder no-op at boundary', reorderProgression(draft, 0, -1, 't2') === draft);
 eq('remove drops one', removeProgression(draft, 0, 't3').progressions.length, 1);
+const copied = copyProgression(draft, 0, 't8');
+eq('copy inserts a row', copied.progressions.length, 3);
+eq('copy sits immediately below source', copied.progressions[1].title, draft.progressions[0].title);
+eq('copy bumps updatedAt', copied.updatedAt, 't8');
+ok('copy is immutable', draft.progressions.length === 2);
+ok('copy deep-copies chords (new ref)', copied.progressions[1].chords !== draft.progressions[0].chords);
+ok('copy deep-copies provenance (new ref, same data)',
+   copied.progressions[1].provenance !== draft.progressions[0].provenance &&
+   copied.progressions[1].provenance.keyLabel === draft.progressions[0].provenance.keyLabel);
+ok('copy no-ops on a bad index', copyProgression(draft, 9, 't8') === draft);
 eq('setLabel applies a preset', setProgressionLabel(draft, 0, 'Chorus', 't4').progressions[0].label, 'Chorus');
 eq('setLabel rejects non-preset -> empty', setProgressionLabel(draft, 0, 'Nope', 't4').progressions[0].label, '');
 eq('setLyrics applies', setLyrics(draft, 'words', 't5').lyrics, 'words');

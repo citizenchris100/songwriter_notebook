@@ -179,6 +179,18 @@ export function removeProgression(song, index, now) {
   return { ...song, progressions: ps, updatedAt: now };
 }
 
+// Duplicate row `index`, inserting the copy immediately below it. Deep-copies chords and
+// provenance so the copy shares no references with the source (edits stay independent).
+export function copyProgression(song, index, now) {
+  if (index < 0 || index >= song.progressions.length) return song;
+  const src = song.progressions[index];
+  const copy = { label: src.label || '', title: src.title || '', chords: src.chords.map(cleanChord) };
+  if (src.provenance) copy.provenance = { ...src.provenance };
+  const ps = song.progressions.slice();
+  ps.splice(index + 1, 0, copy);
+  return { ...song, progressions: ps, updatedAt: now };
+}
+
 // ---- hand-editing: build rows/chords by hand in the Songs tab ----
 // Chords are stored as the contractual {name, notes} snapshot only; strip any extra
 // fields a builder (chordFromRootAndQuality) carries so the row stays schema-valid.
