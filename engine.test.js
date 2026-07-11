@@ -25,6 +25,16 @@ import {
   addSketchMeta, removeSketchMeta, setSketchNotes,
 } from './js/sketches.js';
 import { chordFromRootAndQuality, chordForTone, CHROMATIC_TONES } from './js/theory/roman.js';
+import {
+  validateTake, normalizeTake, validateManifest, normalizeManifest, createManifest,
+  makeTake, appendTake, nextTakeNumber, finalizeTake, finalizeRecoveredTake, discardTake,
+  markBounced, setStemSettings, mostRecentKeptTake, stemFileName, mixFileName, tapeDeckRef,
+  defaultStemSettings, clampStemSettings, compressorParams, bounceGainDb,
+  LUFS_TARGET, LUFS_FLOOR, BOUNCE_GAIN_DB_MIN, BOUNCE_GAIN_DB_MAX, LIMITER_CEILING_DB, STEM_KEYS, TAKE_STATUS,
+} from './js/tape/takeModel.js';
+import { wavHeader, floatToInt16, interleave, parseWav, SIZE_FIELDS } from './js/tape/wav.js';
+import { integratedLoudness } from './js/tape/lufs.js';
+import { limit } from './js/tape/limiter.js';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const readJSON = (p) => JSON.parse(readFileSync(here(p), 'utf8'));
@@ -452,6 +462,216 @@ eq('normalizeSong keeps schemaVersion 1', normalizeSong(goodSong).schemaVersion,
 const skNorm = normalizeSong({ ...goodSong, sketches: [{ ...skMeta, bogus: 1 }] });
 ok('normalizeSong strips unknown sketch keys', !('bogus' in skNorm.sketches[0]));
 eq('normalizeSong keeps the sketch id', skNorm.sketches[0].id, 'sk1');
+
+// tapeDeck reference (additive, like sketches — schemaVersion stays 1).
+ok('validateSong accepts a song with a good tapeDeck ref', validateSong({ ...goodSong, tapeDeck: { path: 'takes/my-song/' } }).ok);
+ok('validateSong rejects a tapeDeck with an empty path', !validateSong({ ...goodSong, tapeDeck: { path: '' } }).ok);
+ok('validateSong rejects a non-object tapeDeck', !validateSong({ ...goodSong, tapeDeck: 'nope' }).ok);
+ok('normalizeSong preserves a present tapeDeck ref', normalizeSong({ ...goodSong, tapeDeck: { path: 'takes/my-song/' } }).tapeDeck.path === 'takes/my-song/');
+ok('normalizeSong omits the tapeDeck key entirely when absent', !('tapeDeck' in normalizeSong(goodSong)));
+
+// ============================================================================
+// 14. Tape deck (pure) — takeModel, wav, lufs, limiter
+// ============================================================================
+
+// ---- takeModel: constants ----
+eq('STEM_KEYS', STEM_KEYS.join(','), 'stem1,stem2');
+eq('TAKE_STATUS', TAKE_STATUS.join(','), 'recording,active,discarded');
+eq('LUFS_TARGET', LUFS_TARGET, -14);
+eq('LUFS_FLOOR', LUFS_FLOOR, -50);
+eq('BOUNCE_GAIN_DB_MIN', BOUNCE_GAIN_DB_MIN, -12);
+eq('BOUNCE_GAIN_DB_MAX', BOUNCE_GAIN_DB_MAX, 20);
+eq('LIMITER_CEILING_DB', LIMITER_CEILING_DB, -1);
+
+// ---- takeModel: naming + ref helpers ----
+eq('stemFileName stem1', stemFileName('blue-eyes', 3, 'stem1'), 'blue-eyes_3_stem1.wav');
+eq('stemFileName stem2', stemFileName('blue-eyes', 3, 'stem2'), 'blue-eyes_3_stem2.wav');
+eq('mixFileName', mixFileName('blue-eyes', 3), 'blue-eyes_3_mix.wav');
+eq('tapeDeckRef path', tapeDeckRef('blue-eyes').path, 'takes/blue-eyes/');
+
+// ---- takeModel: effect settings ----
+eq('defaultStemSettings vol', defaultStemSettings().vol, 1.0);
+eq('defaultStemSettings comp', defaultStemSettings().comp, 0);
+ok('defaultStemSettings eq flat', defaultStemSettings().eq.bass === 0 && defaultStemSettings().eq.mid === 0 && defaultStemSettings().eq.treble === 0);
+eq('clampStemSettings clamps vol high', clampStemSettings({ vol: 99 }).vol, 1.5);
+eq('clampStemSettings clamps vol low', clampStemSettings({ vol: -5 }).vol, 0);
+eq('clampStemSettings clamps eq high', clampStemSettings({ eq: { bass: 99 } }).eq.bass, 12);
+eq('clampStemSettings clamps eq low', clampStemSettings({ eq: { treble: -99 } }).eq.treble, -12);
+eq('clampStemSettings clamps comp', clampStemSettings({ comp: 5 }).comp, 1);
+eq('clampStemSettings defaults missing fields', JSON.stringify(clampStemSettings({})), JSON.stringify(defaultStemSettings()));
+
+// compressorParams(0) MUST be the exact neutral/unity shape (D17) — not whatever
+// the general formula naively evaluates to at c=0.
+const cp0 = compressorParams(0);
+ok('compressorParams(0) is neutral', cp0.threshold === 0 && cp0.ratio === 1 && cp0.knee === 0);
+const cp1 = compressorParams(1);
+ok('compressorParams(1) engages', cp1.threshold < 0 && cp1.ratio > 1 && cp1.makeupDb > 0);
+ok('compressorParams(0.5) is between', compressorParams(0.5).threshold < 0 && compressorParams(0.5).ratio > 1 && compressorParams(0.5).ratio < cp1.ratio);
+
+// ---- takeModel: the bounce gain rule (D25) ----
+eq('bounceGainDb at target already', Math.round(bounceGainDb(-14) * 100) / 100, 0);
+eq('bounceGainDb boosts a quiet take', Math.round(bounceGainDb(-24)), 10);
+eq('bounceGainDb clamps a very quiet (but above-floor) take at the max', bounceGainDb(-40), BOUNCE_GAIN_DB_MAX); // raw would be +26 dB, clamped to +20
+eq('bounceGainDb clamps a loud take at the min', bounceGainDb(10), BOUNCE_GAIN_DB_MIN);
+eq('bounceGainDb skips (0 dB) below the floor', bounceGainDb(-60), 0);
+eq('bounceGainDb skips (0 dB) on silence', bounceGainDb(-Infinity), 0);
+
+// ---- takeModel: manifest + take lifecycle ----
+let man = createManifest('blue-eyes');
+eq('createManifest starts empty', man.takes.length, 0);
+eq('nextTakeNumber on empty manifest', nextTakeNumber(man), 1);
+
+const take1 = makeTake({ slug: 'blue-eyes', take: nextTakeNumber(man), sampleRate: 48000, channels: 2 }, 'T0');
+man = appendTake(man, take1);
+eq('makeTake status is recording', take1.status, 'recording');
+eq('makeTake durationSec null while recording', take1.durationSec, null);
+ok('makeTake stems named for both channels', take1.stems.stem1.file === 'blue-eyes_1_stem1.wav' && take1.stems.stem2.file === 'blue-eyes_1_stem2.wav');
+
+const monoTake = makeTake({ slug: 'blue-eyes', take: 99, sampleRate: 48000, channels: 1 }, 'T0');
+ok('single-stem take has stems.stem2 = null (D24)', monoTake.stems.stem2 === null);
+
+man = finalizeTake(man, 1, 12.5);
+eq('finalizeTake sets active', man.takes[0].status, 'active');
+eq('finalizeTake sets duration', man.takes[0].durationSec, 12.5);
+
+eq('nextTakeNumber after take 1', nextTakeNumber(man), 2);
+const take2 = makeTake({ slug: 'blue-eyes', take: nextTakeNumber(man), sampleRate: 48000, channels: 2 }, 'T1');
+man = appendTake(man, take2);
+man = discardTake(man, 2);
+eq('discardTake sets discarded (tombstone)', man.takes[1].status, 'discarded');
+ok('discardTake nulls stem file fields', man.takes[1].stems.stem1.file === null && man.takes[1].stems.stem2.file === null);
+eq('nextTakeNumber never reuses a discarded number', nextTakeNumber(man), 3);
+
+// a take that died mid-record still occupies its number
+const take3 = makeTake({ slug: 'blue-eyes', take: nextTakeNumber(man), sampleRate: 48000, channels: 2 }, 'T2');
+man = appendTake(man, take3);
+eq('nextTakeNumber counts a "recording" take too', nextTakeNumber(man), 4);
+
+// crash recovery: nonzero bytes -> active + recovered; zero bytes -> tombstone
+const recoveredMan = finalizeRecoveredTake(man, 3, 48000 * 2 * 5, 48000); // 5s mono pcm16
+ok('finalizeRecoveredTake marks active+recovered', recoveredMan.takes[2].status === 'active' && recoveredMan.takes[2].recovered === true);
+eq('finalizeRecoveredTake computes duration from bytes', recoveredMan.takes[2].durationSec, 5);
+const emptyRecoveredMan = finalizeRecoveredTake(man, 3, 0, 48000);
+eq('finalizeRecoveredTake tombstones an empty take', emptyRecoveredMan.takes[2].status, 'discarded');
+
+eq('mostRecentKeptTake picks the highest active take', mostRecentKeptTake(man).take, 1);
+ok('mostRecentKeptTake is null with no active takes', mostRecentKeptTake(createManifest('x')) === null);
+
+const bouncedMan = markBounced(man, 1, { file: 'blue-eyes_1_mix.wav', bouncedAt: 'T3', lufs: -14.1 });
+eq('markBounced sets the bounce record', bouncedMan.takes[0].bounce.file, 'blue-eyes_1_mix.wav');
+
+const settingsMan = setStemSettings(man, 1, 'stem1', { vol: 0.5, eq: { bass: 3 } });
+const s1 = settingsMan.takes[0].stems.stem1;
+ok('setStemSettings merges + clamps, keeps the file name', s1.vol === 0.5 && s1.eq.bass === 3 && s1.eq.mid === 0 && s1.file === 'blue-eyes_1_stem1.wav');
+// A single-stem take's absent stem2 must stay null (D24) — never resurrected as a {file:undefined,...} object.
+const monoMan = { ...man, takes: [{ ...man.takes[0], stems: { stem1: man.takes[0].stems.stem1, stem2: null } }] };
+eq('setStemSettings no-ops on a null stem slot (single-stem take)', setStemSettings(monoMan, 1, 'stem2', { vol: 0.9 }).takes[0].stems.stem2, null);
+
+// ---- takeModel: validate/normalize ----
+ok('validateManifest accepts a well-formed manifest', validateManifest(man).ok);
+ok('validateManifest rejects a bad slug', !validateManifest({ slug: '', takes: [] }).ok);
+ok('validateManifest rejects a non-array takes', !validateManifest({ slug: 'x', takes: 'nope' }).ok);
+ok('validateTake rejects an empty object', !validateTake({}).ok);
+ok('validateTake accepts a normalized take', validateTake(normalizeTake(take1)).ok);
+ok('normalizeManifest fills schemaVersion', normalizeManifest({ slug: 'x', takes: [] }).schemaVersion === 1);
+ok('normalizeTake defaults a missing status to discarded', normalizeTake({ take: 1 }).status === 'discarded');
+
+// ============================================================================
+// 15. Tape deck (pure) — wav.js
+// ============================================================================
+eq('SIZE_FIELDS shape', JSON.stringify(SIZE_FIELDS), JSON.stringify([{ offset: 4, bias: 36 }, { offset: 40, bias: 0 }]));
+
+const hdr = new DataView(wavHeader(2, 48000, 1000));
+eq('wavHeader RIFF magic', String.fromCharCode(hdr.getUint8(0), hdr.getUint8(1), hdr.getUint8(2), hdr.getUint8(3)), 'RIFF');
+eq('wavHeader WAVE magic', String.fromCharCode(hdr.getUint8(8), hdr.getUint8(9), hdr.getUint8(10), hdr.getUint8(11)), 'WAVE');
+eq('wavHeader ChunkSize = dataBytes + 36', hdr.getUint32(4, true), 1036);
+eq('wavHeader NumChannels', hdr.getUint16(22, true), 2);
+eq('wavHeader SampleRate', hdr.getUint32(24, true), 48000);
+eq('wavHeader ByteRate', hdr.getUint32(28, true), 48000 * 2 * 2);
+eq('wavHeader BlockAlign', hdr.getUint16(32, true), 4);
+eq('wavHeader BitsPerSample', hdr.getUint16(34, true), 16);
+eq('wavHeader data magic', String.fromCharCode(hdr.getUint8(36), hdr.getUint8(37), hdr.getUint8(38), hdr.getUint8(39)), 'data');
+eq('wavHeader Subchunk2Size = dataBytes', hdr.getUint32(40, true), 1000);
+
+eq('floatToInt16 clamps +1.5 -> 32767', floatToInt16(new Float32Array([1.5]))[0], 0x7fff);
+eq('floatToInt16 clamps -2 -> -32768', floatToInt16(new Float32Array([-2]))[0], -0x8000);
+eq('floatToInt16 zero', floatToInt16(new Float32Array([0]))[0], 0);
+eq('floatToInt16 asymmetric scale +1', floatToInt16(new Float32Array([1]))[0], 0x7fff);
+eq('floatToInt16 asymmetric scale -1', floatToInt16(new Float32Array([-1]))[0], -0x8000);
+
+const chL = new Float32Array([1, 2, 3]);
+const chR = new Float32Array([10, 20, 30]);
+eq('interleave stereo', Array.from(interleave([chL, chR])).join(','), '1,10,2,20,3,30');
+eq('interleave mono is a no-op', interleave([chL]), chL);
+
+// encode -> parseWav round-trip
+function makeSine(freq, amp, seconds, rate) {
+  const n = Math.round(seconds * rate);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = amp * Math.sin((2 * Math.PI * freq * i) / rate);
+  return out;
+}
+const srcL = makeSine(440, 0.5, 0.01, 48000);
+const srcR = makeSine(660, 0.3, 0.01, 48000);
+const enc16 = floatToInt16(interleave([srcL, srcR]));
+const encBytes = new Uint8Array(enc16.buffer);
+const full = new Uint8Array(44 + encBytes.length);
+full.set(new Uint8Array(wavHeader(2, 48000, encBytes.length)), 0);
+full.set(encBytes, 44);
+const parsed = parseWav(full);
+eq('parseWav channels', parsed.channels, 2);
+eq('parseWav rate', parsed.rate, 48000);
+eq('parseWav frame count', parsed.samples[0].length, srcL.length);
+let maxErrL = 0, maxErrR = 0;
+for (let i = 0; i < srcL.length; i++) { maxErrL = Math.max(maxErrL, Math.abs(parsed.samples[0][i] - srcL[i])); maxErrR = Math.max(maxErrR, Math.abs(parsed.samples[1][i] - srcR[i])); }
+ok('parseWav round-trips within one 16-bit quantization step (L)', maxErrL < 0.0001);
+ok('parseWav round-trips within one 16-bit quantization step (R)', maxErrR < 0.0001);
+
+let threwOnGarbage = false;
+try { parseWav(new Uint8Array(100)); } catch { threwOnGarbage = true; }
+ok('parseWav rejects a non-RIFF buffer', threwOnGarbage);
+
+// ============================================================================
+// 16. Tape deck (pure) — lufs.js
+// ============================================================================
+eq('integratedLoudness of silence is -Infinity', integratedLoudness([new Float32Array(48000)], 48000), -Infinity);
+// Amplitude solved offline (binary search) for -14 LUFS at 1kHz mono, 48kHz.
+const lufsTone = makeSine(1000, 0.28195637900229065, 1.0, 48000);
+const measured = integratedLoudness([lufsTone], 48000);
+ok('a synthesized -14 LUFS tone measures within 0.1 LU of -14', Math.abs(measured - (-14)) < 0.1);
+// Louder tone measures louder; quieter measures quieter (monotonic sanity check).
+const louder = integratedLoudness([makeSine(1000, 0.5, 1.0, 48000)], 48000);
+const quieter = integratedLoudness([makeSine(1000, 0.1, 1.0, 48000)], 48000);
+ok('louder tone measures higher LUFS', louder > measured);
+ok('quieter tone measures lower LUFS', quieter < measured);
+
+// ============================================================================
+// 17. Tape deck (pure) — limiter.js
+// ============================================================================
+const ceilingLinear = Math.pow(10, LIMITER_CEILING_DB / 20);
+const loudSine = [makeSine(1000, Math.pow(10, 3 / 20), 0.05, 48000)]; // +3 dBFS
+limit(loudSine, 48000, LIMITER_CEILING_DB);
+let peak = 0;
+for (const v of loudSine[0]) peak = Math.max(peak, Math.abs(v));
+ok('+3 dBFS sine comes out at or under the ceiling', peak <= ceilingLinear + 1e-6);
+
+// Under-ceiling material passes through bit-identical, accounting for the fixed
+// lookahead delay (a real delay line, not a zero-latency approximation).
+const lookaheadSamples = Math.round(0.005 * 48000);
+const quietSrc = makeSine(440, 0.1, 0.02, 48000);
+const quietCopy = Float32Array.from(quietSrc);
+limit([quietCopy], 48000, LIMITER_CEILING_DB);
+let passthroughExact = true;
+for (let i = 0; i < lookaheadSamples; i++) if (quietCopy[i] !== 0) passthroughExact = false;
+for (let i = lookaheadSamples; i < quietSrc.length; i++) if (quietCopy[i] !== quietSrc[i - lookaheadSamples]) passthroughExact = false;
+ok('under-ceiling material passes through bit-identical (delay-shifted)', passthroughExact);
+
+// ============================================================================
+// 18. Tape deck — sw.js caches every new module (tape/… asset-list assertion)
+// ============================================================================
+for (const f of ['tape/takeModel', 'tape/wav', 'tape/lufs', 'tape/limiter', 'tape/audioEngine', 'tape/takeStore', 'tape/opfsWorker', 'tape/captureProcessor', 'tape/devices', 'tape/tapeView']) {
+  ok('sw.js caches ' + f + '.js', sw.includes(`"./js/${f}.js"`));
+}
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail ? 1 : 0);

@@ -45,6 +45,15 @@ export function validateSong(s) {
     else s.sketches.forEach((sk, i) => { const v = validateSketchMeta(sk); if (!v.ok) errors.push('sketch ' + i + ': ' + v.errors[0]); });
   }
 
+  // tapeDeck is an additive optional field: a small reference to the song's OPFS
+  // take directory (the take audio + manifest live out-of-band there, never in
+  // this record — see js/tape/takeModel.js tapeDeckRef).
+  if ('tapeDeck' in s) {
+    const td = s.tapeDeck;
+    if (td == null || typeof td !== 'object' || Array.isArray(td)) errors.push('tapeDeck must be an object');
+    else if (typeof td.path !== 'string' || td.path.length < 1) errors.push('tapeDeck.path must be a non-empty string');
+  }
+
   return { ok: errors.length === 0, errors };
 }
 
@@ -76,7 +85,7 @@ function validateProgression(p, i, errors) {
 // Reduce a validated song to the fields the app persists (drops unknown/$schema keys,
 // fills missing optionals). Pure.
 export function normalizeSong(s) {
-  return {
+  const out = {
     schemaVersion: 1,
     id: s.id,
     name: s.name,
@@ -88,6 +97,12 @@ export function normalizeSong(s) {
     // strip-unknown-keys behavior would delete it on every relaunch and orphan the audio).
     sketches: (s.sketches || []).map(normalizeSketch),
   };
+  // Same reasoning for tapeDeck: a known field, present only when the deck has
+  // actually been opened once (absent key, not null, when there is no deck).
+  if (s.tapeDeck && typeof s.tapeDeck === 'object' && typeof s.tapeDeck.path === 'string') {
+    out.tapeDeck = { path: s.tapeDeck.path };
+  }
+  return out;
 }
 
 function normalizeProgression(p) {

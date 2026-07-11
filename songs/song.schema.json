@@ -93,6 +93,14 @@
           "notes": { "type": "string", "description": "Free-form notes for this sketch (like song lyrics)." }
         }
       }
+    },
+    "tapeDeck": {
+      "type": "object",
+      "description": "A small reference to this song's tape-deck take directory in OPFS. The take audio, per-take vol/EQ/comp settings, and the manifest itself all live out-of-band under that OPFS path (js/tape/takeModel.js, js/tape/takeStore.js) — never in this record, and never in an exported song bundle (takes are Share/Export-per-file only; see TAPE_DECK_SPEC.md D3). Additive optional field, present only once a song's deck has been opened at least once; stripped on import (a re-slugged or foreign song's deck is recreated on next open).",
+      "required": ["path"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "description": "The OPFS virtual path, e.g. \"takes/blue-eyes/\". Pinned to the song's immutable id, not its display name, so it never needs to move on rename." }
+      }
     }
   }
 }

@@ -211,3 +211,34 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
 .sketch-player { display: flex; align-items: center; gap: 6px; }
 .sketch-pstat { font-size: 12px; color: var(--muted); margin-left: 2px; }
 .sketch-notes { margin-top: 0; }
+
+/* ===== Tape deck ===== */
+.tapewrap { display: flex; flex-direction: column; gap: 12px; }
+.tapehead { align-items: center; gap: 12px; }
+.tapetitle { display: flex; flex-direction: column; gap: 2px; }
+.tapetitle .nm { font-size: 15px; font-weight: 700; }
+.tapebanner { border-radius: 10px; padding: 9px 12px; font-size: 13px; font-weight: 600; }
+.tapebanner.warn { background: rgba(255, 122, 96, .12); border: 1px solid var(--accent-soft); color: var(--accent-soft); }
+.tapebanner.err { background: rgba(255, 90, 60, .14); border: 1px solid var(--accent); color: #ff8a7a; }
+
+.tapetransport { align-items: stretch; }
+.tapetimer { font: 700 34px/1 ui-monospace, Menlo, Consolas, monospace; text-align: center; margin: 4px 0 10px; font-variant-numeric: tabular-nums; }
+.tapemeters { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.meterrow { display: flex; align-items: center; gap: 8px; }
+.meterlabel { font-size: 11px; color: var(--muted); width: 44px; flex: none; }
+.meterbar { flex: 1 1 auto; height: 10px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--line); overflow: hidden; }
+.meterfill { height: 100%; width: 0%; background: linear-gradient(90deg, #43d39e 0%, #43d39e 70%, var(--accent) 100%); transition: width 60ms linear; }
+.meterfill.clip { background: var(--accent); }
+
+.tapestrip { min-width: 150px; }
+.tapedial { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.tapedial-label { font-size: 11px; color: var(--muted); width: 44px; flex: none; }
+.tapedial-range { flex: 1 1 auto; accent-color: var(--accent); }
+
+.tapeloaded { align-items: center; }
+.takemenu .saved { cursor: pointer; }
+.takemenu .saved.on { border-color: var(--accent); }
+.takemenu .saved.tombstone, .saved.tombstone { opacity: .5; cursor: default; }
+.historyrowwrap { display: flex; flex-direction: column; gap: 4px; }
+.takehistory .saved.on { border-color: var(--accent); }
+.tapenote { margin: 4px 0 0; text-align: center; }

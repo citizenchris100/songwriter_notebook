@@ -273,6 +273,10 @@ export function mountApp(root, handlers) {
     viewSongs.classList.toggle('hidden', !onSongs);
     tabProg.classList.toggle('on', !onSongs);
     tabSongs.classList.toggle('on', onSongs);
+    // AC-27: the top tab strip is inert while the tape deck is recording.
+    const deckRecording = !!(vm && vm.deck && vm.deck.recording);
+    tabProg.disabled = deckRecording;
+    tabSongs.disabled = deckRecording;
     songsApp.update(vm);
   }
   return { update };

@@ -23,6 +23,10 @@ import {
 import { isAcceptedAudio, makeSketchMeta, addSketchMeta, removeSketchMeta, setSketchNotes } from './sketches.js';
 import * as audioStore from './audioStore.js';
 import { chordFromRootAndQuality } from './theory/roman.js';
+import * as takeModel from './tape/takeModel.js';
+import * as takeStore from './tape/takeStore.js';
+import { SIZE_FIELDS } from './tape/wav.js';
+import { makeTapeDeck } from './tape/audioEngine.js';
 import { mountApp } from './ui.js';
 
 const rootEl = document.getElementById('app');
@@ -64,6 +68,27 @@ let genFlash = null;        // transient note on the generator (e.g. "Added to �
 let currentSketchId = null; // id of the selected sketch in the active song (master-detail)
 let sketchFlash = null;     // transient sketch add accept/reject status (survives one render)
 
+// ---- tape deck state (in-memory; the manifest + audio are OPFS, not sn_songs) ----
+let songSubView = 'sections';  // 'sections' | 'tapedeck' — per-song sub-view flag (NOT a top-level tab)
+let tapeDeck = null;           // the audioEngine controller — created once, lazily; outlives every render
+let tapeLive = { timerEl: null, meterEls: null, setPlayStatus: null }; // current render's live DOM refs (§5.6)
+let deckManifest = null;       // the active song's tape manifest (or null if not open/loaded yet)
+let currentTake = null;        // take NUMBER loaded in the deck (or null)
+let deckStatus = null;         // transient { type:'warn'|'error', message } banner
+let deckBlocked = false;       // AC-26: mic permission denied
+let deckUnsupported = false;   // OPFS/createSyncAccessHandle unsupported (§2 — no fallback store)
+let deckRecording = false;
+let deckArming = false;        // synchronous re-entrancy guard for the Record button's async setup window
+let deckBouncing = false;
+let deckOpenSeq = 0;           // bumped on every onOpenTapeDeck call; a stale in-flight open detects itself via this
+let deckIsRetake = false;      // the in-flight recording was armed via Retake (gates the AC-8 take menu on stop)
+let deckTakeMenuOpen = false;  // AC-8
+let deckTakeMenuTakes = [];
+let deckInputs = null;         // devices.probe() result: { inputs, preselectedId, warnMoreThanTwo, isLikelyInterface, channels }
+let deckSelectedInputId = null;
+let deckSpaceWarning = false;
+let stemSettingsDebounce = null;
+
 function recompute() {
   const merged = mergeFeels(builtinFeels, userFeels);
   feelList = merged.list;
@@ -76,6 +101,61 @@ function activeSong() {
   if (draftSong) return draftSong;
   if (currentSongId) return songs.find((s) => s.id === currentSongId) || null;
   return null;
+}
+
+// Drop every piece of tape-deck UI state tied to whichever song was active —
+// called whenever the active song changes, so a stale manifest/take selection
+// from song A can't leak into song B's deck view.
+function resetTapeDeckUi() {
+  deckOpenSeq++; // invalidate any in-flight onOpenTapeDeck for the song being left
+  songSubView = 'sections';
+  if (tapeDeck) tapeDeck.stopPlay();
+  deckManifest = null;
+  currentTake = null;
+  deckStatus = null;
+  deckBlocked = false;
+  deckUnsupported = false;
+  deckRecording = false;
+  deckArming = false;
+  deckBouncing = false;
+  deckIsRetake = false;
+  deckTakeMenuOpen = false;
+  deckTakeMenuTakes = [];
+  deckInputs = null;
+  deckSelectedInputId = null;
+  clearTimeout(stemSettingsDebounce);
+}
+
+// The tape-deck slice of the view-model — see js/tape/tapeView.js for the shape
+// this feeds. Cheap to compute even when the deck isn't open (deckManifest is
+// null until onOpenTapeDeck loads it, so `takes` is just []).
+function tapeDeckViewModel(active) {
+  const takes = (deckManifest && deckManifest.takes) || [];
+  const loadedTake = deckRecording
+    ? (takes.find((t) => t.status === 'recording') || null)
+    : (currentTake != null ? (takes.find((t) => t.take === currentTake && t.status === 'active') || null) : null);
+  return {
+    songId: active ? active.id : null,
+    path: active ? takeModel.tapeDeckRef(active.id).path : '',
+    currentTakeNo: loadedTake ? loadedTake.take : null,
+    manifestTakes: takes,
+    loadedTake,
+    recording: deckRecording,
+    bouncing: deckBouncing,
+    blocked: deckBlocked,
+    unsupported: deckUnsupported,
+    noInterface: !!(deckInputs && deckInputs.channels !== 2),
+    warnMoreThanTwo: !!(deckInputs && deckInputs.warnMoreThanTwo),
+    inputs: (deckInputs && deckInputs.inputs) || [],
+    selectedInputId: deckSelectedInputId,
+    status: deckStatus,
+    spaceWarning: deckSpaceWarning,
+    takeMenuOpen: deckTakeMenuOpen,
+    takeMenuTakes: deckTakeMenuTakes,
+    hasHistory: takes.length > 0,
+    showStrips: deckRecording || !!loadedTake,
+    showLoadedActions: !deckRecording && !!loadedTake,
+  };
 }
 
 function songViewModel() {
@@ -92,6 +172,12 @@ function songViewModel() {
     nextName: nextUntitledName(songs.map((s) => s.name)),
     currentSketchId,
     sketchFlash,
+    songSubView,
+    deck: tapeDeckViewModel(active),
+    deckHasTapeDeck: !!(active && active.tapeDeck),
+    deckTakeCountForDelete: (active && active.tapeDeck && deckManifest && active.id === deckManifest.slug)
+      ? deckManifest.takes.filter((t) => t.status !== 'discarded').length
+      : null,
   };
 }
 
@@ -220,6 +306,11 @@ async function importOneSong(raw) {
   }
   s = { ...s, sketches: rekeyed };
 
+  // A bundle carries no take audio, and the id may just have been re-slugged —
+  // drop any tapeDeck ref (export already omits it; this is defense in depth
+  // against a hand-edited bundle). Reopening the deck recreates the manifest.
+  if ('tapeDeck' in s) { const { tapeDeck: _drop, ...rest } = s; s = rest; }
+
   songs = songs.concat(s);
   saveSongs(songs);
   currentSongId = s.id;
@@ -277,6 +368,24 @@ async function openJsonSink(suggestedName) {
   return { name: suggestedName };   // decide share vs. download once we hold the bytes
 }
 
+// Tiers 2+3 of the export sink (share sheet, else anchor download) — the part
+// that doesn't need a synchronously-opened File System Access handle. Reused by
+// writeJsonSink (tier 1 handled separately, JSON-export-only) and by
+// onShareTake (a take's stems/bounce are real .wav files, AC-20; there is no
+// "save file picker" step for those, only "share sheet or download").
+async function shareOrDownloadBlob(blob, name, mimeType) {
+  const file = new File([blob], name, { type: mimeType });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file], title: name }); return; }
+    catch (e) { if (e && e.name === 'AbortError') return; /* else fall through to a download */ }
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 // Phase 2 — write `obj` (built by the caller, possibly after an await) to the sink.
 async function writeJsonSink(sink, obj) {
   if (!sink) return;                                       // user cancelled in Phase 1
@@ -289,23 +398,145 @@ async function writeJsonSink(sink, obj) {
     return;
   }
 
-  const file = new File([blob], sink.name, { type: 'application/json' });
-  if (navigator.canShare && navigator.canShare({ files: [file] })) {   // tier 2: iOS share sheet
-    try { await navigator.share({ files: [file], title: sink.name }); return; }
-    catch (e) { if (e && e.name === 'AbortError') return; /* else fall through to a download */ }
-  }
-
-  const url = URL.createObjectURL(blob);                   // tier 3: anchor download
-  const a = document.createElement('a');
-  a.href = url; a.download = sink.name;
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  await shareOrDownloadBlob(blob, sink.name, 'application/json');   // tiers 2+3
 }
 
 // Convenience for a synchronously-built payload (feels): the object is already in hand, so
 // opening the picker first keeps the click gesture intact.
 async function download(filename, obj) {
   await writeJsonSink(await openJsonSink(filename), obj);
+}
+
+// ---- tape deck (§5.6/§5.7) ----
+
+const manifestPath = (slug) => takeModel.tapeDeckRef(slug).path + 'manifest.json';
+
+// The audioEngine controller — created once, lazily (an AudioContext needs a
+// user gesture), and never rebuilt. Its callbacks write into whatever DOM nodes
+// `tapeLive` currently points at (refreshed every render by tapeView, exactly
+// like makeSketchPlayer's single-slot setStatus) rather than through render().
+function ensureTapeDeck() {
+  if (tapeDeck) return tapeDeck;
+  tapeDeck = makeTapeDeck({
+    onMeter: (m) => {
+      if (tapeLive.timerEl) tapeLive.timerEl.textContent = fmtElapsed(m.frames, m.sampleRate);
+      updateMeterEls(m);
+    },
+    onStatus: handleDeckStatus,
+    onWriteError: (message) => { deckStatus = { type: 'error', message: 'Storage error: ' + message }; render(); },
+  });
+  return tapeDeck;
+}
+
+function fmtElapsed(frames, sampleRate) {
+  const s = Math.floor(frames / (sampleRate || 48000));
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+function updateMeterEls(m) {
+  if (!tapeLive.meterEls || !m.peaks) return;
+  takeModel.STEM_KEYS.forEach((key, i) => {
+    const el = tapeLive.meterEls[key];
+    if (!el) return;
+    const peak = m.peaks[i] || 0;
+    el.style.width = Math.min(100, Math.round(peak * 100)) + '%';
+    el.classList.toggle('clip', peak > 0.98);
+  });
+}
+
+// The controller's single onStatus slot (registered once, at ensureTapeDeck()).
+// ASYNC and AWAITED by audioEngine.js's stop() before its own promise resolves
+// — so a caller that does `await tapeDeck.stop()` (onStopTake) genuinely
+// observes the finalized manifest + a completed render(), not a promise that
+// settles before finalizeStoppedTake's own awaits have landed.
+// 'ended' (playback finished) only touches the current render's inline status
+// text; the various stop reasons are the ONE place a recording gets finalized
+// into the manifest, whether Stop was tapped or the engine stopped itself
+// (interruption, storage error).
+async function handleDeckStatus(s) {
+  if (s.type === 'ended') { if (tapeLive.setPlayStatus) tapeLive.setPlayStatus('Finished'); return; }
+  if (s.type === 'blocked') { deckBlocked = true; render(); return; }
+  if (s.type === 'no-wake-lock') { deckStatus = { type: 'warn', message: 'Screen may lock during long takes (Wake Lock isn’t available on this browser).' }; render(); return; }
+  if (s.type === 'stopped' || s.type === 'stopped-interrupted' || s.type === 'stopped-storage-error') {
+    const message = s.type === 'stopped-interrupted' ? 'Recording stopped (interrupted).'
+      : s.type === 'stopped-storage-error' ? 'Recording stopped (storage error).' : null;
+    await finalizeStoppedTake(s, message);
+  }
+}
+
+async function finalizeStoppedTake(s, message) {
+  deckRecording = false;
+  if (deckManifest && deckManifest.slug === s.slug) {
+    deckManifest = takeModel.finalizeTake(deckManifest, s.take, s.durationSec);
+    await takeStore.writeManifest(manifestPath(s.slug), deckManifest);
+  }
+  if (deckIsRetake) {
+    deckTakeMenuOpen = true;
+    deckTakeMenuTakes = deckManifest.takes.filter((t) => t.status !== 'recording').slice().sort((a, b) => b.take - a.take);
+    deckIsRetake = false;
+  } else {
+    currentTake = s.take;
+  }
+  deckStatus = message ? { type: 'warn', message } : null;
+  await refreshSpaceWarning();
+  render();
+}
+
+async function refreshSpaceWarning() {
+  const est = await takeStore.estimateSpace();
+  deckSpaceWarning = !!(est && est.available < 500 * 1024 * 1024); // §5.8: warn under ~500 MB
+}
+
+// Shared by onRecordTake and both Retake outcomes (Keep/Discard "arm a new
+// take"): appends the take to the manifest at status "recording" and writes it
+// BEFORE any OPFS stem file is opened (D22 crash-consistent ordering) — the
+// onChannelsKnown callback is where audioEngine.record() hands back the
+// channel count + sample rate the instant they're known.
+//
+// `deckArming` is a SYNCHRONOUS re-entrancy guard, set true before the first
+// `await`. `deckRecording` alone isn't enough: it only flips true deep inside
+// the async onChannelsKnown callback, well after getUserMedia/worklet-load have
+// already started, leaving a real window for a fast double-tap to arm two
+// takes off the same stale manifest snapshot (duplicate take numbers, one
+// recording's stem files truncated by the other's openTakeFiles).
+async function armRecording() {
+  if (deckArming || deckRecording) return;
+  const a = activeSong();
+  if (!a || !a.id || !deckManifest) return;
+  deckArming = true;
+  deckStatus = null;
+  const slug = a.id;
+  const path = manifestPath(slug);
+  await refreshSpaceWarning(); // §5.8: "before each record", not just on deck open / after the last take
+  let started = false;
+  try {
+    const result = await ensureTapeDeck().record({
+      slug,
+      deviceId: deckSelectedInputId,
+      onChannelsKnown: async (channels, sampleRate) => {
+        const takeNo = takeModel.nextTakeNumber(deckManifest);
+        const take = takeModel.makeTake({ slug, take: takeNo, sampleRate, channels, capturedWithoutInterface: channels !== 2 }, nowISO());
+        deckManifest = takeModel.appendTake(deckManifest, take);
+        await takeStore.writeManifest(path, deckManifest);
+        deckRecording = true;
+        currentTake = null;
+        render();
+        return takeNo;
+      },
+    });
+    started = !!result.ok;
+    if (!result.ok && result.denied) deckBlocked = true;
+  } catch {
+    // A failure AFTER onChannelsKnown already flipped deckRecording=true (e.g.
+    // AudioWorkletNode construction or openTakeFiles rejecting) would otherwise
+    // strand the UI nav-locked forever (audioEngine's own `recording` flag never
+    // got set, so a later Stop short-circuits and never fires onStatus).
+    deckStatus = { type: 'error', message: 'Could not start recording (setup failed).' };
+  } finally {
+    deckArming = false;
+    if (!started) deckRecording = false; // only clobber on failure — success already set it true above
+    render();
+  }
 }
 
 const handlers = {
@@ -343,7 +574,7 @@ const handlers = {
   onExportAll: () => download('songwriter-feels.json', feelList.map(toFeelFile)),
 
   // ---- tabs ----
-  onTab: (tab) => { genFlash = null; currentView = tab; render(); },
+  onTab: (tab) => { if (deckRecording) return; genFlash = null; currentView = tab; render(); }, // AC-27: top tab strip inert while recording
 
   // ---- create a song / add to the open song from checked generator rows ----
   onCreateSong: (indices) => {
@@ -356,6 +587,7 @@ const handlers = {
     sketchFlash = null;
     currentView = 'songs';
     genFlash = null;
+    resetTapeDeckUi();
     render();
   },
   onAddToCurrent: (indices) => {
@@ -377,6 +609,7 @@ const handlers = {
       currentSongId = target || null;
       currentSketchId = null;
       sketchFlash = null;
+      resetTapeDeckUi();
       render();
     },
     onSetLabel: (i, lblValue) => { updateActive((s, now) => setProgressionLabel(s, i, lblValue, now)); render(); },
@@ -394,6 +627,7 @@ const handlers = {
       sketchFlash = null;
       currentView = 'songs';
       genFlash = null;
+      resetTapeDeckUi();
       render();
     },
     onNewRow: () => { updateActive((s, now) => appendRow(s, cMajor(), now)); render(); },
@@ -470,10 +704,13 @@ const handlers = {
       const gone = songs.find((s) => s.id === id);
       songs = songs.filter((s) => s.id !== id);
       saveSongs(songs);
-      if (currentSongId === id) { currentSongId = null; currentSketchId = null; sketchFlash = null; }
+      if (currentSongId === id) { currentSongId = null; currentSketchId = null; sketchFlash = null; resetTapeDeckUi(); }
       render();
       // Best-effort: drop the deleted song's audio blobs (reconcile also GCs them later).
       if (gone && gone.sketches && gone.sketches.length) audioStore.deleteMany(gone.sketches.map((sk) => sk.id)).catch(() => {});
+      // §5.7: also GC its OPFS take directory (no boot-time GC, D30 — deletion is
+      // the one place a song's takes get removed, immediately, with confirm).
+      if (gone && gone.tapeDeck) takeStore.deleteSongTakes(gone.id).catch(() => {});
     },
 
     // Import a pasted/uploaded song bundle (single object or an array). Reconstructs the
@@ -488,6 +725,7 @@ const handlers = {
       currentSketchId = null;
       sketchFlash = null;
       currentView = 'songs';
+      resetTapeDeckUi();
       render();
       if (results.length === 1) return results[0];
       const okCount = results.filter((r) => r.ok).length;
@@ -508,6 +746,233 @@ const handlers = {
       for (const s of songs) bundles.push(await toSongBundle(s));
       await writeJsonSink(sink, bundles);
     },
+
+    // ---- tape deck (§5.6/§5.7) ----
+
+    onOpenTapeDeck: async () => {
+      const a = activeSong();
+      if (!a || !a.id) return;                          // a draft has no slug -> no OPFS path (§5.8)
+      // A generation token: onSelectSong/onNewSong/onDeleteSong/onImportSong (all
+      // synchronous) bump deckOpenSeq via resetTapeDeckUi, and a second, later
+      // onOpenTapeDeck call bumps it again here — either invalidates this call.
+      // Without this, a song switch mid-await lets this continuation's stale
+      // `a`/`manifest` clobber the NEW song's shared deck state (deckManifest,
+      // currentTake) and — worse — stamp the wrong tapeDeck.path onto whichever
+      // song happens to be active when the late `updateActive` call lands.
+      const mySeq = ++deckOpenSeq;
+      const stale = () => deckOpenSeq !== mySeq;
+
+      songSubView = 'tapedeck';
+      deckStatus = null;
+      deckTakeMenuOpen = false;
+      deckIsRetake = false;
+      render();
+
+      if (!(await takeStore.isSupported())) { if (!stale()) { deckUnsupported = true; render(); } return; }
+      if (stale()) return;
+      deckUnsupported = false;
+
+      await ensurePersist();
+      if (stale()) return;
+      const path = manifestPath(a.id);
+      let manifest;
+      try {
+        const raw = await takeStore.readManifest(path);
+        const v = takeModel.validateManifest(raw);
+        if (!v.ok) { manifest = takeModel.createManifest(a.id); if (!stale()) { deckStatus = { type: 'error', message: 'This song’s take history looked corrupted and could not be loaded.' }; } }
+        else manifest = takeModel.normalizeManifest(raw);
+      } catch { manifest = takeModel.createManifest(a.id); }
+      if (stale()) return;
+
+      // Crash recovery (§5.3): finalize any take a prior session left mid-record
+      // BEFORE mostRecentKeptTake can see it. Prefer stem1's byte count for
+      // duration (both stems share one sampleRate/duration by construction) but
+      // fall back to stem2's — an asymmetric partial-write failure (empty
+      // stem1, real audio in stem2) must not tombstone-and-orphan real audio.
+      const dir = takeModel.tapeDeckRef(a.id).path;
+      for (const t of manifest.takes.slice()) {
+        if (t.status !== 'recording') continue;
+        const stem1 = t.stems && t.stems.stem1;
+        const stem2 = t.stems && t.stems.stem2;
+        let stem1Bytes = 0, stem2Bytes = 0;
+        if (stem1 && stem1.file) { try { stem1Bytes = await takeStore.finalizeExisting(dir + stem1.file, SIZE_FIELDS); } catch { stem1Bytes = 0; } }
+        if (stem2 && stem2.file) { try { stem2Bytes = await takeStore.finalizeExisting(dir + stem2.file, SIZE_FIELDS); } catch { stem2Bytes = 0; } }
+        manifest = takeModel.finalizeRecoveredTake(manifest, t.take, stem1Bytes || stem2Bytes, t.sampleRate);
+      }
+      if (stale()) return;
+
+      // Stamp the song's small OPFS reference on first open only (AC-19),
+      // BEFORE writing the manifest: if the app dies between these two writes,
+      // a dangling tapeDeck ref with no manifest.json yet self-heals on next
+      // open (load-or-create, D30) — the reverse order could instead leave a
+      // real OPFS directory with no song record pointing at it.
+      if (!a.tapeDeck) updateActive((s, now) => (s.id === a.id ? { ...s, tapeDeck: takeModel.tapeDeckRef(a.id), updatedAt: now } : s));
+      if (stale()) return;
+      await takeStore.writeManifest(path, manifest);
+      if (stale()) return;
+
+      deckManifest = manifest;
+      const kept = takeModel.mostRecentKeptTake(manifest);
+      currentTake = kept ? kept.take : null;
+
+      await refreshSpaceWarning();
+      if (stale()) return;
+
+      const probeResult = await ensureTapeDeck().probe(deckSelectedInputId);
+      if (stale()) return;
+      if (!probeResult.ok) { deckBlocked = true; render(); return; }
+      deckBlocked = false;
+      deckInputs = probeResult;
+      if (!deckSelectedInputId) deckSelectedInputId = probeResult.preselectedId;
+      render();
+    },
+
+    onCloseTapeDeck: () => {
+      if (deckRecording) return; // AC-27
+      // AC-8: Back is also a valid way to "dismiss" an open take menu, and
+      // dismissing must load the newest take (tapeView's explicit "Use newest"
+      // button covers the direct case; this covers backing out via the header).
+      if (deckTakeMenuOpen && deckManifest) {
+        const kept = takeModel.mostRecentKeptTake(deckManifest);
+        currentTake = kept ? kept.take : null;
+      }
+      songSubView = 'sections';
+      if (tapeDeck) tapeDeck.stopPlay();
+      deckTakeMenuOpen = false;
+      render();
+    },
+
+    onRecordTake: () => armRecording(),
+
+    onStopTake: async () => {
+      if (!tapeDeck || !deckRecording) return;
+      await tapeDeck.stop(); // resolves after onStatus('stopped',...) has already finalized the manifest
+    },
+
+    // AC-7: Keep/Discard both arm a fresh recording; only Discard also tombstones.
+    onKeepTake: () => { deckIsRetake = true; armRecording(); },
+    onDiscardLastTake: async () => {
+      const a = activeSong();
+      if (!a || !deckManifest || !deckManifest.takes.length) return;
+      const last = deckManifest.takes[deckManifest.takes.length - 1];
+      deckManifest = takeModel.discardTake(deckManifest, last.take);
+      await takeStore.writeManifest(manifestPath(a.id), deckManifest);
+      takeStore.deleteTakeAudio(a.id, last.take).catch(() => {}); // metadata first, best-effort file delete second
+      if (currentTake === last.take) { const kept = takeModel.mostRecentKeptTake(deckManifest); currentTake = kept ? kept.take : null; }
+      deckIsRetake = true;
+      render();
+      await armRecording();
+    },
+    onCancelRetake: () => { deckStatus = null; render(); },
+
+    // AC-22: per-take Delete — the storage relief valve, available for any take, any time.
+    onDeleteTake: async (takeNo) => {
+      const a = activeSong();
+      // A bounce mid-flight for this same take would otherwise write an
+      // orphaned _mix.wav after the delete tombstones it (markBounced's
+      // takeNo would no longer match anything). Simplest safe rule: no
+      // deletes while any bounce is in flight (tapeView also disables the
+      // buttons — this is the defense-in-depth backstop).
+      if (!a || !deckManifest || deckBouncing) return;
+      deckManifest = takeModel.discardTake(deckManifest, takeNo);
+      await takeStore.writeManifest(manifestPath(a.id), deckManifest);
+      takeStore.deleteTakeAudio(a.id, takeNo).catch(() => {});
+      if (currentTake === takeNo) {
+        if (tapeDeck) tapeDeck.stopPlay();
+        const kept = takeModel.mostRecentKeptTake(deckManifest);
+        currentTake = kept ? kept.take : null;
+      }
+      await refreshSpaceWarning();
+      render();
+    },
+
+    // AC-8 take-menu selection, or a plain "Load" from take history.
+    onSelectTake: (takeNo) => {
+      if (tapeDeck) tapeDeck.stopPlay();
+      currentTake = takeNo;
+      deckTakeMenuOpen = false;
+      render();
+    },
+
+    // AC-25 input picker — re-probes the newly picked device.
+    onSelectInput: async (deviceId) => {
+      deckSelectedInputId = deviceId;
+      const probeResult = await ensureTapeDeck().probe(deviceId);
+      if (probeResult.ok) { deckInputs = probeResult; deckBlocked = false; } else { deckBlocked = true; }
+      render();
+    },
+
+    // D32: capture-only on `input` — applies live for preview, no persistence, no render.
+    onPreviewStemSetting: (stemKey, patch) => {
+      if (!tapeDeck || !deckManifest || currentTake == null) return;
+      const take = deckManifest.takes.find((t) => t.take === currentTake);
+      const current = take && take.stems[stemKey];
+      if (!current) return;
+      const merged = takeModel.clampStemSettings({ ...current, ...patch, eq: { ...current.eq, ...(patch.eq || {}) } });
+      tapeDeck.applySettings(stemKey, merged);
+    },
+    // D32: on `change` (pointer-up) — persist to the manifest, debounced ~300ms, and render.
+    onSetStemSetting: (stemKey, patch) => {
+      if (!deckManifest || currentTake == null) return;
+      deckManifest = takeModel.setStemSettings(deckManifest, currentTake, stemKey, patch);
+      const a = activeSong();
+      clearTimeout(stemSettingsDebounce);
+      stemSettingsDebounce = setTimeout(() => { if (a) takeStore.writeManifest(manifestPath(a.id), deckManifest).catch(() => {}); }, 300);
+      render();
+    },
+
+    onBounceTake: async () => {
+      const a = activeSong();
+      if (!a || !deckManifest || currentTake == null || !tapeDeck || deckBouncing) return;
+      const take = deckManifest.takes.find((t) => t.take === currentTake);
+      if (!take) return;
+      const takeNo = take.take;              // snapshot — `currentTake` can change while this await is in flight
+      deckBouncing = true;
+      render();
+      const result = await tapeDeck.bounce(take, a.id);
+      deckBouncing = false;
+      if (!result.ok) { deckStatus = { type: 'error', message: 'Bounce failed: ' + result.error }; render(); return; }
+      // The take may have been discarded/deleted while the bounce was running
+      // (onDeleteTake also guards on deckBouncing, but this stays correct even
+      // if that guard is ever bypassed): don't resurrect a tombstoned take's
+      // bounce record, and don't leave an orphaned _mix.wav unexplained.
+      const stillActive = deckManifest.takes.find((t) => t.take === takeNo && t.status === 'active');
+      if (!stillActive) { takeStore.deleteTakeAudio(a.id, takeNo).catch(() => {}); render(); return; }
+      deckManifest = takeModel.markBounced(deckManifest, takeNo, { file: result.file, bouncedAt: nowISO(), lufs: result.lufs });
+      await takeStore.writeManifest(manifestPath(a.id), deckManifest);
+      await refreshSpaceWarning();
+      render();
+    },
+
+    // AC-20: the only way take audio leaves the app. `which` is 'stem1'|'stem2'|'bounce'.
+    // `takeNo` defaults to the loaded take (loadedActions' per-stem/mix buttons);
+    // AC-10 also needs Share reachable straight from a take-history row without
+    // first Loading it, so historyRow passes its own take's number explicitly.
+    onShareTake: async (which, takeNo) => {
+      const a = activeSong();
+      const tn = takeNo != null ? takeNo : currentTake;
+      if (!a || !deckManifest || tn == null) return;
+      const take = deckManifest.takes.find((t) => t.take === tn);
+      if (!take) return;
+      const fileRef = which === 'bounce' ? (take.bounce && take.bounce.file) : (take.stems[which] && take.stems[which].file);
+      if (!fileRef) return;
+      let bytes;
+      try { bytes = await takeStore.readFile(takeModel.tapeDeckRef(a.id).path + fileRef); }
+      catch { deckStatus = { type: 'error', message: 'Could not read that file.' }; render(); return; }
+      await shareOrDownloadBlob(new Blob([bytes], { type: 'audio/wav' }), fileRef, 'audio/wav');
+    },
+
+    // Ephemeral playback — no persisted state, so these go straight to the
+    // controller rather than through a manifest-mutating handler (sketches
+    // precedent: compare onLoadSketchBlob / makeSketchPlayer).
+    onPlayTake: (take, slug) => ensureTapeDeck().play(take, slug),
+    onReplayTake: (take, slug) => ensureTapeDeck().replay(take, slug),
+    onStopPlayTake: () => { if (tapeDeck) tapeDeck.stopPlay(); },
+
+    // tapeView calls this once per render with the freshly-built timer/meter/
+    // play-status DOM refs (the makeSketchPlayer.setStatus idiom, generalized —
+    // see tapeLive's declaration up top). Pure state, no render() of its own.
+    onDeckLiveRefs: (live) => { tapeLive = live; },
   },
 };
 
