@@ -1,8 +1,8 @@
-// songsView.js — the Songs tab. Pick/show a saved song, label/reorder/remove its
-// sections, HAND-EDIT sections (new row, + add chord, tap a chord to change it via the
-// 12-tone picker), edit lyrics, save (with inline naming) / rename / delete, and
-// import/export songs. Impure (DOM only); all song logic lives in songs.js (pure) and
-// main.js (state + storage). The view is rebuilt from the view-model on every update().
+// songsView.js — the Songs tab. Open a song from a .json / pick a saved one, name a NEW
+// song up front, label/reorder/remove its sections, HAND-EDIT sections (new row, + add
+// chord, tap a chord to change it via the 12-tone picker), edit lyrics, Save the .json /
+// rename / delete. Impure (DOM only); all song logic lives in songs.js (pure) and main.js
+// (state + storage). The view is rebuilt from the view-model on every update().
 import { h } from './dom.js';
 import { SECTION_LABELS } from './songs.js';
 import { CHROMATIC_TONES, chordForTone } from './theory/roman.js';
@@ -12,12 +12,37 @@ import { buildDeckView } from './tape/tapeView.js';
 export function mountSongsView(container, handlers) {
   const {
     onSelectSong, onSetLabel, onReorder, onRemoveProgression, onCopyProgression,
-    onNewSong, onNewRow, onAddChord, onSetChord, onRemoveChord,
-    onLyricsChange, onSaveSong, onRenameSong, onDeleteSong,
-    onImportSong, onExportCurrent, onExportAllSongs,
+    onNewSong, onConfirmNewSong, onCancelNewSong, onNewRow, onAddChord, onSetChord, onRemoveChord,
+    onLyricsChange, onRenameSong, onDeleteSong,
+    onOpenSongPicker, onOpenSongText, onSaveSongFile,
     onAddSketch, onSelectSketch, onDeleteSketch, onSketchNotesChange, onLoadSketchBlob,
     onOpenTapeDeck, onDeckLiveRefs,
   } = handlers;
+
+  // An "Open…" control: native file picker → load a song's .json. Uses the File System
+  // Access picker where present (desktop; yields a handle for silent Save), else a hidden
+  // <input type=file> (iOS / Chrome Android). `cls` styles the visible button.
+  function openControl(label, cls) {
+    const wrap = h('span', 'openctl');
+    const btn = h('button', cls || 'btn', label || 'Open…');
+    const fileInput = h('input');
+    fileInput.type = 'file';
+    fileInput.accept = 'application/json,.json';
+    fileInput.style.display = 'none';
+    fileInput.addEventListener('change', () => {
+      const f = fileInput.files[0];
+      if (!f) return;
+      const reader = new FileReader();
+      reader.onload = () => { onOpenSongText(String(reader.result), f.name); fileInput.value = ''; };
+      reader.readAsText(f);
+    });
+    btn.addEventListener('click', () => {
+      if (typeof window !== 'undefined' && window.showOpenFilePicker) onOpenSongPicker();
+      else fileInput.click();
+    });
+    wrap.append(btn, fileInput);
+    return wrap;
+  }
 
   const rowOf = (child) => { const r = h('div', 'row'); r.appendChild(child); return r; };
 
@@ -45,34 +70,51 @@ export function mountSongsView(container, handlers) {
 
     const wrap = h('div', 'songswrap');
 
-    // ---- song picker ----
+    // ---- naming a new song (name up front) ----
+    if (vm.isPendingNew) {
+      const card = h('div', 'card grow');
+      card.appendChild(h('span', 'lbl', 'Name your song'));
+      const bar = h('div', 'namebar');
+      const input = h('input', 'nameinput'); input.type = 'text';
+      input.value = vm.nextName || ''; input.placeholder = 'Song name';
+      const ok = h('button', 'btn primary', 'Create');
+      const cancel = h('button', 'btn mini', 'Cancel');
+      const submit = () => onConfirmNewSong(input.value);
+      ok.addEventListener('click', submit);
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+      cancel.addEventListener('click', () => onCancelNewSong());
+      bar.append(input, ok, cancel);
+      card.appendChild(bar);
+      wrap.appendChild(rowOf(card));
+      container.appendChild(wrap);
+      setTimeout(() => { input.focus(); input.select(); }, 0);
+      return;
+    }
+
+    // ---- song picker + Open ----
     const pickCard = h('div', 'card grow');
     pickCard.appendChild(h('span', 'lbl', 'Song'));
+    const pickRow = h('div', 'row pickrow');
     const sel = h('select');
     const blank = h('option', null, '— choose a song —'); blank.value = ''; sel.appendChild(blank);
-    if (vm.isDraft) { const o = h('option', null, '(unsaved draft)'); o.value = '__draft__'; sel.appendChild(o); }
     vm.songs.forEach((s) => { const o = h('option', null, s.name); o.value = s.id; sel.appendChild(o); });
     sel.value = vm.selectedId || '';
-    const confirmHost = h('div', 'switchconfirm');
-    sel.addEventListener('change', () => {
-      const target = sel.value || null;
-      if (vm.isDraft && target !== '__draft__') {
-        sel.value = vm.selectedId || '';        // revert until the user confirms
-        showSwitchConfirm(confirmHost, target);
-      } else {
-        onSelectSong(target);
-      }
-    });
-    pickCard.append(sel, confirmHost);
+    sel.addEventListener('change', () => onSelectSong(sel.value || null));
+    pickRow.append(sel, openControl('Open…', 'btn'));
+    pickCard.appendChild(pickRow);
     wrap.appendChild(rowOf(pickCard));
+
+    if (vm.songFlash) wrap.appendChild(flashEl(vm.songFlash));
 
     // ---- empty state ----
     if (!vm.activeSong) {
-      wrap.appendChild(h('div', 'feel-empty pad', 'No song selected. Start one below, choose one above, or capture progressions on the Progressions tab.'));
+      wrap.appendChild(h('div', 'feel-empty pad', 'No song open. Open one from your files, start a new one, or capture progressions on the Progressions tab.'));
+      const cta = h('div', 'row');
+      cta.appendChild(openControl('Open a song…', 'btn primary'));
       const newBtn = h('button', 'btn primary newsong', '+ New song');
       newBtn.addEventListener('click', () => onNewSong());
-      wrap.appendChild(rowOf(newBtn));
-      wrap.appendChild(managePanel());
+      cta.appendChild(newBtn);
+      wrap.appendChild(cta);
       container.appendChild(wrap);
       return;
     }
@@ -102,19 +144,19 @@ export function mountSongsView(container, handlers) {
     // ---- sketches (audio attachments) ----
     wrap.appendChild(sketchesSection(song, vm, { onAddSketch, onSelectSketch, onDeleteSketch, onSketchNotesChange }, player));
 
-    // ---- tape deck (AC-1: disabled for an unsaved draft — no slug, no OPFS path) ----
+    // ---- tape deck ----
     const deckBtn = h('button', 'btn', '🎛 Tape Deck');
-    deckBtn.disabled = vm.isDraft;
-    deckBtn.title = vm.isDraft ? 'Save the song first.' : '';
-    deckBtn.addEventListener('click', () => { if (!vm.isDraft) onOpenTapeDeck(); });
+    deckBtn.addEventListener('click', () => onOpenTapeDeck());
     wrap.appendChild(rowOf(deckBtn));
 
     // ---- save / rename / delete ----
     wrap.appendChild(actionRow(vm));
-
-    // ---- import / export ----
-    wrap.appendChild(managePanel());
     container.appendChild(wrap);
+  }
+
+  function flashEl(flash) {
+    return h('div', 'feel-status ' + (flash.ok ? 'ok' : 'err'),
+      flash.ok ? ('Saved ' + flash.name) : ('Could not open: ' + flash.error));
   }
 
   function progBlock(p, i, last) {
@@ -162,37 +204,17 @@ export function mountSongsView(container, handlers) {
 
   function actionRow(vm) {
     const row = h('div', 'row songactions');
-    const hint = h('div', 'savehint', vm.isDraft ? 'Unsaved — Save to keep this song.' : 'Saved on this device.');
+    const linked = vm.linkedFile;
+    const hint = h('div', 'savehint', linked ? ('File: ' + linked) : 'Not saved to a file yet.');
 
     const btns = h('div', 'row');
+    // The one Save: writes the song's .json (overwrites the linked file in place where the
+    // platform allows it; else opens the save flow and links the song to the file it lands in).
     const saveBtn = h('button', 'btn primary', 'Save');
+    saveBtn.addEventListener('click', () => onSaveSongFile());
     btns.appendChild(saveBtn);
 
-    // Inline name field for a draft's first save (no native dialog).
-    const nameBar = h('div', 'namebar hidden');
-    const nameInput = h('input', 'nameinput'); nameInput.type = 'text';
-    const nameOk = h('button', 'btn mini', '✓ Save');
-    const nameCancel = h('button', 'btn mini', '✗');
-    nameBar.append(nameInput, nameOk, nameCancel);
-    nameOk.addEventListener('click', () => onSaveSong(nameInput.value));
-    nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') onSaveSong(nameInput.value); });
-    nameCancel.addEventListener('click', () => nameBar.classList.add('hidden'));
-    saveBtn.addEventListener('click', () => {
-      if (vm.isDraft) {
-        nameInput.value = vm.nextName;
-        nameBar.classList.remove('hidden');
-        nameInput.focus(); nameInput.select();
-      } else {
-        onSaveSong(null);
-      }
-    });
-
-    if (vm.isDraft) {
-      row.append(hint, btns, nameBar);
-      return row;
-    }
-
-    // Rename (saved songs only).
+    // Rename.
     const renameBtn = h('button', 'btn', 'Rename');
     const renBar = h('div', 'namebar hidden');
     const renInput = h('input', 'nameinput'); renInput.type = 'text';
@@ -223,62 +245,8 @@ export function mountSongsView(container, handlers) {
     delCancel.addEventListener('click', () => delBar.classList.add('hidden'));
     btns.appendChild(delBtn);
 
-    row.append(hint, btns, nameBar, renBar, delBar);
+    row.append(hint, btns, renBar, delBar);
     return row;
-  }
-
-  function showSwitchConfirm(host, target) {
-    host.textContent = '';
-    const strip = h('div', 'namebar');
-    strip.appendChild(h('span', 'savehint', 'Discard unsaved draft?'));
-    const ok = h('button', 'btn mini danger', 'Discard');
-    const cancel = h('button', 'btn mini', 'Keep editing');
-    ok.addEventListener('click', () => onSelectSong(target));
-    cancel.addEventListener('click', () => { host.textContent = ''; });
-    strip.append(ok, cancel);
-    host.appendChild(strip);
-  }
-
-  function managePanel() {
-    const d = h('details', 'feels-panel songs-panel');
-    d.appendChild(h('summary', null, 'Import / export songs'));
-
-    const box = h('textarea');
-    box.placeholder = 'Paste a song JSON here…';
-    box.rows = 4;
-    d.appendChild(box);
-
-    const status = h('div', 'feel-status');
-
-    const btnRow = h('div', 'feel-btns');
-    const importBtn = h('button', 'btn mini', 'Import');
-    importBtn.addEventListener('click', async () => showStatus(status, await onImportSong(box.value)));
-    const fileLabel = h('label', 'btn mini', 'Upload .json');
-    const fileInput = h('input');
-    fileInput.type = 'file';
-    fileInput.accept = 'application/json,.json';
-    fileInput.style.display = 'none';
-    fileInput.addEventListener('change', () => {
-      const f = fileInput.files[0];
-      if (!f) return;
-      const reader = new FileReader();
-      reader.onload = async () => { showStatus(status, await onImportSong(String(reader.result))); fileInput.value = ''; };
-      reader.readAsText(f);
-    });
-    fileLabel.appendChild(fileInput);
-    const exportBtn = h('button', 'btn mini', 'Export current');
-    exportBtn.addEventListener('click', onExportCurrent);
-    const exportAllBtn = h('button', 'btn mini', 'Export all');
-    exportAllBtn.addEventListener('click', onExportAllSongs);
-    btnRow.append(importBtn, fileLabel, exportBtn, exportAllBtn);
-    d.append(btnRow, status);
-    return d;
-  }
-
-  function showStatus(el, res) {
-    if (!res) return;
-    el.className = 'feel-status ' + (res.ok ? 'ok' : 'err');
-    el.textContent = res.ok ? ('Imported "' + res.name + '"') : ('Could not import: ' + res.error);
   }
 
   // ---- the 12-tone chord picker (a fixed-position popover; only one open at a time) ----

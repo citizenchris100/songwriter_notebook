@@ -8,7 +8,8 @@
 
 const DB_NAME = 'sn_audio';
 const STORE = 'sketches';
-const VERSION = 1;
+const HANDLES = 'fileHandles';   // per-song FileSystemFileHandle (out-of-line key = song id)
+const VERSION = 2;
 
 let _dbP = null;
 
@@ -19,7 +20,8 @@ function open() {
     const req = indexedDB.open(DB_NAME, VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
-      if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE); // out-of-line keys (the sketch id)
+      if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);     // sketch audio blobs (sketch id)
+      if (!db.objectStoreNames.contains(HANDLES)) db.createObjectStore(HANDLES); // save-in-place handles (song id)
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -79,5 +81,38 @@ export function allKeys() {
     const req = t.objectStore(STORE).getAllKeys();
     req.onsuccess = () => resolve(req.result || []);
     req.onerror = () => reject(req.error);
+  }));
+}
+
+// ---- save-in-place file handles (File System Access API; desktop) ----
+// A FileSystemFileHandle is structured-cloneable, so it persists across sessions here.
+// On platforms without the API (iOS, Chrome Android) nothing is ever stored.
+
+export function putFileHandle(id, handle) {
+  return open().then((db) => new Promise((resolve, reject) => {
+    const t = db.transaction(HANDLES, 'readwrite');
+    t.objectStore(HANDLES).put(handle, id);
+    t.oncomplete = () => resolve();
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error || new Error('transaction aborted'));
+  }));
+}
+
+export function getFileHandle(id) {
+  return open().then((db) => new Promise((resolve, reject) => {
+    const t = db.transaction(HANDLES, 'readonly');
+    const req = t.objectStore(HANDLES).get(id);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+export function deleteFileHandle(id) {
+  return open().then((db) => new Promise((resolve, reject) => {
+    const t = db.transaction(HANDLES, 'readwrite');
+    t.objectStore(HANDLES).delete(id);
+    t.oncomplete = () => resolve();
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error || new Error('transaction aborted'));
   }));
 }

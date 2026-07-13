@@ -3,11 +3,11 @@
 // Progressions and Songs tabs, and registers the service worker. The only stateful,
 // side-effectful module.
 //
-// Tab/song state (currentView, draftSong, currentSongId) is intentionally in-memory
+// Tab/song state (currentView, currentSongId, pendingNew) is intentionally in-memory
 // only: it is not part of the deep-linkable generator state (persistence.js), and on
-// reload the app opens on Progressions with the Songs tab blank. Songs themselves are
-// persisted to localStorage (sn_songs). A single explicit Save is the persistence point
-// for a new draft; edits to an already-saved song autosave.
+// reload the app opens on Progressions with the Songs tab blank. Songs live in the
+// localStorage working cache (sn_songs) and autosave on every edit; the durable, portable
+// artifact is the .json a song is Opened from / Saved to (see onSaveSongFile / onOpenSong*).
 import { deriveOutput } from './derive.js';
 import { validate, randomize, DEFAULT_FEEL } from './session.js';
 import { load, save, reflectUrl } from './persistence.js';
@@ -62,11 +62,15 @@ let lastModel;       // the most recent deriveOutput(state) — reused for song-
 // ---- songs state (in-memory; sn_songs is the only persisted part) ----
 let songs = [];
 let currentView = 'progressions';
-let currentSongId = null;   // id of the selected saved song (null when none/draft)
-let draftSong = null;       // an unsaved new song (from "Create song"); no id yet
+let currentSongId = null;   // id of the selected song (null when none)
+let pendingNew = null;      // a new song awaiting its name: { snaps } (snaps=null → blank seed)
 let genFlash = null;        // transient note on the generator (e.g. "Added to …")
 let currentSketchId = null; // id of the selected sketch in the active song (master-detail)
 let sketchFlash = null;     // transient sketch add accept/reject status (survives one render)
+let songFlash = null;       // transient Save/Open status on the Songs tab (survives one render)
+// Per-song File System Access handles for silent Save (overwrite in place). Session cache;
+// also persisted in IndexedDB (audioStore.fileHandles). Empty on iOS / Chrome Android.
+const fileHandles = new Map();
 
 // ---- tape deck state (in-memory; the manifest + audio are OPFS, not sn_songs) ----
 let songSubView = 'sections';  // 'sections' | 'tapedeck' — per-song sub-view flag (NOT a top-level tab)
@@ -96,9 +100,8 @@ function recompute() {
   feelIds = feelList.map((f) => f.id);
 }
 
-// The song currently open in the Songs tab: the unsaved draft, else the selected saved song.
+// The song currently open in the Songs tab: the selected song (or null).
 function activeSong() {
-  if (draftSong) return draftSong;
   if (currentSongId) return songs.find((s) => s.id === currentSongId) || null;
   return null;
 }
@@ -165,11 +168,13 @@ function songViewModel() {
     genFlash,
     songs: songs.map((s) => ({ id: s.id, name: s.name })),
     activeSong: active,
-    isDraft: !!draftSong,
+    isPendingNew: !!pendingNew,
     hasCurrentSong: !!active,
-    currentSongName: active ? (draftSong ? '(unsaved draft)' : active.name) : '',
-    selectedId: draftSong ? '__draft__' : (currentSongId || null),
+    currentSongName: active ? active.name : '',
+    selectedId: currentSongId || null,
     nextName: nextUntitledName(songs.map((s) => s.name)),
+    linkedFile: active && active.file ? active.file.name : null,
+    songFlash,
     currentSketchId,
     sketchFlash,
     songSubView,
@@ -194,11 +199,10 @@ function commit() {
   render();
 }
 
-// Apply a pure transform to the active song. For a saved song this also persists
-// immediately (edits autosave); a draft only mutates in memory until first Save.
+// Apply a pure transform to the active song and persist immediately (every edit autosaves
+// to the localStorage working cache).
 function updateActive(fn) {
   const now = nowISO();
-  if (draftSong) { draftSong = fn(draftSong, now); return; }
   if (currentSongId) {
     songs = songs.map((s) => (s.id === currentSongId ? fn(s, now) : s));
     saveSongs(songs);
@@ -310,11 +314,49 @@ async function importOneSong(raw) {
   // drop any tapeDeck ref (export already omits it; this is defense in depth
   // against a hand-edited bundle). Reopening the deck recreates the manifest.
   if ('tapeDeck' in s) { const { tapeDeck: _drop, ...rest } = s; s = rest; }
+  // The file link is local to whoever exported it; the opener re-links to the file it
+  // actually opened (afterOpen), so never carry an incoming link in.
+  if ('file' in s) { const { file: _dropFile, ...rest } = s; s = rest; }
 
   songs = songs.concat(s);
   saveSongs(songs);
   currentSongId = s.id;
-  return { ok: true, name: s.name };
+  return { ok: true, name: s.name, id: s.id };
+}
+
+// Parse text (a single bundle object or an array of them) and import each. Returns
+// { ok, ids, count, error } — ids are the resulting (possibly re-slugged) song ids.
+async function importSongsFromText(text) {
+  let obj;
+  try { obj = JSON.parse(text); } catch { return { ok: false, ids: [], count: 0, error: 'not valid JSON' }; }
+  const items = Array.isArray(obj) ? obj : [obj];
+  const ids = [];
+  let firstErr = null;
+  for (const raw of items) {
+    const r = await importOneSong(raw);
+    if (r.ok) ids.push(r.id); else if (!firstErr) firstErr = r.error;
+  }
+  return { ok: ids.length > 0, ids, count: ids.length, error: ids.length ? null : (firstErr || 'nothing to import') };
+}
+
+// Land an Open: select the imported song, and for the single-song case link it to the
+// file it came from (name always; the writable handle when the platform gave us one).
+function afterOpen(res, linkName) {
+  pendingNew = null;
+  currentSketchId = null;
+  sketchFlash = null;
+  songFlash = res.ok ? null : { ok: false, error: res.error };
+  currentView = 'songs';
+  resetTapeDeckUi();
+  if (res.ok) {
+    currentSongId = res.ids[res.ids.length - 1];
+    if (res.count === 1 && linkName) {
+      const sid = res.ids[0];
+      songs = songs.map((s) => (s.id === sid ? { ...s, file: { name: linkName } } : s));
+      saveSongs(songs);
+    }
+  }
+  render();
 }
 
 // After load, drop any sketch metadata whose blob is missing (evicted / never written)
@@ -399,6 +441,32 @@ async function writeJsonSink(sink, obj) {
   }
 
   await shareOrDownloadBlob(blob, sink.name, 'application/json');   // tiers 2+3
+}
+
+// ---- per-song save-in-place handles (File System Access API; desktop) ----
+
+// Ask (once, under the click gesture) for readwrite permission on a retained handle.
+// A browser permission grant, NOT an app "are you sure".
+async function ensureHandleWritable(handle) {
+  try {
+    const opts = { mode: 'readwrite' };
+    if ((await handle.queryPermission(opts)) === 'granted') return true;
+    if ((await handle.requestPermission(opts)) === 'granted') return true;
+  } catch {}
+  return false;
+}
+
+// A usable write handle for a song, if any: session cache first, then IndexedDB.
+async function handleForSong(songId) {
+  if (fileHandles.has(songId)) return fileHandles.get(songId);
+  try { const h = await audioStore.getFileHandle(songId); if (h) { fileHandles.set(songId, h); return h; } } catch {}
+  return null;
+}
+
+// Remember a handle for a song (session cache + IndexedDB, best-effort).
+async function rememberHandle(songId, handle) {
+  fileHandles.set(songId, handle);
+  try { await audioStore.putFileHandle(songId, handle); } catch {}
 }
 
 // Convenience for a synchronously-built payload (feels): the object is already in hand, so
@@ -580,11 +648,12 @@ const handlers = {
   onCreateSong: (indices) => {
     const snaps = snapshotsFor(indices);
     if (!snaps.length) return;
-    const now = nowISO();
-    draftSong = appendProgressions(createSong(now), snaps, now);
+    // Name up front: stash the captured snapshots and prompt for a name on the Songs tab.
+    pendingNew = { snaps };
     currentSongId = null;
     currentSketchId = null;
     sketchFlash = null;
+    songFlash = null;
     currentView = 'songs';
     genFlash = null;
     resetTapeDeckUi();
@@ -595,8 +664,7 @@ const handlers = {
     const snaps = snapshotsFor(indices);
     if (!snaps.length) return;
     updateActive((s, now) => appendProgressions(s, snaps, now));
-    const a = activeSong();
-    genFlash = '✓ Added to ' + (draftSong ? 'the new song' : a.name);
+    genFlash = '✓ Added to ' + activeSong().name;
     render();
   },
 
@@ -604,8 +672,8 @@ const handlers = {
   songs: {
     onSelectSong: (target) => {
       genFlash = null;
-      if (target === '__draft__') return; // already the active draft
-      draftSong = null;
+      songFlash = null;
+      pendingNew = null;
       currentSongId = target || null;
       currentSketchId = null;
       sketchFlash = null;
@@ -618,18 +686,35 @@ const handlers = {
     onCopyProgression: (i) => { updateActive((s, now) => copyProgression(s, i, now)); render(); },
 
     // ---- hand-editing: build a song by hand in the Songs tab ----
-    // Start a new draft song with one seeded C-major row (works with no song selected).
+    // Name up front: prompt for a name, then onConfirmNewSong creates + persists + selects.
     onNewSong: () => {
-      const now = nowISO();
-      draftSong = appendRow(createSong(now), cMajor(), now);
+      pendingNew = { snaps: null };   // null → seed one blank C-major row on confirm
       currentSongId = null;
       currentSketchId = null;
       sketchFlash = null;
+      songFlash = null;
       currentView = 'songs';
       genFlash = null;
       resetTapeDeckUi();
       render();
     },
+    // Confirm the name for a pending new song: build it (from captured snapshots or a seeded
+    // blank row), assign a unique id, persist, and select it. This is the one create path.
+    onConfirmNewSong: (name) => {
+      if (!pendingNew) return;
+      const now = nowISO();
+      const finalName = (name && String(name).trim()) ? String(name).trim() : nextUntitledName(songs.map((s) => s.name));
+      const base = pendingNew.snaps
+        ? appendProgressions(createSong(now), pendingNew.snaps, now)
+        : appendRow(createSong(now), cMajor(), now);
+      const finalized = finalizeDraft(base, finalName, songs.map((s) => s.id), now);
+      songs = songs.concat(finalized);
+      saveSongs(songs);
+      currentSongId = finalized.id;
+      pendingNew = null;
+      render();
+    },
+    onCancelNewSong: () => { pendingNew = null; render(); },
     onNewRow: () => { updateActive((s, now) => appendRow(s, cMajor(), now)); render(); },
     onAddChord: (i) => { updateActive((s, now) => addChord(s, i, cMajor(), now)); render(); },
     onSetChord: (i, j, chord) => { updateActive((s, now) => setChord(s, i, j, chord, now)); render(); },
@@ -648,13 +733,12 @@ const handlers = {
       if (!check.ok) { sketchFlash = { ok: false, error: check.error }; render(); return; }
       if (file.size > 25 * 1024 * 1024) { sketchFlash = { ok: false, error: 'That file is too large (25 MB max).' }; render(); return; }
       if (!activeSong()) return;
-      const wasDraft = !!draftSong;
       const beforeId = currentSongId;
       const id = newSketchId();
       try { await ensurePersist(); await audioStore.putBlob(id, file); }
       catch { sketchFlash = { ok: false, error: 'Could not store audio (storage full or unavailable).' }; render(); return; }
       // Only commit metadata if the intended song is still the active one.
-      const stillSame = wasDraft ? !!draftSong : (!draftSong && currentSongId === beforeId && songs.some((s) => s.id === beforeId));
+      const stillSame = currentSongId === beforeId && songs.some((s) => s.id === beforeId);
       if (!stillSame) { audioStore.deleteBlob(id).catch(() => {}); return; }
       updateActive((s, now) => addSketchMeta(s, makeSketchMeta({ id, filename: file.name, mimeType: file.type, size: file.size }, now), now));
       currentSketchId = id;
@@ -680,22 +764,9 @@ const handlers = {
     // Load a sketch's audio blob for the inline player (impure; IndexedDB).
     onLoadSketchBlob: (id) => audioStore.getBlob(id),
 
-    onSaveSong: (name) => {
-      if (draftSong) {
-        const finalName = (name && String(name).trim()) ? String(name).trim() : nextUntitledName(songs.map((s) => s.name));
-        const finalized = finalizeDraft(draftSong, finalName, songs.map((s) => s.id), nowISO());
-        songs = songs.concat(finalized);
-        saveSongs(songs);
-        currentSongId = finalized.id;
-        draftSong = null;
-      } else if (currentSongId) {
-        saveSongs(songs); // already current; persist for reassurance
-      }
-      render();
-    },
     onRenameSong: (name) => {
       const nm = name && String(name).trim();
-      if (!nm || draftSong || !currentSongId) { render(); return; }
+      if (!nm || !currentSongId) { render(); return; }
       songs = songs.map((s) => (s.id === currentSongId ? renameSong(s, nm, nowISO()) : s));
       saveSongs(songs);
       render();
@@ -704,8 +775,11 @@ const handlers = {
       const gone = songs.find((s) => s.id === id);
       songs = songs.filter((s) => s.id !== id);
       saveSongs(songs);
-      if (currentSongId === id) { currentSongId = null; currentSketchId = null; sketchFlash = null; resetTapeDeckUi(); }
+      if (currentSongId === id) { currentSongId = null; currentSketchId = null; sketchFlash = null; songFlash = null; resetTapeDeckUi(); }
       render();
+      // Best-effort: drop the deleted song's save-in-place handle (session + IndexedDB).
+      fileHandles.delete(id);
+      audioStore.deleteFileHandle(id).catch(() => {});
       // Best-effort: drop the deleted song's audio blobs (reconcile also GCs them later).
       if (gone && gone.sketches && gone.sketches.length) audioStore.deleteMany(gone.sketches.map((sk) => sk.id)).catch(() => {});
       // §5.7: also GC its OPFS take directory (no boot-time GC, D30 — deletion is
@@ -713,46 +787,72 @@ const handlers = {
       if (gone && gone.tapeDeck) takeStore.deleteSongTakes(gone.id).catch(() => {});
     },
 
-    // Import a pasted/uploaded song bundle (single object or an array). Reconstructs the
-    // audio in IndexedDB from the embedded base64. Returns { ok, name }/{ ok:false, error }.
-    onImportSong: async (text) => {
-      let obj;
-      try { obj = JSON.parse(text); } catch { return { ok: false, error: 'not valid JSON' }; }
-      const items = Array.isArray(obj) ? obj : [obj];
-      const results = [];
-      for (const raw of items) results.push(await importOneSong(raw));
-      draftSong = null;
-      currentSketchId = null;
-      sketchFlash = null;
-      currentView = 'songs';
-      resetTapeDeckUi();
-      render();
-      if (results.length === 1) return results[0];
-      const okCount = results.filter((r) => r.ok).length;
-      return okCount ? { ok: true, name: okCount + ' songs' } : { ok: false, error: (results[0] && results[0].error) || 'nothing to import' };
-    },
-    onExportCurrent: async () => {
+    // Save the current song's .json. Linked + File System Access → overwrite in place,
+    // silently. Otherwise open the platform save flow (desktop picker, else Save to Files /
+    // share / download) and link the song to the file it lands in.
+    onSaveSongFile: async () => {
       const a = activeSong();
-      if (!a || !a.id) return;                          // a draft has no id yet; save it first
-      const sink = await openJsonSink(a.id + '.json');  // open the save dialog under the gesture
-      if (!sink) return;                                // user cancelled
-      await writeJsonSink(sink, await toSongBundle(a)); // build the bundle, then write it
+      if (!a || !a.id) return;
+      const bundle = await toSongBundle(a);
+
+      // 1. Silent overwrite when we hold a usable handle (desktop, already linked).
+      const existing = await handleForSong(a.id);
+      if (existing && await ensureHandleWritable(existing)) {
+        try {
+          await writeJsonSink({ handle: existing }, bundle);
+          songFlash = { ok: true, name: (a.file && a.file.name) || (a.id + '.json') };
+          render();
+          return;
+        } catch { /* handle went stale (file moved/deleted) → fall through to re-pick */ }
+      }
+
+      // 2. First save (or no usable handle): choose name + destination.
+      const suggested = (a.file && a.file.name) || (a.id + '.json');
+      const sink = await openJsonSink(suggested);
+      if (!sink) return;   // cancelled the save dialog
+      await writeJsonSink(sink, bundle);
+      const savedName = (sink.handle && sink.handle.name) || sink.name || suggested;
+      if (sink.handle) await rememberHandle(a.id, sink.handle);
+      songs = songs.map((s) => (s.id === a.id ? { ...s, file: { name: savedName } } : s));
+      saveSongs(songs);
+      songFlash = { ok: true, name: savedName };
+      render();
     },
-    onExportAllSongs: async () => {
-      if (!songs.length) return;
-      const sink = await openJsonSink('songwriter-songs.json');
-      if (!sink) return;                                // user cancelled
-      const bundles = [];
-      for (const s of songs) bundles.push(await toSongBundle(s));
-      await writeJsonSink(sink, bundles);
+
+    // Open a song from a .json. Desktop path: showOpenFilePicker gives a handle we retain
+    // (so Save overwrites it in place). Called by the view only where the API exists.
+    onOpenSongPicker: async () => {
+      if (typeof window === 'undefined' || !window.showOpenFilePicker) return;
+      let handles;
+      try {
+        handles = await window.showOpenFilePicker({
+          multiple: false,
+          types: [{ description: 'Songwriter JSON', accept: { 'application/json': ['.json'] } }],
+        });
+      } catch { return; }   // AbortError (cancelled) or unsupported
+      const handle = handles && handles[0];
+      if (!handle) return;
+      let text;
+      try { const f = await handle.getFile(); text = await f.text(); }
+      catch { songFlash = { ok: false, error: 'could not read that file' }; render(); return; }
+      const res = await importSongsFromText(text);
+      if (res.ok && res.count === 1) await rememberHandle(res.ids[0], handle);
+      afterOpen(res, handle.name);
+    },
+
+    // Open a song from text read via a hidden <input type=file> (iOS / Chrome Android /
+    // any no-File-System-Access platform). No handle, so the link is name-only.
+    onOpenSongText: async (text, filename) => {
+      const res = await importSongsFromText(text);
+      afterOpen(res, filename || null);
     },
 
     // ---- tape deck (§5.6/§5.7) ----
 
     onOpenTapeDeck: async () => {
       const a = activeSong();
-      if (!a || !a.id) return;                          // a draft has no slug -> no OPFS path (§5.8)
-      // A generation token: onSelectSong/onNewSong/onDeleteSong/onImportSong (all
+      if (!a || !a.id) return;                          // no song selected -> no OPFS path (§5.8)
+      // A generation token: onSelectSong/onNewSong/onDeleteSong/onOpenSong* (all
       // synchronous) bump deckOpenSeq via resetTapeDeckUi, and a second, later
       // onOpenTapeDeck call bumps it again here — either invalidates this call.
       // Without this, a song switch mid-await lets this continuation's stale

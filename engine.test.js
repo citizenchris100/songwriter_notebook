@@ -470,6 +470,15 @@ ok('validateSong rejects a non-object tapeDeck', !validateSong({ ...goodSong, ta
 ok('normalizeSong preserves a present tapeDeck ref', normalizeSong({ ...goodSong, tapeDeck: { path: 'takes/my-song/' } }).tapeDeck.path === 'takes/my-song/');
 ok('normalizeSong omits the tapeDeck key entirely when absent', !('tapeDeck' in normalizeSong(goodSong)));
 
+// file link (additive, local-only — the .json a song is opened from / saved to; stays out
+// of the export bundle; schemaVersion stays 1).
+ok('validateSong accepts a song with a good file ref', validateSong({ ...goodSong, file: { name: 'My Song.json' } }).ok);
+ok('validateSong rejects a file with an empty name', !validateSong({ ...goodSong, file: { name: '' } }).ok);
+ok('validateSong rejects a non-object file', !validateSong({ ...goodSong, file: 'nope' }).ok);
+ok('normalizeSong preserves a present file ref', normalizeSong({ ...goodSong, file: { name: 'My Song.json' } }).file.name === 'My Song.json');
+ok('normalizeSong reduces file to { name } only', !('handle' in normalizeSong({ ...goodSong, file: { name: 'x.json', handle: 1 } }).file));
+ok('normalizeSong omits the file key entirely when absent', !('file' in normalizeSong(goodSong)));
+
 // ============================================================================
 // 14. Tape deck (pure) — takeModel, wav, lufs, limiter
 // ============================================================================

@@ -54,6 +54,15 @@ export function validateSong(s) {
     else if (typeof td.path !== 'string' || td.path.length < 1) errors.push('tapeDeck.path must be a non-empty string');
   }
 
+  // file is an additive optional field: the LOCAL link between this song and the .json
+  // file it was opened from / last saved to (name only; the writable handle, where the
+  // platform supports one, lives out-of-band in IndexedDB). Never part of an export bundle.
+  if ('file' in s) {
+    const fl = s.file;
+    if (fl == null || typeof fl !== 'object' || Array.isArray(fl)) errors.push('file must be an object');
+    else if (typeof fl.name !== 'string' || fl.name.length < 1) errors.push('file.name must be a non-empty string');
+  }
+
   return { ok: errors.length === 0, errors };
 }
 
@@ -101,6 +110,12 @@ export function normalizeSong(s) {
   // actually been opened once (absent key, not null, when there is no deck).
   if (s.tapeDeck && typeof s.tapeDeck === 'object' && typeof s.tapeDeck.path === 'string') {
     out.tapeDeck = { path: s.tapeDeck.path };
+  }
+  // Same reasoning for the file link: a known field, present only once a song has been
+  // opened from or saved to a .json (absent key when unlinked). name only — the handle is
+  // out-of-band. Reduced to { name } so a stray extra key can't ride along.
+  if (s.file && typeof s.file === 'object' && typeof s.file.name === 'string' && s.file.name) {
+    out.file = { name: s.file.name };
   }
   return out;
 }

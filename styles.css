@@ -157,8 +157,9 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
   background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
   border-radius: 9px; padding: 8px 10px; font-size: 14px; flex: 1 1 160px; outline: none;
 }
-.switchconfirm:not(:empty) { margin-top: 8px; }
-.songs-panel { max-width: 760px; }
+.pickrow { align-items: center; }
+.pickrow select { width: auto; flex: 1 1 160px; }
+.openctl { display: inline-flex; }
 
 /* ===== Songs tab: hand-editing (tappable chips, add chord, new row/song, picker) ===== */
 .prow.songchips { flex-wrap: wrap; overflow-x: visible; align-items: stretch; }
