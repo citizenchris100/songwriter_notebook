@@ -415,32 +415,38 @@ async function openJsonSink(suggestedName) {
 // writeJsonSink (tier 1 handled separately, JSON-export-only) and by
 // onShareTake (a take's stems/bounce are real .wav files, AC-20; there is no
 // "save file picker" step for those, only "share sheet or download").
+// Returns true when the bytes reached a destination, false when the user dismissed
+// the share sheet. The anchor-download tier has no cancel signal, so it returns true.
 async function shareOrDownloadBlob(blob, name, mimeType) {
   const file = new File([blob], name, { type: mimeType });
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
-    try { await navigator.share({ files: [file], title: name }); return; }
-    catch (e) { if (e && e.name === 'AbortError') return; /* else fall through to a download */ }
+    try { await navigator.share({ files: [file], title: name }); return true; }
+    catch (e) { if (e && e.name === 'AbortError') return false; /* else fall through to a download */ }
   }
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url; a.download = name;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return true;
 }
 
 // Phase 2 — write `obj` (built by the caller, possibly after an await) to the sink.
+// Returns true when the bytes were written/shared, false if the user cancelled (a null
+// Phase-1 sink, or an iOS share-sheet dismiss). Callers that don't gate on the result
+// may ignore it.
 async function writeJsonSink(sink, obj) {
-  if (!sink) return;                                       // user cancelled in Phase 1
+  if (!sink) return false;                                 // user cancelled in Phase 1
   const text = JSON.stringify(obj, null, 2) + '\n';
   const blob = new Blob([text], { type: 'application/json' });
 
   if (sink.handle) {                                       // tier 1: File System Access handle
     const writable = await sink.handle.createWritable();
     try { await writable.write(blob); } finally { await writable.close(); }
-    return;
+    return true;
   }
 
-  await shareOrDownloadBlob(blob, sink.name, 'application/json');   // tiers 2+3
+  return await shareOrDownloadBlob(blob, sink.name, 'application/json');   // tiers 2+3
 }
 
 // ---- per-song save-in-place handles (File System Access API; desktop) ----
@@ -699,8 +705,12 @@ const handlers = {
       render();
     },
     // Confirm the name for a pending new song: build it (from captured snapshots or a seeded
-    // blank row), assign a unique id, persist, and select it. This is the one create path.
-    onConfirmNewSong: (name) => {
+    // blank row), assign a unique id, then choose a save location and write its .json — the
+    // same openJsonSink/writeJsonSink path as Save. A song is committed to sn_songs, linked,
+    // and opened ONLY after the write succeeds, so a created song always has a written .json;
+    // cancelling the location dialog (or the iOS share sheet) or a write failure creates
+    // nothing. This is the one create path (the New button and Progressions' Create song).
+    onConfirmNewSong: async (name) => {
       if (!pendingNew) return;
       const now = nowISO();
       const finalName = (name && String(name).trim()) ? String(name).trim() : nextUntitledName(songs.map((s) => s.name));
@@ -708,11 +718,26 @@ const handlers = {
         ? appendProgressions(createSong(now), pendingNew.snaps, now)
         : appendRow(createSong(now), cMajor(), now);
       const finalized = finalizeDraft(base, finalName, songs.map((s) => s.id), now);
-      songs = songs.concat(finalized);
-      saveSongs(songs);
-      currentSongId = finalized.id;
-      pendingNew = null;
-      render();
+
+      // Open the save location FIRST (no await precedes it, so the File System Access dialog
+      // keeps its transient activation from the Create click).
+      const sink = await openJsonSink(finalized.id + '.json');
+      if (!sink) return;   // desktop picker dismissed → no song, name card stays
+      try {
+        const bundle = await toSongBundle(finalized);              // fresh song → empty audio map
+        if (!(await writeJsonSink(sink, bundle))) return;          // iOS share sheet dismissed → no song
+        const savedName = (sink.handle && sink.handle.name) || sink.name || (finalized.id + '.json');
+        if (sink.handle) await rememberHandle(finalized.id, sink.handle);
+        songs = songs.concat({ ...finalized, file: { name: savedName } });
+        saveSongs(songs);
+        currentSongId = finalized.id;
+        pendingNew = null;
+        songFlash = { ok: true, name: savedName };
+        render();
+      } catch {
+        songFlash = { ok: false, error: 'could not save the song file' };
+        render();   // pendingNew stays set → name card + error shown, user can retry
+      }
     },
     onCancelNewSong: () => { pendingNew = null; render(); },
     onNewRow: () => { updateActive((s, now) => appendRow(s, cMajor(), now)); render(); },

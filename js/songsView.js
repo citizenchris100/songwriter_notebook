@@ -77,7 +77,7 @@ export function mountSongsView(container, handlers) {
       const bar = h('div', 'namebar');
       const input = h('input', 'nameinput'); input.type = 'text';
       input.value = vm.nextName || ''; input.placeholder = 'Song name';
-      const ok = h('button', 'btn primary', 'Create');
+      const ok = h('button', 'btn primary', 'Create…');
       const cancel = h('button', 'btn mini', 'Cancel');
       const submit = () => onConfirmNewSong(input.value);
       ok.addEventListener('click', submit);
@@ -85,6 +85,8 @@ export function mountSongsView(container, handlers) {
       cancel.addEventListener('click', () => onCancelNewSong());
       bar.append(input, ok, cancel);
       card.appendChild(bar);
+      card.appendChild(h('div', 'feel-empty', "You'll choose where to save the .json next."));
+      if (vm.songFlash && !vm.songFlash.ok) card.appendChild(h('div', 'feel-status err', vm.songFlash.error));
       wrap.appendChild(rowOf(card));
       container.appendChild(wrap);
       setTimeout(() => { input.focus(); input.select(); }, 0);
