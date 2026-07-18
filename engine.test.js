@@ -38,6 +38,10 @@ import {
 import { wavHeader, floatToInt16, interleave, parseWav, SIZE_FIELDS } from './js/tape/wav.js';
 import { integratedLoudness } from './js/tape/lufs.js';
 import { limit } from './js/tape/limiter.js';
+import {
+  detectClickSample, rttSeconds, median, summarizeTrials, isPlausibleRtt,
+  PLAUSIBLE_RTT_MIN, PLAUSIBLE_RTT_MAX,
+} from './js/tape/latency.js';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const readJSON = (p) => JSON.parse(readFileSync(here(p), 'utf8'));
@@ -763,9 +767,48 @@ for (let i = lookaheadSamples; i < quietSrc.length; i++) if (quietCopy[i] !== qu
 ok('under-ceiling material passes through bit-identical (delay-shifted)', passthroughExact);
 
 // ============================================================================
+// 17b. Tape deck (pure) — latency.js (overdub round-trip calibration math)
+// ============================================================================
+// A captured buffer: silence, then a click (short decaying burst) at a known index.
+function bufferWithClick(len, at, amp) {
+  const b = new Float32Array(len);
+  for (let i = 0; i < 200 && at + i < len; i++) b[at + i] = amp * Math.sin((2 * Math.PI * 2000 * i) / 48000) * (1 - i / 200);
+  return b;
+}
+const clickBuf = bufferWithClick(48000, 12000, 0.8);
+const onset = detectClickSample(clickBuf);
+ok('detectClickSample finds the onset near the click start', Math.abs(onset - 12000) <= 3);
+eq('detectClickSample returns -1 on silence', detectClickSample(new Float32Array(48000)), -1);
+eq('detectClickSample returns -1 on empty', detectClickSample(new Float32Array(0)), -1);
+// A little room noise, click well above it -> still detected at the right place.
+const noisy = bufferWithClick(48000, 20000, 0.6);
+for (let i = 0; i < noisy.length; i++) noisy[i] += (((i * 2654435761) % 1000) / 1000 - 0.5) * 0.02; // deterministic pseudo-noise
+ok('detectClickSample survives low room noise', Math.abs(detectClickSample(noisy) - 20000) <= 5);
+
+eq('rttSeconds computes onset-minus-emit over rate', rttSeconds(48000 + 960, 48000, 48000), 0.02); // 20 ms
+ok('rttSeconds NaN on bad input', Number.isNaN(rttSeconds(1, 2, 0)));
+
+eq('median odd', median([3, 1, 2]), 2);
+eq('median even', median([4, 1, 3, 2]), 2.5);
+ok('median ignores non-numbers', median([2, NaN, 4, undefined, 6]) === 4);
+
+ok('isPlausibleRtt accepts a typical 20 ms round trip', isPlausibleRtt(0.02));
+ok('isPlausibleRtt rejects 0', !isPlausibleRtt(0));
+ok('isPlausibleRtt rejects an absurd 2 s', !isPlausibleRtt(2));
+eq('PLAUSIBLE band', PLAUSIBLE_RTT_MIN + ',' + PLAUSIBLE_RTT_MAX, '0.001,0.5');
+
+// summarizeTrials: median is robust to one wild outlier; the spread reports confidence.
+const good = summarizeTrials([0.021, 0.019, 0.020, 0.022, 0.018, 0.200]); // last is an outlier
+ok('summarizeTrials is ok with a quorum', good.ok);
+ok('summarizeTrials median rejects the outlier', Math.abs(good.medianSec - 0.0205) < 0.002);
+ok('summarizeTrials reports a spread', good.spreadMs > 0);
+ok('summarizeTrials filters implausible values before the quorum', !summarizeTrials([0.02, null, 5, 0]).ok);
+ok('summarizeTrials fails on all-silent trials', !summarizeTrials([null, null, null]).ok);
+
+// ============================================================================
 // 18. Tape deck — sw.js caches every new module (tape/… asset-list assertion)
 // ============================================================================
-for (const f of ['tape/takeModel', 'tape/wav', 'tape/lufs', 'tape/limiter', 'tape/audioEngine', 'tape/takeStore', 'tape/opfsWorker', 'tape/captureProcessor', 'tape/devices', 'tape/tapeView']) {
+for (const f of ['tape/takeModel', 'tape/wav', 'tape/lufs', 'tape/limiter', 'tape/latency', 'tape/audioEngine', 'tape/takeStore', 'tape/opfsWorker', 'tape/captureProcessor', 'tape/devices', 'tape/tapeView']) {
   ok('sw.js caches ' + f + '.js', sw.includes(`"./js/${f}.js"`));
 }
 

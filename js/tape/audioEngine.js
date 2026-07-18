@@ -11,15 +11,20 @@ import { integratedLoudness } from './lufs.js';
 import { limit } from './limiter.js';
 import {
   STEM_KEYS, MAX_TRACKS, stemFileName, mixFileName, compressorParams, bounceGainDb,
-  EQ_BANDS, LIMITER_CEILING_DB,
+  EQ_BANDS, LIMITER_CEILING_DB, defaultStemSettings,
 } from './takeModel.js';
+import { detectClickSample, rttSeconds, summarizeTrials } from './latency.js';
 
 const BOUNCE_RATE = 48000;
 
 // D21: worklet module fetches bypass the service worker — load the module
 // source via fetch (SW-cache-served offline) into a Blob URL, exactly as
 // takeStore.js does for the worker. Falls back to the plain URL online.
+// Idempotent per context: adding the module twice would re-run registerProcessor
+// ('capture-processor' already registered → throws), and both record() and
+// calibrateLatency() call this, so guard on a per-ctx flag.
 async function addWorkletModule(ctx) {
+  if (ctx.__captureWorkletLoaded) return;
   const url = new URL('./captureProcessor.js', import.meta.url).href;
   try {
     const res = await fetch(url);
@@ -30,6 +35,7 @@ async function addWorkletModule(ctx) {
   } catch {
     await ctx.audioWorklet.addModule(url); // fine online; may not work offline
   }
+  ctx.__captureWorkletLoaded = true;
 }
 
 // The persistent, non-destructive effect chain for one stem (D12): Gain(vol) ->
@@ -440,6 +446,92 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
     return { ok: true, srcKey, dstKey, durationSec };
   }
 
+  // ---- overdub latency calibration (§ measured, not guessed) ----
+  // Fire a series of clicks THROUGH the real playback chain (so the compressor's
+  // fixed latency is included, exactly as the backing experiences it) and capture
+  // the input via the worklet's measure mode. The user provides the loopback (a
+  // cable EVO out->in, or acoustically mic-to-headphones). Each click's return is
+  // located on the AudioContext sample clock, so the measured round trip needs no
+  // outputLatency/getOutputTimestamp (unreliable / absent on iPadOS < 18.4). The
+  // median of several trials, applied verbatim as monitorLatencySec, aligns an
+  // overdub to the backing.
+  async function calibrateLatency({ deviceId, onProgress } = {}) {
+    const N = 7, SPACING = 0.6, LEAD = 0.4, SEARCH = 0.5, TAIL = 0.25;
+    const acquired = await devices.acquireForRecording(deviceId);
+    if (!acquired.ok) return { ok: false, reason: 'Microphone access is blocked.' };
+    const stream = acquired.stream;
+    const audioCtx = await ensureContext();
+    await addWorkletModule(audioCtx);
+    const sr = audioCtx.sampleRate;
+
+    const source = audioCtx.createMediaStreamSource(stream);
+    const node = new AudioWorkletNode(audioCtx, 'capture-processor', {
+      numberOfInputs: 1, numberOfOutputs: 1,
+      channelCount: 1, channelCountMode: 'explicit', channelInterpretation: 'discrete',
+      processorOptions: { channelCount: 1, measure: true },
+    });
+    const sink = audioCtx.createGain(); sink.gain.value = 0;
+    source.connect(node); node.connect(sink); sink.connect(audioCtx.destination);
+
+    // Position-anchored capture buffer: each chunk is written at its absolute frame
+    // (robust to a dropped quantum) relative to the first chunk's frame.
+    const totalSec = LEAD + N * SPACING + SEARCH + TAIL;
+    const cap = new Float32Array(Math.ceil((totalSec + 0.5) * sr));
+    let firstFrame = -1;
+    node.port.onmessage = (e) => {
+      const m = e.data; if (!m || !m.measure) return;
+      if (firstFrame < 0) firstFrame = m.startFrame;
+      const off = m.startFrame - firstFrame;
+      if (off >= 0 && off < cap.length) cap.set(m.measure.subarray(0, Math.min(m.measure.length, cap.length - off)), off);
+    };
+
+    // A 2 ms windowed 2 kHz click, played through the real chain (comp latency incl.).
+    const clickLen = Math.round(0.002 * sr);
+    const clickBuf = audioCtx.createBuffer(1, clickLen, sr);
+    const cd = clickBuf.getChannelData(0);
+    for (let i = 0; i < clickLen; i++) cd[i] = 0.9 * Math.sin((2 * Math.PI * 2000 * i) / sr) * (1 - i / clickLen);
+    const chain = buildEffectChain(audioCtx, defaultStemSettings());
+    chain.output.connect(audioCtx.destination);
+
+    const startAt = audioCtx.currentTime + LEAD;
+    const emitFrames = [];
+    for (let k = 0; k < N; k++) {
+      const at = startAt + k * SPACING;
+      emitFrames.push(Math.round(at * sr));
+      const s = audioCtx.createBufferSource();
+      s.buffer = clickBuf; s.connect(chain.input); s.start(at);
+      if (onProgress) onProgress((k + 1) / N);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, (totalSec + 0.2) * 1000));
+    await new Promise((resolve) => {
+      const prev = node.port.onmessage;
+      node.port.onmessage = (e) => { if (e.data && e.data.flushed) { resolve(); return; } prev && prev(e); };
+      node.port.postMessage({ op: 'flush' });
+      setTimeout(resolve, 300);
+    });
+
+    try { source.disconnect(); node.disconnect(); sink.disconnect(); chain.output.disconnect(); } catch { /* already disconnected */ }
+    stream.getTracks().forEach((t) => t.stop());
+
+    if (firstFrame < 0) return { ok: false, reason: 'No audio captured — check the input.' };
+
+    // For each click, search its own window [emit, emit+SEARCH]; the detected onset
+    // index (from the window start = the emit frame) IS the round trip in samples.
+    const searchLen = Math.round(SEARCH * sr);
+    const rtts = [];
+    for (let k = 0; k < N; k++) {
+      const winStart = emitFrames[k] - firstFrame;
+      if (winStart < 0 || winStart >= cap.length) { rtts.push(null); continue; }
+      const win = cap.subarray(winStart, Math.min(cap.length, winStart + searchLen));
+      const onset = detectClickSample(win);
+      rtts.push(onset < 0 ? null : rttSeconds(emitFrames[k] + onset, emitFrames[k], sr));
+    }
+    // Drop the first (graph warm-up), then median the rest.
+    const summary = summarizeTrials(rtts.slice(1));
+    return { ok: summary.ok, rttSec: summary.medianSec, spreadMs: summary.spreadMs, reason: summary.reason };
+  }
+
   function dispose() {
     if (recording) stop('interrupted');
     stopMonitor();
@@ -448,5 +540,5 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
     if (ctx) { try { ctx.close(); } catch { /* already closed */ } ctx = null; }
   }
 
-  return { probe, record, stop, play, replay, stopPlay, bounce, bounceTracks, applySettings, dispose };
+  return { probe, record, stop, play, replay, stopPlay, bounce, bounceTracks, applySettings, calibrateLatency, dispose };
 }

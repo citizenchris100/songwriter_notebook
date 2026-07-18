@@ -43,9 +43,15 @@ The 2-track deck below was expanded, at the user's direction, into a **4-track c
    pass, the deck plays the take's already-recorded tracks so the performer overdubs in time. Alignment
    is a **capture gate**: the worklet discards frames until `beginFrame = (startAt + monitorLatencySec) *
    rate`, so every stem file's sample 0 IS the shared timeline t=0 and playback/bounce need no alignment
-   code. `monitorLatencySec` is **measured on-device** (input latency is unexposed by Web Audio) with
-   `tools/latency-spike.html` (EVO loopback) and entered in the deck; a wrong value flams the overdub by
-   a fixed offset. iOS Safari lacks `AudioContext.outputLatency` → calibration is the reliable path.
+   code. `monitorLatencySec` is the round trip (output + input), which is **measured in-app** by a
+   loopback calibration — the deck's **Calibrate** button plays a series of clicks through the real
+   playback chain (so the compressor's latency is included) and detects their return in the input
+   (cable EVO out→in, or acoustically), taking the median of several trials and storing it **per input
+   device**. This is the only reliable path: `AudioContext.outputLatency` is absent on iPadOS < 18.4 and
+   under-reports (it misses input latency) where present, and there is no input-latency API at all —
+   `js/tape/latency.js` (pure, node-tested) does the detection/stats. Default 0 (uncalibrated) = pure
+   playback + capture; a manual ms override is also available. `tools/latency-spike.html` (the throwaway
+   diagnostic) was folded into this in-app calibration and removed.
 4. **Per-track ping-pong bounce.** Each track strip has a Bounce▸ button → pick a destination track; the
    source + destination are summed (both effected, **mono**, limiter-guarded, no LUFS normalize) into the
    destination's file, the destination resets to neutral settings, and the **source slot is freed** for

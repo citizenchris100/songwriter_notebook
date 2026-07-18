@@ -42,16 +42,34 @@ class CaptureProcessor extends AudioWorkletProcessor {
     this.meterEveryFrames = Math.max(1, Math.round(sampleRate / METER_HZ));
     this.framesSinceMeter = 0;
 
+    // Measure mode (latency calibration, js/tape/latency.js): stream raw mono capture
+    // back to the main thread tagged with the absolute context frame of each chunk's
+    // first sample, so a returning click can be located on the one sample clock. No
+    // gate, no int16, no OPFS worker.
+    this.measure = !!opts.measure;
+    this.mChunk = this.measure ? new Float32Array(CHUNK_FRAMES) : null;
+    this.mCursor = 0;
+    this.mChunkStart = -1;
+
     this.port.onmessage = (e) => {
       const data = e.data;
       if (!data) return;
       if (data.port) { this.workerPort = data.port; return; }
       if (data.op === 'begin' && typeof data.beginFrame === 'number') { this.beginFrame = data.beginFrame; return; }
       if (data.op === 'flush') {
+        if (this.measure) { this.postMeasureChunk(); this.port.postMessage({ flushed: true }); return; }
         if (this.cursor > 0) this.flushChunk(this.cursor);
         this.port.postMessage({ flushed: true });
       }
     };
+  }
+
+  postMeasureChunk() {
+    if (this.mCursor === 0) return;
+    const out = this.mChunk.slice(0, this.mCursor);
+    this.port.postMessage({ measure: out, startFrame: this.mChunkStart }, [out.buffer]);
+    this.mCursor = 0;
+    this.mChunkStart = -1;
   }
 
   // Duplicated from wav.js floatToInt16 by necessity (this file has zero imports).
@@ -78,6 +96,18 @@ class CaptureProcessor extends AudioWorkletProcessor {
     const input = inputs[0];
     if (!input || !input.length || !input[0] || !input[0].length) return true; // no signal yet — stay alive
     const frames = input[0].length;
+
+    // Measure mode: stream channel 0 straight back, anchored to the sample clock.
+    if (this.measure) {
+      const ch = input[0];
+      for (let i = 0; i < frames; i++) {
+        if (this.mCursor === 0) this.mChunkStart = currentFrame + i; // absolute frame of this chunk's sample 0
+        this.mChunk[this.mCursor++] = ch[i];
+        if (this.mCursor >= CHUNK_FRAMES) this.postMeasureChunk();
+      }
+      return true;
+    }
+
     for (let i = 0; i < frames; i++) {
       // Peaks track the LIVE input every frame (so the meter shows level even during
       // an overdub's pre-roll count-in, before the gate opens).

@@ -35,7 +35,7 @@ export function buildDeckView(deck, handlers, songName) {
   const {
     onCloseTapeDeck, onNewTake, onArmRecordPass, onSetRoutingSlot, onStopTake,
     onDiscardLastGroup, onBounceStemToTrack, onBounceTake, onDeleteTake, onSelectTake,
-    onSelectInput, onSetMonitorLatency, onPreviewStemSetting, onSetStemSetting, onShareTake,
+    onSelectInput, onSetMonitorLatency, onCalibrateLatency, onPreviewStemSetting, onSetStemSetting, onShareTake,
     onPlayTake, onReplayTake, onStopPlayTake,
   } = handlers;
 
@@ -76,7 +76,7 @@ export function buildDeckView(deck, handlers, songName) {
   }
 
   // ---- transport ----
-  const transport = transportSection(deck, { onNewTake, onArmRecordPass, onSetRoutingSlot, onSetMonitorLatency, onStopTake, onPlayTake, onReplayTake, onStopPlayTake, songId: deck.songId });
+  const transport = transportSection(deck, { onNewTake, onArmRecordPass, onSetRoutingSlot, onSetMonitorLatency, onCalibrateLatency, onStopTake, onPlayTake, onReplayTake, onStopPlayTake, songId: deck.songId });
   wrap.appendChild(transport.el);
   live.timerEl = transport.timerEl;
   live.meterEls = transport.meterEls;
@@ -117,22 +117,40 @@ function armPanel(deck, ctx) {
     box.appendChild(row);
   }
   if (deck.inputChannels > deck.freeSlots) box.appendChild(banner('warn', 'More inputs than free tracks — only ' + deck.freeSlots + ' will be recorded this pass.'));
-  // Overdub latency compensation (ms) — only relevant when there are existing tracks
-  // to play as backing. Measure it once with tools/latency-spike.html on this rig.
-  if (deck.filledCount > 0) {
-    const latRow = h('div', 'row routerow');
-    latRow.appendChild(h('span', 'lbl', 'Overdub latency (ms)'));
-    const latIn = h('input', 'tapedial-range');
-    latIn.type = 'number'; latIn.min = '0'; latIn.max = '400'; latIn.step = '1'; latIn.value = String(deck.monitorLatencyMs || 0);
-    latIn.style.width = '5rem';
-    latIn.addEventListener('change', () => ctx.onSetMonitorLatency(Number(latIn.value) || 0));
-    latRow.appendChild(latIn);
-    box.appendChild(latRow);
-  }
+  // Overdub timing: the tracks play back and you monitor via the interface; this
+  // shifts a new track earlier to cancel the interface's round-trip delay so it
+  // lands in time. Only relevant once there are tracks to play under the new one.
+  if (deck.filledCount > 0) box.appendChild(latencyPanel(deck, ctx));
   const recBtn = h('button', 'btn primary grow', '● Record');
   recBtn.disabled = !!(deck.blocked || deck.unsupported || maxCap < 1);
   recBtn.addEventListener('click', () => ctx.onArmRecordPass());
   box.appendChild(rowOf(recBtn));
+  return box;
+}
+
+// Overdub timing panel: a measured round-trip (via the loopback calibration) or a
+// manual value, applied as the shift that lands a new track in time with the backing.
+function latencyPanel(deck, ctx) {
+  const lat = deck.monitorLatency || { ms: 0, source: 'none', spreadMs: null };
+  const box = h('div', 'col armpanel');
+  const desc = lat.source === 'measured'
+    ? 'Overdub sync: ' + lat.ms + ' ms measured' + (lat.spreadMs != null ? ' (±' + lat.spreadMs + ' ms)' : '')
+    : lat.source === 'manual'
+      ? 'Overdub sync: ' + lat.ms + ' ms (manual)'
+      : 'Overdub sync: none — playback + capture only';
+  box.appendChild(h('div', 'subtitle', desc));
+  const row = h('div', 'row routerow');
+  row.appendChild(h('span', 'lbl', 'Latency (ms)'));
+  const latIn = h('input', 'tapedial-range');
+  latIn.type = 'number'; latIn.min = '0'; latIn.max = '400'; latIn.step = '1'; latIn.value = String(lat.ms || 0);
+  latIn.style.width = '5rem';
+  latIn.addEventListener('change', () => ctx.onSetMonitorLatency(Number(latIn.value) || 0));
+  const calBtn = h('button', 'btn mini', deck.calibrating ? 'Calibrating…' : 'Calibrate');
+  calBtn.disabled = !!(deck.calibrating || deck.blocked || deck.unsupported);
+  calBtn.addEventListener('click', () => ctx.onCalibrateLatency());
+  row.append(latIn, calBtn);
+  box.appendChild(row);
+  box.appendChild(h('div', 'feel-empty', 'Loop the EVO output to input 1 (or hold the mic to your headphones), then Calibrate. Or type a value if you already know it.'));
   return box;
 }
 

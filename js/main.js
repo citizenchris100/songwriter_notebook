@@ -92,6 +92,7 @@ let deckRecordingGroup = null;  // the in-flight pass's group number
 let deckInputs = null;         // devices.probe() result: { inputs, preselectedId, warnMoreThanMax, isLikelyInterface, channels }
 let deckSelectedInputId = null;
 let deckSpaceWarning = false;
+let deckCalibrating = false;   // an overdub-latency calibration is in flight (clicks playing)
 let stemSettingsDebounce = null;
 
 function recompute() {
@@ -122,6 +123,7 @@ function resetTapeDeckUi() {
   deckRecording = false;
   deckArming = false;
   deckBouncing = false;
+  deckCalibrating = false;
   deckPendingNewTake = false;
   deckRouting = [];
   deckRecordingSlotKeys = [];
@@ -190,7 +192,8 @@ function tapeDeckViewModel(active) {
     inputChannels,
     status: deckStatus,
     spaceWarning: deckSpaceWarning,
-    monitorLatencyMs: getMonitorLatencyMs(),
+    calibrating: deckCalibrating,
+    monitorLatency: readLatency(deckSelectedInputId), // { ms, source:'measured'|'manual'|'none', spreadMs }
     hasHistory: takes.length > 0,
     filledSlotKeys,
     freeSlotKeys,
@@ -530,15 +533,28 @@ async function download(filename, obj) {
 
 const manifestPath = (slug) => takeModel.tapeDeckRef(slug).path + 'manifest.json';
 
-// Overdub monitoring latency (ms) — the round-trip the app plays a backing track
-// out and hears it back in, measured on-device with tools/latency-spike.html and
-// entered in the deck. Used to time-align an overdub so its sample 0 lands with the
-// backing at t=0; 0 (unset) means no compensation (deterministic, possibly a touch
-// late). Persisted globally (one rig at a time); a per-device split is a future step.
-const LATENCY_KEY = 'sn_tape_latency_ms';
-function getMonitorLatencyMs() {
-  try { const v = parseFloat(localStorage.getItem(LATENCY_KEY)); return isFinite(v) ? v : 0; } catch { return 0; }
+// Overdub round-trip latency (ms) — the delay the app plays a backing track out and
+// hears it back in. Used to time-align an overdub (the capture gate's offset). It is
+// MEASURED per input device by the in-app loopback calibration (js/tape/audioEngine
+// calibrateLatency), never read from AudioContext.outputLatency (unreliable / absent
+// on iPadOS < 18.4). 0 (uncalibrated) = no compensation (pure playback + capture,
+// deterministic but possibly a touch late). Stored per device (the correction is per
+// input/output/host combo and must be re-measured on a device change).
+const LATENCY_KEY = 'sn_tape_latency';
+const latencyKey = (deviceId) => LATENCY_KEY + '_' + (deviceId || 'default');
+function readLatency(deviceId) {
+  try {
+    const raw = localStorage.getItem(latencyKey(deviceId));
+    if (raw) { const o = JSON.parse(raw); if (o && typeof o.ms === 'number' && isFinite(o.ms)) return { ms: o.ms, source: o.source || 'manual', spreadMs: isFinite(o.spreadMs) ? o.spreadMs : null }; }
+    const legacy = parseFloat(localStorage.getItem('sn_tape_latency_ms')); // pre-per-device global value
+    if (isFinite(legacy)) return { ms: legacy, source: 'manual', spreadMs: null };
+  } catch { /* ignore */ }
+  return { ms: 0, source: 'none', spreadMs: null };
 }
+function writeLatency(deviceId, obj) {
+  try { localStorage.setItem(latencyKey(deviceId), JSON.stringify(obj)); } catch { /* ignore */ }
+}
+function getMonitorLatencyMs() { return readLatency(deckSelectedInputId).ms; }
 function getMonitorLatencySec() { return getMonitorLatencyMs() / 1000; }
 
 // The audioEngine controller — created once, lazily (an AudioContext needs a
@@ -1130,9 +1146,32 @@ const handlers = {
       render();
     },
 
-    // Persist the measured overdub monitoring latency (ms) from the deck's input.
+    // Manual overdub-latency override for the current input (dial-in / nudge).
     onSetMonitorLatency: (ms) => {
-      try { localStorage.setItem(LATENCY_KEY, String(ms)); } catch { /* ignore */ }
+      writeLatency(deckSelectedInputId, { ms: Number(ms) || 0, source: 'manual', spreadMs: null });
+      render();
+    },
+
+    // Measure the overdub round-trip through a loopback (cable EVO out->in, or mic to
+    // headphones). Plays a series of clicks; stores the median per input device.
+    onCalibrateLatency: async () => {
+      if (!tapeDeck || deckRecording || deckBouncing || deckCalibrating) return;
+      if (tapeDeck) tapeDeck.stopPlay();
+      deckCalibrating = true;
+      deckStatus = { type: 'warn', message: 'Calibrating… loop the EVO output to input 1 (or hold the mic to your headphones). You’ll hear a few clicks.' };
+      render();
+      let res;
+      try { res = await ensureTapeDeck().calibrateLatency({ deviceId: deckSelectedInputId }); }
+      catch { res = { ok: false, reason: 'Calibration failed to run.' }; }
+      deckCalibrating = false;
+      if (res.ok) {
+        const ms = Math.round(res.rttSec * 1000);
+        const spreadMs = res.spreadMs != null ? Math.round(res.spreadMs) : null;
+        writeLatency(deckSelectedInputId, { ms, source: 'measured', spreadMs });
+        deckStatus = { type: 'warn', message: 'Measured round-trip ' + ms + ' ms' + (spreadMs != null ? ' (±' + spreadMs + ' ms across trials)' : '') + ' — applied to overdubs.' };
+      } else {
+        deckStatus = { type: 'error', message: res.reason || 'Calibration failed.' };
+      }
       render();
     },
 
