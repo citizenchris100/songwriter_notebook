@@ -27,10 +27,13 @@ import {
 import { chordFromRootAndQuality, chordForTone, CHROMATIC_TONES } from './js/theory/roman.js';
 import {
   validateTake, normalizeTake, validateManifest, normalizeManifest, createManifest,
-  makeTake, appendTake, nextTakeNumber, finalizeTake, finalizeRecoveredTake, discardTake,
-  markBounced, setStemSettings, mostRecentKeptTake, stemFileName, mixFileName, tapeDeckRef,
+  makeTake, appendTake, nextTakeNumber, appendPassTracks, finalizePass, finalizeRecoveredPass,
+  discardTake, discardGroup, bounceTrackToTrack, markBounced, setStemSettings, mostRecentKeptTake,
+  nextGroup, lastGroupSlotKeys, freeSlotKeys, filledSlotKeys, maxSlotDuration, takeHasAudio,
+  slotHasAudio, defaultRouting, stemFileName, mixFileName, tapeDeckRef,
   defaultStemSettings, clampStemSettings, compressorParams, bounceGainDb,
-  LUFS_TARGET, LUFS_FLOOR, BOUNCE_GAIN_DB_MIN, BOUNCE_GAIN_DB_MAX, LIMITER_CEILING_DB, STEM_KEYS, TAKE_STATUS,
+  LUFS_TARGET, LUFS_FLOOR, BOUNCE_GAIN_DB_MIN, BOUNCE_GAIN_DB_MAX, LIMITER_CEILING_DB,
+  STEM_KEYS, MAX_TRACKS, TAKE_STATUS,
 } from './js/tape/takeModel.js';
 import { wavHeader, floatToInt16, interleave, parseWav, SIZE_FIELDS } from './js/tape/wav.js';
 import { integratedLoudness } from './js/tape/lufs.js';
@@ -484,7 +487,8 @@ ok('normalizeSong omits the file key entirely when absent', !('file' in normaliz
 // ============================================================================
 
 // ---- takeModel: constants ----
-eq('STEM_KEYS', STEM_KEYS.join(','), 'stem1,stem2');
+eq('STEM_KEYS', STEM_KEYS.join(','), 'stem1,stem2,stem3,stem4');
+eq('MAX_TRACKS', MAX_TRACKS, 4);
 eq('TAKE_STATUS', TAKE_STATUS.join(','), 'recording,active,discarded');
 eq('LUFS_TARGET', LUFS_TARGET, -14);
 eq('LUFS_FLOOR', LUFS_FLOOR, -50);
@@ -494,9 +498,14 @@ eq('LIMITER_CEILING_DB', LIMITER_CEILING_DB, -1);
 
 // ---- takeModel: naming + ref helpers ----
 eq('stemFileName stem1', stemFileName('blue-eyes', 3, 'stem1'), 'blue-eyes_3_stem1.wav');
-eq('stemFileName stem2', stemFileName('blue-eyes', 3, 'stem2'), 'blue-eyes_3_stem2.wav');
+eq('stemFileName stem4', stemFileName('blue-eyes', 3, 'stem4'), 'blue-eyes_3_stem4.wav');
 eq('mixFileName', mixFileName('blue-eyes', 3), 'blue-eyes_3_mix.wav');
 eq('tapeDeckRef path', tapeDeckRef('blue-eyes').path, 'takes/blue-eyes/');
+
+// ---- takeModel: default input->slot routing ----
+eq('defaultRouting caps at maxCapture', defaultRouting(['stem1', 'stem2', 'stem3', 'stem4'], 2).join(','), 'stem1,stem2');
+eq('defaultRouting caps at free-slot count', defaultRouting(['stem3', 'stem4'], 4).join(','), 'stem3,stem4');
+eq('defaultRouting empty when no free slots', defaultRouting([], 2).length, 0);
 
 // ---- takeModel: effect settings ----
 eq('defaultStemSettings vol', defaultStemSettings().vol, 1.0);
@@ -525,56 +534,108 @@ eq('bounceGainDb clamps a loud take at the min', bounceGainDb(10), BOUNCE_GAIN_D
 eq('bounceGainDb skips (0 dB) below the floor', bounceGainDb(-60), 0);
 eq('bounceGainDb skips (0 dB) on silence', bounceGainDb(-Infinity), 0);
 
-// ---- takeModel: manifest + take lifecycle ----
+// ---- takeModel: a take is a 4-track container filled over multiple passes ----
 let man = createManifest('blue-eyes');
 eq('createManifest starts empty', man.takes.length, 0);
+eq('createManifest schemaVersion 2', man.schemaVersion, 2);
 eq('nextTakeNumber on empty manifest', nextTakeNumber(man), 1);
 
-const take1 = makeTake({ slug: 'blue-eyes', take: nextTakeNumber(man), sampleRate: 48000, channels: 2 }, 'T0');
+// Take 1: an empty container, then a first pass arms two of its four slots (group 1).
+const take1 = makeTake({ take: nextTakeNumber(man), sampleRate: 48000 }, 'T0');
 man = appendTake(man, take1);
 eq('makeTake status is recording', take1.status, 'recording');
 eq('makeTake durationSec null while recording', take1.durationSec, null);
-ok('makeTake stems named for both channels', take1.stems.stem1.file === 'blue-eyes_1_stem1.wav' && take1.stems.stem2.file === 'blue-eyes_1_stem2.wav');
+ok('makeTake starts with 4 empty slots', STEM_KEYS.every((k) => take1.stems[k] === null));
+ok('a fresh container has no channels field', !('channels' in take1));
 
-const monoTake = makeTake({ slug: 'blue-eyes', take: 99, sampleRate: 48000, channels: 1 }, 'T0');
-ok('single-stem take has stems.stem2 = null (D24)', monoTake.stems.stem2 === null);
+eq('nextGroup on an empty take is 1', nextGroup(man.takes[0]), 1);
+man = appendPassTracks(man, 1, ['stem1', 'stem2'], 1);
+ok('appendPassTracks names + stamps the pass slots', man.takes[0].stems.stem1.file === 'blue-eyes_1_stem1.wav' && man.takes[0].stems.stem1.group === 1 && man.takes[0].stems.stem1.durationSec === null);
+ok('appendPassTracks leaves untargeted slots free', man.takes[0].stems.stem3 === null && man.takes[0].stems.stem4 === null);
+eq('freeSlotKeys after arming pass 1', freeSlotKeys(man.takes[0]).join(','), 'stem3,stem4');
 
-man = finalizeTake(man, 1, 12.5);
-eq('finalizeTake sets active', man.takes[0].status, 'active');
-eq('finalizeTake sets duration', man.takes[0].durationSec, 12.5);
+// Clean stop of the pass: per-slot durations, take length = max, status active.
+man = finalizePass(man, 1, { stem1: 12.5, stem2: 10.0 });
+eq('finalizePass sets active', man.takes[0].status, 'active');
+eq('finalizePass per-slot duration', man.takes[0].stems.stem1.durationSec, 12.5);
+eq('finalizePass take duration = max filled slot', man.takes[0].durationSec, 12.5);
+eq('filledSlotKeys after pass 1', filledSlotKeys(man.takes[0]).join(','), 'stem1,stem2');
+eq('maxSlotDuration', maxSlotDuration(man.takes[0]), 12.5);
+ok('takeHasAudio true after a pass', takeHasAudio(man.takes[0]) === true);
 
+// Overdub pass 2 into the two remaining free slots (group 2, on the same take).
+eq('nextGroup after pass 1 is 2', nextGroup(man.takes[0]), 2);
+man = appendPassTracks(man, 1, defaultRouting(freeSlotKeys(man.takes[0]), 2), 2);
+ok('pass 2 arms stem3+stem4 at group 2', man.takes[0].stems.stem3.group === 2 && man.takes[0].stems.stem4.group === 2);
+man = finalizePass(man, 1, { stem3: 8.0, stem4: 20.0 });
+eq('take duration grows to the longest track', man.takes[0].durationSec, 20.0);
+eq('filledSlotKeys after pass 2', filledSlotKeys(man.takes[0]).join(','), 'stem1,stem2,stem3,stem4');
+eq('freeSlotKeys when full', freeSlotKeys(man.takes[0]).length, 0);
+
+// lastGroupSlotKeys is the most recent pass only (retake acts on exactly these).
+eq('lastGroupSlotKeys = the last pass', lastGroupSlotKeys(man.takes[0]).join(','), 'stem3,stem4');
+
+// Retake→discard-last-group frees only that pass's slots, keeps the earlier group.
+let dg = discardGroup(man, 1, 2);
+eq('discardGroup frees the last group', freeSlotKeys(dg.takes[0]).join(','), 'stem3,stem4');
+ok('discardGroup keeps group 1 intact', dg.takes[0].stems.stem1.file === 'blue-eyes_1_stem1.wav');
+eq('discardGroup recomputes take duration', dg.takes[0].durationSec, 12.5);
+ok('discardGroup keeps the take active', dg.takes[0].status === 'active');
+
+// Ping-pong bounce: stem1 -> stem2. Source freed, dest neutral + new duration.
+const preComp = setStemSettings(man, 1, 'stem2', { vol: 0.5, comp: 0.8 });
+let pp = bounceTrackToTrack(preComp, 1, 'stem1', 'stem2', 13.0);
+ok('bounceTrackToTrack frees the source slot', pp.takes[0].stems.stem1 === null);
+ok('bounceTrackToTrack keeps the dest file', pp.takes[0].stems.stem2.file === 'blue-eyes_1_stem2.wav');
+ok('bounceTrackToTrack resets dest settings to neutral', pp.takes[0].stems.stem2.vol === 1.0 && pp.takes[0].stems.stem2.comp === 0);
+eq('bounceTrackToTrack sets dest duration', pp.takes[0].stems.stem2.durationSec, 13.0);
+eq('bounceTrackToTrack frees a slot for recording', freeSlotKeys(pp.takes[0]).join(','), 'stem1');
+// A group can span physically non-adjacent keys after a bounce-then-record — helpers key off stamps, never adjacency.
+let pp2 = appendPassTracks(pp, 1, ['stem1'], nextGroup(pp.takes[0]));
+eq('recording after ping-pong stamps a fresh group', pp2.takes[0].stems.stem1.group, 3);
+
+// A discarded number is never reused.
 eq('nextTakeNumber after take 1', nextTakeNumber(man), 2);
-const take2 = makeTake({ slug: 'blue-eyes', take: nextTakeNumber(man), sampleRate: 48000, channels: 2 }, 'T1');
+const take2 = makeTake({ take: nextTakeNumber(man), sampleRate: 48000 }, 'T1');
 man = appendTake(man, take2);
+man = appendPassTracks(man, 2, ['stem1'], 1);
 man = discardTake(man, 2);
 eq('discardTake sets discarded (tombstone)', man.takes[1].status, 'discarded');
-ok('discardTake nulls stem file fields', man.takes[1].stems.stem1.file === null && man.takes[1].stems.stem2.file === null);
+ok('discardTake nulls every slot file field', STEM_KEYS.every((k) => !man.takes[1].stems[k] || man.takes[1].stems[k].file === null));
 eq('nextTakeNumber never reuses a discarded number', nextTakeNumber(man), 3);
 
-// a take that died mid-record still occupies its number
-const take3 = makeTake({ slug: 'blue-eyes', take: nextTakeNumber(man), sampleRate: 48000, channels: 2 }, 'T2');
+// A take that died mid-record still occupies its number; crash recovery per slot.
+const take3 = makeTake({ take: nextTakeNumber(man), sampleRate: 48000 }, 'T2');
 man = appendTake(man, take3);
+man = appendPassTracks(man, 3, ['stem1', 'stem2'], 1);
 eq('nextTakeNumber counts a "recording" take too', nextTakeNumber(man), 4);
 
-// crash recovery: nonzero bytes -> active + recovered; zero bytes -> tombstone
-const recoveredMan = finalizeRecoveredTake(man, 3, 48000 * 2 * 5, 48000); // 5s mono pcm16
-ok('finalizeRecoveredTake marks active+recovered', recoveredMan.takes[2].status === 'active' && recoveredMan.takes[2].recovered === true);
-eq('finalizeRecoveredTake computes duration from bytes', recoveredMan.takes[2].durationSec, 5);
-const emptyRecoveredMan = finalizeRecoveredTake(man, 3, 0, 48000);
-eq('finalizeRecoveredTake tombstones an empty take', emptyRecoveredMan.takes[2].status, 'discarded');
+// crash recovery: nonzero bytes -> finalize that slot; zero bytes -> free that slot.
+const recovered = finalizeRecoveredPass(man, 3, { stem1: 48000 * 2 * 5, stem2: 0 }, 48000); // stem1 5s, stem2 empty
+const rt = recovered.takes.find((t) => t.take === 3);
+ok('finalizeRecoveredPass marks active+recovered', rt.status === 'active' && rt.recovered === true);
+eq('finalizeRecoveredPass finalizes the nonempty slot', rt.stems.stem1.durationSec, 5);
+ok('finalizeRecoveredPass frees the empty pending slot', rt.stems.stem2 === null);
+// a pass where every slot captured nothing tombstones the whole (empty) take
+const empties = finalizeRecoveredPass(man, 3, { stem1: 0, stem2: 0 }, 48000);
+eq('finalizeRecoveredPass tombstones an all-empty pass', empties.takes.find((t) => t.take === 3).status, 'discarded');
 
-eq('mostRecentKeptTake picks the highest active take', mostRecentKeptTake(man).take, 1);
+eq('mostRecentKeptTake picks the highest active take with audio', mostRecentKeptTake(man).take, 1);
 ok('mostRecentKeptTake is null with no active takes', mostRecentKeptTake(createManifest('x')) === null);
+// An emptied (all-discarded-group) active container is not auto-loaded.
+const emptiedActive = { schemaVersion: 2, slug: 'x', takes: [{ take: 1, status: 'active', recovered: false, createdAt: 'T', durationSec: null, sampleRate: 48000, stems: { stem1: null, stem2: null, stem3: null, stem4: null }, bounce: null }] };
+ok('mostRecentKeptTake skips an active container with no audio', mostRecentKeptTake(emptiedActive) === null);
 
 const bouncedMan = markBounced(man, 1, { file: 'blue-eyes_1_mix.wav', bouncedAt: 'T3', lufs: -14.1 });
 eq('markBounced sets the bounce record', bouncedMan.takes[0].bounce.file, 'blue-eyes_1_mix.wav');
 
+// setStemSettings preserves the slot's group + durationSec (regression: earlier code dropped them).
 const settingsMan = setStemSettings(man, 1, 'stem1', { vol: 0.5, eq: { bass: 3 } });
 const s1 = settingsMan.takes[0].stems.stem1;
 ok('setStemSettings merges + clamps, keeps the file name', s1.vol === 0.5 && s1.eq.bass === 3 && s1.eq.mid === 0 && s1.file === 'blue-eyes_1_stem1.wav');
-// A single-stem take's absent stem2 must stay null (D24) — never resurrected as a {file:undefined,...} object.
-const monoMan = { ...man, takes: [{ ...man.takes[0], stems: { stem1: man.takes[0].stems.stem1, stem2: null } }] };
-eq('setStemSettings no-ops on a null stem slot (single-stem take)', setStemSettings(monoMan, 1, 'stem2', { vol: 0.9 }).takes[0].stems.stem2, null);
+ok('setStemSettings preserves group + durationSec', s1.group === 1 && s1.durationSec === 12.5);
+// A free (null) slot must stay null — never resurrected as a {file:undefined,...} object.
+eq('setStemSettings no-ops on a free slot', setStemSettings(man, 3, 'stem3', { vol: 0.9 }).takes.find((t) => t.take === 3).stems.stem3, null);
 
 // ---- takeModel: validate/normalize ----
 ok('validateManifest accepts a well-formed manifest', validateManifest(man).ok);
@@ -582,8 +643,34 @@ ok('validateManifest rejects a bad slug', !validateManifest({ slug: '', takes: [
 ok('validateManifest rejects a non-array takes', !validateManifest({ slug: 'x', takes: 'nope' }).ok);
 ok('validateTake rejects an empty object', !validateTake({}).ok);
 ok('validateTake accepts a normalized take', validateTake(normalizeTake(take1)).ok);
-ok('normalizeManifest fills schemaVersion', normalizeManifest({ slug: 'x', takes: [] }).schemaVersion === 1);
+ok('normalizeManifest emits schemaVersion 2', normalizeManifest({ slug: 'x', takes: [] }).schemaVersion === 2);
 ok('normalizeTake defaults a missing status to discarded', normalizeTake({ take: 1 }).status === 'discarded');
+
+// ---- takeModel: v1 -> v2 migration (real on-device takes must survive) ----
+const v1Stereo = {
+  schemaVersion: 1, slug: 'blue-eyes', takes: [
+    { take: 1, status: 'active', recovered: false, createdAt: 'T', durationSec: 12.5, sampleRate: 48000, channels: 2, capturedWithoutInterface: false,
+      stems: { stem1: { file: 'blue-eyes_1_stem1.wav', vol: 1, eq: { bass: 3, mid: 0, treble: -2 }, comp: 0.2 },
+               stem2: { file: 'blue-eyes_1_stem2.wav', vol: 0.8, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0 } },
+      bounce: { file: 'blue-eyes_1_mix.wav', bouncedAt: 'T2', lufs: -14.1 } },
+  ],
+};
+ok('validateManifest accepts a raw v1 manifest', validateManifest(v1Stereo).ok);
+const migrated = normalizeManifest(v1Stereo);
+const mt = migrated.takes[0];
+eq('migration stamps schemaVersion 2', migrated.schemaVersion, 2);
+ok('migration keeps stem1/stem2 filenames (WAVs still resolve)', mt.stems.stem1.file === 'blue-eyes_1_stem1.wav' && mt.stems.stem2.file === 'blue-eyes_1_stem2.wav');
+ok('migration stamps group 1', mt.stems.stem1.group === 1 && mt.stems.stem2.group === 1);
+ok('migration sets per-slot durationSec from the take duration', mt.stems.stem1.durationSec === 12.5 && mt.stems.stem2.durationSec === 12.5);
+ok('migration opens stem3/stem4 as free slots', mt.stems.stem3 === null && mt.stems.stem4 === null);
+ok('migration preserves the effect settings', mt.stems.stem1.eq.bass === 3 && mt.stems.stem1.comp === 0.2 && mt.stems.stem2.vol === 0.8);
+ok('migration drops the legacy channels field', !('channels' in mt));
+ok('migration is idempotent (re-normalize is stable)', JSON.stringify(normalizeManifest(migrated)) === JSON.stringify(migrated));
+eq('a migrated 2-track take opens as a partial 4-track take', freeSlotKeys(mt).join(','), 'stem3,stem4');
+// A mono v1 take -> stem1 only, stem2 stays null.
+const v1Mono = { schemaVersion: 1, slug: 's', takes: [{ take: 1, status: 'active', recovered: false, createdAt: 'T', durationSec: 6, sampleRate: 48000, channels: 1, stems: { stem1: { file: 's_1_stem1.wav', vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0 }, stem2: null }, bounce: null }] };
+const mm = normalizeManifest(v1Mono).takes[0];
+ok('mono v1 migrates stem1 only', mm.stems.stem1.file === 's_1_stem1.wav' && mm.stems.stem1.group === 1 && mm.stems.stem2 === null);
 
 // ============================================================================
 // 15. Tape deck (pure) — wav.js

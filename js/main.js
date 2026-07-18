@@ -85,10 +85,11 @@ let deckRecording = false;
 let deckArming = false;        // synchronous re-entrancy guard for the Record button's async setup window
 let deckBouncing = false;
 let deckOpenSeq = 0;           // bumped on every onOpenTapeDeck call; a stale in-flight open detects itself via this
-let deckIsRetake = false;      // the in-flight recording was armed via Retake (gates the AC-8 take menu on stop)
-let deckTakeMenuOpen = false;  // AC-8
-let deckTakeMenuTakes = [];
-let deckInputs = null;         // devices.probe() result: { inputs, preselectedId, warnMoreThanTwo, isLikelyInterface, channels }
+let deckPendingNewTake = false; // a "+ New take" container awaiting its first pass (materialized lazily at Record)
+let deckRouting = [];           // input-channel index -> destination slot key, for the next pass (normalized each render)
+let deckRecordingSlotKeys = []; // the in-flight pass's destination slot keys (meter routing + finalize)
+let deckRecordingGroup = null;  // the in-flight pass's group number
+let deckInputs = null;         // devices.probe() result: { inputs, preselectedId, warnMoreThanMax, isLikelyInterface, channels }
 let deckSelectedInputId = null;
 let deckSpaceWarning = false;
 let stemSettingsDebounce = null;
@@ -121,9 +122,10 @@ function resetTapeDeckUi() {
   deckRecording = false;
   deckArming = false;
   deckBouncing = false;
-  deckIsRetake = false;
-  deckTakeMenuOpen = false;
-  deckTakeMenuTakes = [];
+  deckPendingNewTake = false;
+  deckRouting = [];
+  deckRecordingSlotKeys = [];
+  deckRecordingGroup = null;
   deckInputs = null;
   deckSelectedInputId = null;
   clearTimeout(stemSettingsDebounce);
@@ -132,30 +134,73 @@ function resetTapeDeckUi() {
 // The tape-deck slice of the view-model — see js/tape/tapeView.js for the shape
 // this feeds. Cheap to compute even when the deck isn't open (deckManifest is
 // null until onOpenTapeDeck loads it, so `takes` is just []).
+// Normalize the input->slot routing into a valid bijection over the free slots,
+// length maxCapture, honoring the user's choices where still valid. Recomputed each
+// render and cached back into deckRouting so onSetRoutingSlot's swap works off the
+// same array the UI is showing.
+function normalizeRouting(prev, freeKeys, maxCapture) {
+  const used = new Set();
+  const out = [];
+  for (let i = 0; i < maxCapture; i++) {
+    let k = prev[i];
+    if (!freeKeys.includes(k) || used.has(k)) k = freeKeys.find((f) => !used.has(f));
+    if (k == null) break;
+    out.push(k);
+    used.add(k);
+  }
+  return out;
+}
+
 function tapeDeckViewModel(active) {
   const takes = (deckManifest && deckManifest.takes) || [];
+  const activeWithAudio = takes.filter((t) => t.status === 'active' && takeModel.takeHasAudio(t));
   const loadedTake = deckRecording
     ? (takes.find((t) => t.status === 'recording') || null)
-    : (currentTake != null ? (takes.find((t) => t.take === currentTake && t.status === 'active') || null) : null);
+    : (deckPendingNewTake ? null : (currentTake != null ? (takes.find((t) => t.take === currentTake && t.status === 'active') || null) : null));
+  const pendingNewTake = deckPendingNewTake || (!deckRecording && !loadedTake && activeWithAudio.length === 0);
+
+  // Free/filled tracks of the take being worked on (all 4 free for a pending new take).
+  let filledSlotKeys, freeSlotKeys;
+  if (pendingNewTake) { filledSlotKeys = []; freeSlotKeys = takeModel.STEM_KEYS.slice(); }
+  else if (loadedTake) { filledSlotKeys = takeModel.filledSlotKeys(loadedTake); freeSlotKeys = takeModel.freeSlotKeys(loadedTake); }
+  else { filledSlotKeys = []; freeSlotKeys = []; }
+
+  const inputChannels = (deckInputs && deckInputs.channels) || 1;
+  const freeSlots = freeSlotKeys.length;
+  const maxCapture = Math.min(inputChannels, freeSlots, takeModel.MAX_TRACKS);
+  const routing = normalizeRouting(deckRouting, freeSlotKeys, maxCapture);
+  deckRouting = routing; // cache the normalized routing so onSetRoutingSlot swaps off it
+
   return {
     songId: active ? active.id : null,
     path: active ? takeModel.tapeDeckRef(active.id).path : '',
     currentTakeNo: loadedTake ? loadedTake.take : null,
     manifestTakes: takes,
     loadedTake,
+    pendingNewTake,
     recording: deckRecording,
     bouncing: deckBouncing,
+    overdub: deckRecording && filledSlotKeys.length > deckRecordingSlotKeys.length,
     blocked: deckBlocked,
     unsupported: deckUnsupported,
-    noInterface: !!(deckInputs && deckInputs.channels !== 2),
-    warnMoreThanTwo: !!(deckInputs && deckInputs.warnMoreThanTwo),
+    noInterface: !!(deckInputs && deckInputs.channels < 2),
+    warnMoreThanMax: !!(deckInputs && deckInputs.warnMoreThanMax),
     inputs: (deckInputs && deckInputs.inputs) || [],
     selectedInputId: deckSelectedInputId,
+    inputChannels,
     status: deckStatus,
     spaceWarning: deckSpaceWarning,
-    takeMenuOpen: deckTakeMenuOpen,
-    takeMenuTakes: deckTakeMenuTakes,
+    monitorLatencyMs: getMonitorLatencyMs(),
     hasHistory: takes.length > 0,
+    filledSlotKeys,
+    freeSlotKeys,
+    freeSlots,
+    filledCount: filledSlotKeys.length,
+    maxCapture,
+    routing,
+    recordingSlotKeys: deckRecordingSlotKeys,
+    lastGroupKeys: (loadedTake && !deckRecording) ? takeModel.lastGroupSlotKeys(loadedTake) : [],
+    canBounceTracks: !deckRecording && !deckBouncing && filledSlotKeys.length >= 2,
     showStrips: deckRecording || !!loadedTake,
     showLoadedActions: !deckRecording && !!loadedTake,
   };
@@ -485,6 +530,17 @@ async function download(filename, obj) {
 
 const manifestPath = (slug) => takeModel.tapeDeckRef(slug).path + 'manifest.json';
 
+// Overdub monitoring latency (ms) — the round-trip the app plays a backing track
+// out and hears it back in, measured on-device with tools/latency-spike.html and
+// entered in the deck. Used to time-align an overdub so its sample 0 lands with the
+// backing at t=0; 0 (unset) means no compensation (deterministic, possibly a touch
+// late). Persisted globally (one rig at a time); a per-device split is a future step.
+const LATENCY_KEY = 'sn_tape_latency_ms';
+function getMonitorLatencyMs() {
+  try { const v = parseFloat(localStorage.getItem(LATENCY_KEY)); return isFinite(v) ? v : 0; } catch { return 0; }
+}
+function getMonitorLatencySec() { return getMonitorLatencyMs() / 1000; }
+
 // The audioEngine controller — created once, lazily (an AudioContext needs a
 // user gesture), and never rebuilt. Its callbacks write into whatever DOM nodes
 // `tapeLive` currently points at (refreshed every render by tapeView, exactly
@@ -509,7 +565,10 @@ function fmtElapsed(frames, sampleRate) {
 
 function updateMeterEls(m) {
   if (!tapeLive.meterEls || !m.peaks) return;
-  takeModel.STEM_KEYS.forEach((key, i) => {
+  // Route each capture channel's peak to its assigned track meter (input->slot
+  // routing), not positional order.
+  const keys = m.slotKeys || deckRecordingSlotKeys;
+  keys.forEach((key, i) => {
     const el = tapeLive.meterEls[key];
     if (!el) return;
     const peak = m.peaks[i] || 0;
@@ -530,6 +589,7 @@ function updateMeterEls(m) {
 async function handleDeckStatus(s) {
   if (s.type === 'ended') { if (tapeLive.setPlayStatus) tapeLive.setPlayStatus('Finished'); return; }
   if (s.type === 'blocked') { deckBlocked = true; render(); return; }
+  if (s.type === 'no-free-slots') { deckStatus = { type: 'warn', message: 'No free tracks to record into — bounce a track or start a new take.' }; render(); return; }
   if (s.type === 'no-wake-lock') { deckStatus = { type: 'warn', message: 'Screen may lock during long takes (Wake Lock isn’t available on this browser).' }; render(); return; }
   if (s.type === 'stopped' || s.type === 'stopped-interrupted' || s.type === 'stopped-storage-error') {
     const message = s.type === 'stopped-interrupted' ? 'Recording stopped (interrupted).'
@@ -541,16 +601,16 @@ async function handleDeckStatus(s) {
 async function finalizeStoppedTake(s, message) {
   deckRecording = false;
   if (deckManifest && deckManifest.slug === s.slug) {
-    deckManifest = takeModel.finalizeTake(deckManifest, s.take, s.durationSec);
+    // finalizePass sets this pass's per-slot durations, recomputes the take length,
+    // and flips it active. Passes stay within one take now, so there's no take menu —
+    // the just-finished take simply loads.
+    deckManifest = takeModel.finalizePass(deckManifest, s.take, s.slotDurations || {});
     await takeStore.writeManifest(manifestPath(s.slug), deckManifest);
   }
-  if (deckIsRetake) {
-    deckTakeMenuOpen = true;
-    deckTakeMenuTakes = deckManifest.takes.filter((t) => t.status !== 'recording').slice().sort((a, b) => b.take - a.take);
-    deckIsRetake = false;
-  } else {
-    currentTake = s.take;
-  }
+  currentTake = s.take;
+  deckPendingNewTake = false;
+  deckRecordingSlotKeys = [];
+  deckRecordingGroup = null;
   deckStatus = message ? { type: 'warn', message } : null;
   await refreshSpaceWarning();
   render();
@@ -561,18 +621,17 @@ async function refreshSpaceWarning() {
   deckSpaceWarning = !!(est && est.available < 500 * 1024 * 1024); // §5.8: warn under ~500 MB
 }
 
-// Shared by onRecordTake and both Retake outcomes (Keep/Discard "arm a new
-// take"): appends the take to the manifest at status "recording" and writes it
-// BEFORE any OPFS stem file is opened (D22 crash-consistent ordering) — the
-// onChannelsKnown callback is where audioEngine.record() hands back the
-// channel count + sample rate the instant they're known.
+// Arm one recording PASS: either the first pass of a fresh "+ New take" container,
+// or an overdub pass into the current take's free slots. The pass's slots are armed
+// in the manifest and written BEFORE any OPFS stem file is opened (D22 crash-
+// consistent ordering) — audioEngine.record()'s onPassOpen callback is where the
+// capture channel count + sample rate are handed back the instant they're known.
 //
 // `deckArming` is a SYNCHRONOUS re-entrancy guard, set true before the first
-// `await`. `deckRecording` alone isn't enough: it only flips true deep inside
-// the async onChannelsKnown callback, well after getUserMedia/worklet-load have
-// already started, leaving a real window for a fast double-tap to arm two
-// takes off the same stale manifest snapshot (duplicate take numbers, one
-// recording's stem files truncated by the other's openTakeFiles).
+// `await`. `deckRecording` alone isn't enough: it only flips true deep inside the
+// async onPassOpen callback, well after getUserMedia/worklet-load have started,
+// leaving a window for a fast double-tap to arm two passes off the same stale
+// manifest snapshot.
 async function armRecording() {
   if (deckArming || deckRecording) return;
   const a = activeSong();
@@ -582,33 +641,60 @@ async function armRecording() {
   const slug = a.id;
   const path = manifestPath(slug);
   await refreshSpaceWarning(); // §5.8: "before each record", not just on deck open / after the last take
+
+  // New take vs overdub into the current take. `baseTake` is the container being
+  // filled (null for a fresh take); freeKeys are its recordable slots.
+  const isNew = deckPendingNewTake || currentTake == null;
+  const baseTake = isNew ? null : (deckManifest.takes.find((t) => t.take === currentTake) || null);
+  const freeKeys = isNew ? takeModel.STEM_KEYS.slice() : (baseTake ? takeModel.freeSlotKeys(baseTake) : []);
+  const routing = (deckRouting && deckRouting.length) ? deckRouting.slice() : takeModel.defaultRouting(freeKeys, takeModel.MAX_TRACKS);
+  // The take's already-recorded tracks play as backing while overdubbing (empty for
+  // a first pass); latency-aligned via the measured monitor round-trip.
+  const existingTracks = (baseTake ? takeModel.filledSlotKeys(baseTake) : []).map((k) => ({ meta: baseTake.stems[k] }));
+
   let started = false;
   try {
     const result = await ensureTapeDeck().record({
       slug,
       deviceId: deckSelectedInputId,
-      onChannelsKnown: async (channels, sampleRate) => {
-        const takeNo = takeModel.nextTakeNumber(deckManifest);
-        const take = takeModel.makeTake({ slug, take: takeNo, sampleRate, channels, capturedWithoutInterface: channels !== 2 }, nowISO());
-        deckManifest = takeModel.appendTake(deckManifest, take);
+      routing,
+      monitorLatencySec: getMonitorLatencySec(),
+      existingTracks,
+      onPassOpen: async (capture, sampleRate) => {
+        // Resolve this pass's destination slots from the routing (dedup, cap at the
+        // real captured channel count, only into free slots).
+        const slotKeys = [];
+        for (const k of routing) { if (freeKeys.includes(k) && !slotKeys.includes(k) && slotKeys.length < capture) slotKeys.push(k); }
+        let takeNo, group;
+        if (isNew) {
+          takeNo = takeModel.nextTakeNumber(deckManifest);
+          group = 1;
+          deckManifest = takeModel.appendTake(deckManifest, takeModel.makeTake({ take: takeNo, sampleRate }, nowISO()));
+        } else {
+          takeNo = currentTake;
+          group = takeModel.nextGroup(baseTake);
+        }
+        deckManifest = takeModel.appendPassTracks(deckManifest, takeNo, slotKeys, group);
         await takeStore.writeManifest(path, deckManifest);
         deckRecording = true;
-        currentTake = null;
+        deckPendingNewTake = false;
+        deckRecordingSlotKeys = slotKeys;
+        deckRecordingGroup = group;
+        currentTake = takeNo;
         render();
-        return takeNo;
+        return { take: takeNo, slotKeys };
       },
     });
-    started = !!result.ok;
-    if (!result.ok && result.denied) deckBlocked = true;
+    started = !!(result && result.ok);
+    if (result && !result.ok && result.denied) deckBlocked = true;
   } catch {
-    // A failure AFTER onChannelsKnown already flipped deckRecording=true (e.g.
+    // A failure AFTER onPassOpen already flipped deckRecording=true (e.g.
     // AudioWorkletNode construction or openTakeFiles rejecting) would otherwise
-    // strand the UI nav-locked forever (audioEngine's own `recording` flag never
-    // got set, so a later Stop short-circuits and never fires onStatus).
+    // strand the UI nav-locked forever.
     deckStatus = { type: 'error', message: 'Could not start recording (setup failed).' };
   } finally {
     deckArming = false;
-    if (!started) deckRecording = false; // only clobber on failure — success already set it true above
+    if (!started) { deckRecording = false; deckRecordingSlotKeys = []; deckRecordingGroup = null; } // only clobber on failure
     render();
   }
 }
@@ -889,8 +975,9 @@ const handlers = {
 
       songSubView = 'tapedeck';
       deckStatus = null;
-      deckTakeMenuOpen = false;
-      deckIsRetake = false;
+      deckPendingNewTake = false;
+      deckRecordingSlotKeys = [];
+      deckRecordingGroup = null;
       render();
 
       if (!(await takeStore.isSupported())) { if (!stale()) { deckUnsupported = true; render(); } return; }
@@ -909,20 +996,23 @@ const handlers = {
       } catch { manifest = takeModel.createManifest(a.id); }
       if (stale()) return;
 
-      // Crash recovery (§5.3): finalize any take a prior session left mid-record
-      // BEFORE mostRecentKeptTake can see it. Prefer stem1's byte count for
-      // duration (both stems share one sampleRate/duration by construction) but
-      // fall back to stem2's — an asymmetric partial-write failure (empty
-      // stem1, real audio in stem2) must not tombstone-and-orphan real audio.
+      // Crash recovery (§5.3): finalize any pass a prior session left mid-record
+      // BEFORE mostRecentKeptTake can see it. Measure each PENDING slot (a slot
+      // with a file but no duration — an earlier completed pass's tracks already
+      // have durations and are left alone); a nonzero byte count finalizes that
+      // slot, an empty one is freed. A take is tombstoned only if recovery leaves
+      // it with zero real tracks (so a crash mid-overdub never orphans the tracks
+      // recorded in earlier passes).
       const dir = takeModel.tapeDeckRef(a.id).path;
       for (const t of manifest.takes.slice()) {
         if (t.status !== 'recording') continue;
-        const stem1 = t.stems && t.stems.stem1;
-        const stem2 = t.stems && t.stems.stem2;
-        let stem1Bytes = 0, stem2Bytes = 0;
-        if (stem1 && stem1.file) { try { stem1Bytes = await takeStore.finalizeExisting(dir + stem1.file, SIZE_FIELDS); } catch { stem1Bytes = 0; } }
-        if (stem2 && stem2.file) { try { stem2Bytes = await takeStore.finalizeExisting(dir + stem2.file, SIZE_FIELDS); } catch { stem2Bytes = 0; } }
-        manifest = takeModel.finalizeRecoveredTake(manifest, t.take, stem1Bytes || stem2Bytes, t.sampleRate);
+        const slotBytes = {};
+        for (const key of takeModel.STEM_KEYS) {
+          const slot = t.stems && t.stems[key];
+          if (!slot || !slot.file || slot.durationSec !== null) continue; // only pending slots
+          try { slotBytes[key] = await takeStore.finalizeExisting(dir + slot.file, SIZE_FIELDS); } catch { slotBytes[key] = 0; }
+        }
+        manifest = takeModel.finalizeRecoveredPass(manifest, t.take, slotBytes, t.sampleRate);
       }
       if (stale()) return;
 
@@ -954,41 +1044,62 @@ const handlers = {
 
     onCloseTapeDeck: () => {
       if (deckRecording) return; // AC-27
-      // AC-8: Back is also a valid way to "dismiss" an open take menu, and
-      // dismissing must load the newest take (tapeView's explicit "Use newest"
-      // button covers the direct case; this covers backing out via the header).
-      if (deckTakeMenuOpen && deckManifest) {
-        const kept = takeModel.mostRecentKeptTake(deckManifest);
-        currentTake = kept ? kept.take : null;
-      }
       songSubView = 'sections';
       if (tapeDeck) tapeDeck.stopPlay();
-      deckTakeMenuOpen = false;
+      deckPendingNewTake = false;
       render();
     },
 
-    onRecordTake: () => armRecording(),
+    // Start a fresh empty 4-track container (materialized at the first Record).
+    onNewTake: () => {
+      if (deckRecording) return;
+      if (tapeDeck) tapeDeck.stopPlay();
+      deckPendingNewTake = true;
+      currentTake = null;
+      deckRouting = takeModel.defaultRouting(takeModel.STEM_KEYS.slice(), takeModel.MAX_TRACKS);
+      deckStatus = null;
+      render();
+    },
+
+    onArmRecordPass: () => armRecording(),
+
+    // Reassign one input's destination slot, swapping with whichever input held it
+    // (keeps the routing a bijection over the free slots). deckRouting is the
+    // normalized array the last render produced (see tapeDeckViewModel).
+    onSetRoutingSlot: (i, key) => {
+      const r = deckRouting.slice();
+      const j = r.findIndex((k, idx) => idx !== i && k === key);
+      const prev = r[i];
+      r[i] = key;
+      if (j >= 0) r[j] = prev; // swap
+      deckRouting = r;
+      render();
+    },
 
     onStopTake: async () => {
       if (!tapeDeck || !deckRecording) return;
       await tapeDeck.stop(); // resolves after onStatus('stopped',...) has already finalized the manifest
     },
 
-    // AC-7: Keep/Discard both arm a fresh recording; only Discard also tombstones.
-    onKeepTake: () => { deckIsRetake = true; armRecording(); },
-    onDiscardLastTake: async () => {
+    // Retake (rescoped): re-record ONLY the last recorded group — free its slots,
+    // delete their audio, then re-arm a pass into exactly those slots (with the
+    // take's earlier groups playing as backing).
+    onDiscardLastGroup: async () => {
       const a = activeSong();
-      if (!a || !deckManifest || !deckManifest.takes.length) return;
-      const last = deckManifest.takes[deckManifest.takes.length - 1];
-      deckManifest = takeModel.discardTake(deckManifest, last.take);
+      if (!a || !deckManifest || currentTake == null || deckRecording) return;
+      const take = deckManifest.takes.find((t) => t.take === currentTake);
+      if (!take) return;
+      const keys = takeModel.lastGroupSlotKeys(take);
+      if (!keys.length) return;
+      const group = Math.max.apply(null, keys.map((k) => (take.stems[k].group || 1)));
+      deckManifest = takeModel.discardGroup(deckManifest, currentTake, group);
       await takeStore.writeManifest(manifestPath(a.id), deckManifest);
-      takeStore.deleteTakeAudio(a.id, last.take).catch(() => {}); // metadata first, best-effort file delete second
-      if (currentTake === last.take) { const kept = takeModel.mostRecentKeptTake(deckManifest); currentTake = kept ? kept.take : null; }
-      deckIsRetake = true;
+      takeStore.deleteSlotFiles(a.id, currentTake, keys).catch(() => {}); // metadata first, best-effort delete second
+      if (tapeDeck) tapeDeck.stopPlay();
+      deckRouting = takeModel.defaultRouting(keys, takeModel.MAX_TRACKS); // re-arm into exactly the freed slots
       render();
       await armRecording();
     },
-    onCancelRetake: () => { deckStatus = null; render(); },
 
     // AC-22: per-take Delete — the storage relief valve, available for any take, any time.
     onDeleteTake: async (takeNo) => {
@@ -1011,11 +1122,17 @@ const handlers = {
       render();
     },
 
-    // AC-8 take-menu selection, or a plain "Load" from take history.
+    // A plain "Load" from take history.
     onSelectTake: (takeNo) => {
       if (tapeDeck) tapeDeck.stopPlay();
       currentTake = takeNo;
-      deckTakeMenuOpen = false;
+      deckPendingNewTake = false;
+      render();
+    },
+
+    // Persist the measured overdub monitoring latency (ms) from the deck's input.
+    onSetMonitorLatency: (ms) => {
+      try { localStorage.setItem(LATENCY_KEY, String(ms)); } catch { /* ignore */ }
       render();
     },
 
@@ -1065,6 +1182,34 @@ const handlers = {
       if (!stillActive) { takeStore.deleteTakeAudio(a.id, takeNo).catch(() => {}); render(); return; }
       deckManifest = takeModel.markBounced(deckManifest, takeNo, { file: result.file, bouncedAt: nowISO(), lufs: result.lufs });
       await takeStore.writeManifest(manifestPath(a.id), deckManifest);
+      await refreshSpaceWarning();
+      render();
+    },
+
+    // Ping-pong bounce: sum one track into another (both effected, mono, baked),
+    // freeing the source slot for more recording. Shares the deckBouncing guard with
+    // the master bounce + delete so no two operations touch the same take's files.
+    onBounceStemToTrack: async (srcKey, dstKey) => {
+      const a = activeSong();
+      if (!a || !deckManifest || currentTake == null || !tapeDeck || deckBouncing || deckRecording || srcKey === dstKey) return;
+      const take = deckManifest.takes.find((t) => t.take === currentTake);
+      const src = take && take.stems[srcKey];
+      const dst = take && take.stems[dstKey];
+      if (!src || !src.file || !dst || !dst.file) return;
+      const takeNo = take.take;
+      tapeDeck.stopPlay();
+      deckBouncing = true;
+      render();
+      const result = await tapeDeck.bounceTracks(take, srcKey, dstKey, a.id);
+      deckBouncing = false;
+      if (!result.ok) { deckStatus = { type: 'error', message: 'Bounce failed: ' + result.error }; render(); return; }
+      // Don't touch a take that got deleted mid-bounce (the delete guard blocks this,
+      // but stay correct if it's ever bypassed).
+      const stillActive = deckManifest.takes.find((t) => t.take === takeNo && t.status === 'active');
+      if (!stillActive) { render(); return; }
+      deckManifest = takeModel.bounceTrackToTrack(deckManifest, takeNo, srcKey, dstKey, result.durationSec);
+      await takeStore.writeManifest(manifestPath(a.id), deckManifest);
+      takeStore.deleteSlotFiles(a.id, takeNo, [srcKey]).catch(() => {}); // metadata first, best-effort file delete second
       await refreshSpaceWarning();
       render();
     },

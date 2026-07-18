@@ -1,19 +1,23 @@
-// js/tape/tapeView.js — the deck UI (§5.6). Built with dom.js's h(), called
-// fresh on every songsView.update() (the same rebuild-from-view-model discipline
-// as the rest of the Songs tab). The AudioContext/graph-owning controller
+// js/tape/tapeView.js — the deck UI (§5.6). Built with dom.js's h(), called fresh
+// on every songsView.update() (the same rebuild-from-view-model discipline as the
+// rest of the Songs tab). The AudioContext/graph-owning controller
 // (js/tape/audioEngine.js) is NOT built here — main.js owns ONE instance for the
 // lifetime of the app (its own module scope is never torn down, so the
 // AudioContext survives every rebuild without needing a special DOM container).
 //
-// Two things in this view genuinely cannot go through a full render(): the
-// elapsed timer + level meters (mutated at ~10 Hz from the worklet) and the
-// inline play-status text (mirrors sketchesView's makeSketchPlayer.setStatus
-// idiom exactly). Both are handed back to the caller as `live` — one small
-// "current DOM node" registration per render, exactly like the sketches player.
+// A take is a 4-TRACK CONTAINER filled over multiple passes. Each pass records into
+// currently-free slots via input->track routing; tracks can be ping-ponged (bounced
+// one onto another) to free slots for more recording; retake re-records only the
+// last group. Mono forever — the master bounce and every track are single-channel.
+//
+// Two things in this view genuinely cannot go through a full render(): the elapsed
+// timer + level meters (mutated at ~10 Hz from the worklet) and the inline
+// play-status text. Both are handed back as `live` — one small "current DOM node"
+// registration per render, exactly like the sketches player.
 import { h } from '../dom.js';
 import { STEM_KEYS } from './takeModel.js';
 
-const STEM_LABELS = { stem1: 'Mic 1', stem2: 'Mic 2' };
+const STEM_LABELS = { stem1: 'Track 1', stem2: 'Track 2', stem3: 'Track 3', stem4: 'Track 4' };
 
 const fmtTime = (sec) => {
   const s = Math.max(0, Math.floor(sec || 0));
@@ -22,19 +26,17 @@ const fmtTime = (sec) => {
 const fmtWhen = (iso) => { try { return new Date(iso).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }); } catch { return iso || ''; } };
 const rowOf = (child) => { const r = h('div', 'row'); r.appendChild(child); return r; };
 const banner = (kind, text) => h('div', 'tapebanner ' + kind, text);
+const labelList = (keys) => (keys || []).map((k) => STEM_LABELS[k]).join(' & ');
 
 // Build the whole deck subview. `deck` is the tape-deck slice of the view-model
-// (assembled by main.js's songViewModel()); `handlers` are the callbacks from
-// main.js (§5.7's named list, plus onPlayTake/onReplayTake/onStopPlayTake — the
-// ephemeral, non-persisting playback controls; they mutate no persisted state,
-// so they don't touch the manifest, but they still have to reach the
-// AudioContext-owning controller that only main.js holds a reference to).
-// Returns { el, live }.
+// (assembled by main.js's tapeDeckViewModel()); `handlers` are the callbacks from
+// main.js. Returns { el, live }.
 export function buildDeckView(deck, handlers, songName) {
   const {
-    onCloseTapeDeck, onRecordTake, onStopTake, onKeepTake, onDiscardLastTake, onCancelRetake,
-    onDeleteTake, onSelectTake, onSelectInput, onPreviewStemSetting, onSetStemSetting,
-    onBounceTake, onShareTake, onPlayTake, onReplayTake, onStopPlayTake,
+    onCloseTapeDeck, onNewTake, onArmRecordPass, onSetRoutingSlot, onStopTake,
+    onDiscardLastGroup, onBounceStemToTrack, onBounceTake, onDeleteTake, onSelectTake,
+    onSelectInput, onSetMonitorLatency, onPreviewStemSetting, onSetStemSetting, onShareTake,
+    onPlayTake, onReplayTake, onStopPlayTake,
   } = handlers;
 
   const wrap = h('div', 'songswrap tapewrap');
@@ -48,20 +50,21 @@ export function buildDeckView(deck, handlers, songName) {
   back.addEventListener('click', () => { if (!deck.recording) onCloseTapeDeck(); });
   const title = h('div', 'tapetitle');
   title.appendChild(h('div', 'nm', songName || ''));
-  title.appendChild(h('div', 'subtitle', 'Take ' + (deck.currentTakeNo || '—') + (deck.path ? ' · ' + deck.path : '')));
+  const takeLabel = deck.pendingNewTake ? 'New take' : ('Take ' + (deck.currentTakeNo || '—'));
+  title.appendChild(h('div', 'subtitle', takeLabel + (deck.path ? ' · ' + deck.path : '')));
   head.append(back, title);
   wrap.appendChild(head);
 
   // ---- status banners ----
   if (deck.blocked) wrap.appendChild(banner('err', 'Microphone access is blocked — enable it in Settings for this site.'));
   else if (deck.unsupported) wrap.appendChild(banner('err', 'Recording needs a current Safari or Chrome (this browser lacks on-device audio storage).'));
-  else if (deck.noInterface) wrap.appendChild(banner('warn', 'No 2-input audio interface detected — the built-in mic records one channel only.'));
-  if (deck.warnMoreThanTwo) wrap.appendChild(banner('warn', 'This interface has more than two inputs — only the first two will be recorded.'));
+  else if (deck.noInterface) wrap.appendChild(banner('warn', 'No multi-input audio interface detected — the built-in mic records one track at a time.'));
+  if (deck.warnMoreThanMax) wrap.appendChild(banner('warn', 'This interface has more than four inputs — only the first four are available per pass.'));
   if (deck.status && deck.status.message) wrap.appendChild(banner(deck.status.type === 'error' ? 'err' : 'warn', deck.status.message));
   if (deck.spaceWarning) wrap.appendChild(banner('warn', 'Storage is running low. Delete a take to free space, or export what you need to keep.'));
 
   // ---- input picker (AC-25) ----
-  if (deck.inputs && deck.inputs.length > 1) {
+  if (deck.inputs && deck.inputs.length > 1 && !deck.recording) {
     const card = h('div', 'card grow');
     card.appendChild(h('span', 'lbl', 'Input'));
     const sel = h('select');
@@ -72,22 +75,19 @@ export function buildDeckView(deck, handlers, songName) {
     wrap.appendChild(rowOf(card));
   }
 
-  // ---- take menu: choose which take loads after a stop-after-retake (AC-8) ----
-  if (deck.takeMenuOpen) wrap.appendChild(takeMenu(deck, onSelectTake));
-
   // ---- transport ----
-  const transport = transportSection(deck, { onRecordTake, onStopTake, onPlayTake, onReplayTake, onStopPlayTake, songId: deck.songId });
+  const transport = transportSection(deck, { onNewTake, onArmRecordPass, onSetRoutingSlot, onSetMonitorLatency, onStopTake, onPlayTake, onReplayTake, onStopPlayTake, songId: deck.songId });
   wrap.appendChild(transport.el);
   live.timerEl = transport.timerEl;
   live.meterEls = transport.meterEls;
   live.setPlayStatus = transport.setPlayStatus;
 
-  // ---- stem strips (vol/EQ/comp) — shown while recording OR a take is loaded ----
-  if (deck.showStrips && deck.loadedTake) wrap.appendChild(stemStrips(deck, { onPreviewStemSetting, onSetStemSetting }));
+  // ---- track strips (vol/EQ/comp + per-track bounce) — shown while recording OR a take is loaded ----
+  if (deck.showStrips && deck.loadedTake) wrap.appendChild(trackStrips(deck, { onPreviewStemSetting, onSetStemSetting, onBounceStemToTrack }));
 
-  // ---- retake / bounce / share for the loaded take ----
+  // ---- retake / master bounce / share for the loaded take ----
   if (deck.showLoadedActions && deck.loadedTake) {
-    wrap.appendChild(loadedActions(deck, { onKeepTake, onDiscardLastTake, onCancelRetake, onBounceTake, onShareTake }));
+    wrap.appendChild(loadedActions(deck, { onDiscardLastGroup, onBounceTake, onShareTake }));
   }
 
   // ---- take history (AC-10, AC-22, AC-23) ----
@@ -98,6 +98,44 @@ export function buildDeckView(deck, handlers, songName) {
   return { el: wrap, live };
 }
 
+// The arm-pass routing panel (AC-2/25): one row per available input mapping it to a
+// currently-free track slot, defaulted from deck.routing, plus the Record button.
+function armPanel(deck, ctx) {
+  const box = h('div', 'col armpanel');
+  const maxCap = deck.maxCapture || 0;
+  const free = deck.freeSlotKeys || [];
+  box.appendChild(h('div', 'subtitle', 'Record ' + maxCap + ' track' + (maxCap === 1 ? '' : 's') + ' this pass · ' + deck.inputChannels + ' input' + (deck.inputChannels === 1 ? '' : 's') + ' → ' + deck.freeSlots + ' free'));
+  const routing = deck.routing || [];
+  for (let i = 0; i < maxCap; i++) {
+    const row = h('div', 'row routerow');
+    row.appendChild(h('span', 'lbl', 'Input ' + (i + 1) + ' →'));
+    const sel = h('select');
+    free.forEach((key) => { const o = h('option', null, STEM_LABELS[key]); o.value = key; sel.appendChild(o); });
+    sel.value = routing[i] || free[i] || '';
+    sel.addEventListener('change', () => ctx.onSetRoutingSlot(i, sel.value));
+    row.appendChild(sel);
+    box.appendChild(row);
+  }
+  if (deck.inputChannels > deck.freeSlots) box.appendChild(banner('warn', 'More inputs than free tracks — only ' + deck.freeSlots + ' will be recorded this pass.'));
+  // Overdub latency compensation (ms) — only relevant when there are existing tracks
+  // to play as backing. Measure it once with tools/latency-spike.html on this rig.
+  if (deck.filledCount > 0) {
+    const latRow = h('div', 'row routerow');
+    latRow.appendChild(h('span', 'lbl', 'Overdub latency (ms)'));
+    const latIn = h('input', 'tapedial-range');
+    latIn.type = 'number'; latIn.min = '0'; latIn.max = '400'; latIn.step = '1'; latIn.value = String(deck.monitorLatencyMs || 0);
+    latIn.style.width = '5rem';
+    latIn.addEventListener('change', () => ctx.onSetMonitorLatency(Number(latIn.value) || 0));
+    latRow.appendChild(latIn);
+    box.appendChild(latRow);
+  }
+  const recBtn = h('button', 'btn primary grow', '● Record');
+  recBtn.disabled = !!(deck.blocked || deck.unsupported || maxCap < 1);
+  recBtn.addEventListener('click', () => ctx.onArmRecordPass());
+  box.appendChild(rowOf(recBtn));
+  return box;
+}
+
 function transportSection(deck, ctx) {
   const box = h('div', 'card grow tapetransport');
 
@@ -105,9 +143,7 @@ function transportSection(deck, ctx) {
     const timerEl = h('div', 'tapetimer', '0:00');
     const meterWrap = h('div', 'tapemeters');
     const meterEls = {};
-    STEM_KEYS.forEach((key) => {
-      const stem = deck.loadedTake && deck.loadedTake.stems && deck.loadedTake.stems[key];
-      if (!stem) return;
+    (deck.recordingSlotKeys || []).forEach((key) => {
       const row = h('div', 'meterrow');
       row.appendChild(h('span', 'meterlabel', STEM_LABELS[key]));
       const bar = h('div', 'meterbar');
@@ -119,7 +155,7 @@ function transportSection(deck, ctx) {
     });
     const stopBtn = h('button', 'btn primary grow', '■ Stop');
     stopBtn.addEventListener('click', () => ctx.onStopTake());
-    box.append(timerEl, meterWrap, rowOf(stopBtn));
+    box.append(h('div', 'subtitle', deck.overdub ? 'Overdub — backing tracks playing' : 'Recording'), timerEl, meterWrap, rowOf(stopBtn));
     return { el: box, timerEl, meterEls, setPlayStatus: null };
   }
 
@@ -128,39 +164,48 @@ function transportSection(deck, ctx) {
     return { el: box, timerEl: null, meterEls: null, setPlayStatus: null };
   }
 
-  if (!deck.loadedTake) {
-    box.appendChild(h('div', 'feel-empty pad', deck.hasHistory ? 'No current take. Record a new one.' : 'No takes yet — hit Record.'));
-    const recBtn = h('button', 'btn primary grow', '● Record');
-    recBtn.disabled = !!(deck.blocked || deck.unsupported);
-    recBtn.addEventListener('click', () => ctx.onRecordTake());
-    box.appendChild(rowOf(recBtn));
-    return { el: box, timerEl: null, meterEls: null, setPlayStatus: null };
+  let setPlayStatus = null;
+
+  // A loaded take with audio: Play / Stop / Replay (ephemeral — ends in the
+  // audioEngine controller directly, not a manifest-mutating handler).
+  if (deck.loadedTake) {
+    const take = deck.loadedTake;
+    box.appendChild(h('div', 'subtitle', 'Take ' + take.take + (take.recovered ? ' (recovered)' : '') + ' · ' + fmtTime(take.durationSec) + ' · ' + deck.filledCount + '/4 tracks'));
+    const btnRow = h('div', 'row');
+    const playBtn = h('button', 'btn mini', '▶ Play');
+    const stopBtn = h('button', 'btn mini', '■ Stop');
+    const replayBtn = h('button', 'btn mini', '↻ Replay');
+    const pstat = h('span', 'sketch-pstat');
+    const setStat = (t) => { pstat.textContent = t; };
+    playBtn.addEventListener('click', async () => { setStat('Loading…'); setStat((await ctx.onPlayTake(take, ctx.songId)) ? 'Playing' : 'Audio unavailable'); });
+    replayBtn.addEventListener('click', async () => { setStat('Loading…'); setStat((await ctx.onReplayTake(take, ctx.songId)) ? 'Playing' : 'Audio unavailable'); });
+    stopBtn.addEventListener('click', () => { ctx.onStopPlayTake(); setStat(''); });
+    btnRow.append(playBtn, stopBtn, replayBtn, pstat);
+    box.appendChild(btnRow);
+    setPlayStatus = (t) => setStat(t);
+  } else {
+    box.appendChild(h('div', 'feel-empty pad', deck.pendingNewTake ? 'New take — route your inputs and hit Record.' : (deck.hasHistory ? 'No take loaded. Record a new one, or load one from history below.' : 'No takes yet — route your inputs and hit Record.')));
   }
 
-  // A take is loaded: Play / Stop / Replay (ephemeral — ends in the audioEngine
-  // controller directly, not a manifest-mutating handler; sketches precedent).
-  const take = deck.loadedTake;
-  box.appendChild(h('div', 'subtitle', 'Take ' + take.take + (take.recovered ? ' (recovered)' : '') + ' · ' + fmtTime(take.durationSec)));
-  const btnRow = h('div', 'row');
-  const playBtn = h('button', 'btn mini', '▶ Play');
-  const stopBtn = h('button', 'btn mini', '■ Stop');
-  const replayBtn = h('button', 'btn mini', '↻ Replay');
-  const pstat = h('span', 'sketch-pstat');
-  const setStat = (t) => { pstat.textContent = t; };
-  playBtn.addEventListener('click', async () => { setStat('Loading…'); setStat((await ctx.onPlayTake(take, ctx.songId)) ? 'Playing' : 'Audio unavailable'); });
-  replayBtn.addEventListener('click', async () => { setStat('Loading…'); setStat((await ctx.onReplayTake(take, ctx.songId)) ? 'Playing' : 'Audio unavailable'); });
-  stopBtn.addEventListener('click', () => { ctx.onStopPlayTake(); setStat(''); });
-  btnRow.append(playBtn, stopBtn, replayBtn, pstat);
-  box.appendChild(btnRow);
-  return { el: box, timerEl: null, meterEls: null, setPlayStatus: (t) => setStat(t) };
+  // Arm a pass into free slots, or explain the full-take options.
+  if (deck.freeSlots > 0 && deck.maxCapture > 0) box.appendChild(armPanel(deck, ctx));
+  else if (deck.loadedTake) box.appendChild(h('div', 'feel-empty', 'All 4 tracks are full — bounce a track onto another to free one, or start a new take.'));
+
+  // + New take (a fresh empty 4-track container).
+  const newBtn = h('button', 'btn mini', '+ New take');
+  newBtn.disabled = !!(deck.blocked || deck.unsupported);
+  newBtn.addEventListener('click', () => ctx.onNewTake());
+  box.appendChild(rowOf(newBtn));
+
+  return { el: box, timerEl: null, meterEls: null, setPlayStatus };
 }
 
-function stemStrips(deck, handlers) {
+function trackStrips(deck, handlers) {
   const wrap = h('div', 'row');
   STEM_KEYS.forEach((key) => {
     const stem = deck.loadedTake.stems && deck.loadedTake.stems[key];
-    if (!stem) return;
-    wrap.appendChild(stemStrip(key, stem, handlers));
+    if (!stem || !stem.file) return;
+    wrap.appendChild(trackStrip(key, stem, deck, handlers));
   });
   return wrap;
 }
@@ -176,7 +221,7 @@ function dial(label, min, max, step, value, onInput, onChange) {
   return box;
 }
 
-function stemStrip(stemKey, stem, handlers) {
+function trackStrip(stemKey, stem, deck, handlers) {
   const card = h('div', 'card grow tapestrip');
   card.appendChild(h('span', 'lbl', STEM_LABELS[stemKey]));
 
@@ -195,30 +240,53 @@ function stemStrip(stemKey, stem, handlers) {
   card.appendChild(dial('Comp', 0, 1, 0.01, stem.comp,
     (v) => preview({ comp: v }), (v) => commit({ comp: v })));
 
+  // Per-track ping-pong bounce (freeing this slot): pick a destination from the
+  // OTHER filled tracks. Inline confirm bar, plain classList toggle (no re-render).
+  if (deck.canBounceTracks) {
+    const others = (deck.filledSlotKeys || []).filter((k) => k !== stemKey);
+    if (others.length) {
+      const bounceBtn = h('button', 'btn mini', 'Bounce ▸');
+      const bar = h('div', 'namebar hidden');
+      bar.appendChild(h('span', 'savehint', 'Bounce ' + STEM_LABELS[stemKey] + ' into… (frees this track)'));
+      others.forEach((k) => {
+        const b = h('button', 'btn mini', STEM_LABELS[k]);
+        b.addEventListener('click', () => handlers.onBounceStemToTrack(stemKey, k));
+        bar.appendChild(b);
+      });
+      const cancel = h('button', 'btn mini', 'Cancel');
+      cancel.addEventListener('click', () => bar.classList.add('hidden'));
+      bar.appendChild(cancel);
+      bounceBtn.addEventListener('click', () => bar.classList.remove('hidden'));
+      card.append(bounceBtn, bar);
+    }
+  }
+
   return card;
 }
 
-// Retake (AC-7) reuses the same inline-confirm-bar idiom as the per-take Delete
-// row and songsView's own Delete-song confirm: the Keep/Discard/Cancel bar is
-// built up front (hidden) and toggled with a plain classList flip, no re-render
-// needed to open it (only Keep/Discard actually change persisted state).
+// Retake (rescoped to the last recorded group) + master bounce + per-file Share.
+// The retake bar reuses the inline-confirm-bar idiom (built hidden, toggled with a
+// classList flip): re-recording erases only the last pass's tracks (AC: retake
+// affects only the last recorded set of tracks) and re-arms them for recording.
 function loadedActions(deck, handlers) {
   const wrap = h('div', 'col');
   const row = h('div', 'row tapeloaded');
 
-  const retakeBtn = h('button', 'btn', 'Retake');
-  const retakeBar = h('div', 'namebar hidden');
-  const keepBtn = h('button', 'btn mini', 'Keep');
-  const discardBtn = h('button', 'btn mini danger', 'Discard');
-  const cancelBtn = h('button', 'btn mini', 'Cancel');
-  retakeBar.append(h('span', 'savehint', 'Keep the last take, or discard it and record again?'), keepBtn, discardBtn, cancelBtn);
-  retakeBtn.addEventListener('click', () => retakeBar.classList.remove('hidden'));
-  keepBtn.addEventListener('click', () => handlers.onKeepTake());
-  discardBtn.addEventListener('click', () => handlers.onDiscardLastTake());
-  cancelBtn.addEventListener('click', () => { retakeBar.classList.add('hidden'); handlers.onCancelRetake(); });
-  row.appendChild(retakeBtn);
+  if (deck.lastGroupKeys && deck.lastGroupKeys.length) {
+    const retakeBtn = h('button', 'btn', 'Retake last group');
+    const retakeBar = h('div', 'namebar hidden');
+    const redoBtn = h('button', 'btn mini danger', 'Re-record');
+    const cancelBtn = h('button', 'btn mini', 'Cancel');
+    retakeBar.append(h('span', 'savehint', 'Re-record the last group (' + labelList(deck.lastGroupKeys) + ')? This erases it.'), redoBtn, cancelBtn);
+    retakeBtn.addEventListener('click', () => retakeBar.classList.remove('hidden'));
+    redoBtn.addEventListener('click', () => handlers.onDiscardLastGroup());
+    cancelBtn.addEventListener('click', () => retakeBar.classList.add('hidden'));
+    row.appendChild(retakeBtn);
+    wrap.appendChild(retakeBar);
+  }
 
-  const bounceBtn = h('button', 'btn primary', 'Bounce');
+  const bounceBtn = h('button', 'btn primary', 'Bounce to mix');
+  bounceBtn.disabled = !!deck.bouncing;
   bounceBtn.addEventListener('click', () => handlers.onBounceTake());
   row.appendChild(bounceBtn);
 
@@ -237,36 +305,8 @@ function loadedActions(deck, handlers) {
     row.appendChild(btn);
   }
 
-  wrap.append(row, retakeBar);
+  wrap.insertBefore(row, wrap.firstChild);
   return wrap;
-}
-
-function takeMenu(deck, onSelectTake) {
-  const box = h('div', 'card grow takemenu');
-  box.appendChild(h('span', 'lbl', 'Choose a take'));
-  // AC-8: "the newest take is preselected; dismissing the menu loads the
-  // newest." takeMenuTakes is sorted newest-first (main.js), and the take that
-  // just finished recording — the reason this menu is open — is always the
-  // highest-numbered ACTIVE one, so index 0 is always a real, selectable take.
-  const newest = (deck.takeMenuTakes || [])[0];
-  if (newest) {
-    const dismissBtn = h('button', 'btn mini', '✕ Use newest (Take ' + newest.take + ')');
-    dismissBtn.addEventListener('click', () => onSelectTake(newest.take));
-    box.appendChild(rowOf(dismissBtn));
-  }
-  const list = h('div', 'savedlist');
-  (deck.takeMenuTakes || []).forEach((t, i) => {
-    const row = h('div', 'saved' + (t.status === 'discarded' ? ' tombstone' : ''));
-    row.appendChild(h('div', 'nm', 'Take ' + t.take + (t.status === 'discarded' ? ' (discarded)' : '') + (t.recovered ? ' (recovered)' : '')));
-    row.appendChild(h('div', 'stuning', fmtWhen(t.createdAt) + (t.durationSec != null ? ' · ' + fmtTime(t.durationSec) : '')));
-    if (t.status !== 'discarded') {
-      row.addEventListener('click', () => onSelectTake(t.take));
-      if (i === 0) row.classList.add('on');
-    }
-    list.appendChild(row);
-  });
-  box.appendChild(list);
-  return box;
 }
 
 function takeHistory(deck, handlers) {
@@ -278,6 +318,19 @@ function takeHistory(deck, handlers) {
   takes.forEach((t) => list.appendChild(historyRow(t, deck, handlers)));
   box.appendChild(list);
   return box;
+}
+
+// The count of filled tracks in a take (for the history "N/4 tracks" line).
+function filledCountOf(t) {
+  if (!t || !t.stems) return 0;
+  return STEM_KEYS.reduce((n, k) => n + (t.stems[k] && t.stems[k].file ? 1 : 0), 0);
+}
+// First shareable ref for a take without loading it: the mix, else the first track.
+function firstShareRef(t) {
+  if (t.bounce && t.bounce.file) return 'bounce';
+  if (!t.stems) return null;
+  for (const k of STEM_KEYS) if (t.stems[k] && t.stems[k].file) return k;
+  return null;
 }
 
 function historyRow(t, deck, handlers) {
@@ -294,13 +347,12 @@ function historyRow(t, deck, handlers) {
   }
   const row = h('div', 'saved' + (t.take === deck.currentTakeNo ? ' on' : ''));
   const nm = h('div', 'nm', 'Take ' + t.take + (t.recovered ? ' (recovered)' : ''));
-  const when = h('div', 'stuning', fmtWhen(t.createdAt) + ' · ' + fmtTime(t.durationSec));
+  const when = h('div', 'stuning', fmtWhen(t.createdAt) + ' · ' + fmtTime(t.durationSec) + ' · ' + filledCountOf(t) + '/4');
   const loadBtn = h('button', 'btn mini', 'Load');
   loadBtn.addEventListener('click', (e) => { e.stopPropagation(); handlers.onSelectTake(t.take); });
-  // AC-10: active rows offer Load, Share, and Delete. Share the finished mix
-  // when one exists, else the first available stem — reachable without first
-  // Loading the take (loadedActions' per-file buttons cover the loaded take).
-  const shareRef = (t.bounce && t.bounce.file) ? 'bounce' : (t.stems && t.stems.stem1 && t.stems.stem1.file) ? 'stem1' : (t.stems && t.stems.stem2 && t.stems.stem2.file) ? 'stem2' : null;
+  // AC-10: active rows offer Load, Share, and Delete. Share the finished mix when
+  // one exists, else the first available track — reachable without first Loading.
+  const shareRef = firstShareRef(t);
   const shareBtn = h('button', 'btn mini', 'Share');
   shareBtn.disabled = !shareRef;
   shareBtn.addEventListener('click', (e) => { e.stopPropagation(); if (shareRef) handlers.onShareTake(shareRef, t.take); });

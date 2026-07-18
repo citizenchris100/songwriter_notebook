@@ -42,13 +42,17 @@ function patchSizeFields(handle, sizeFields, dataBytes) {
   }
 }
 
-// ---- the one open (recording) take at a time ----
-let openTakeState = null; // { sizeFields, stems: { stem1: {handle, cursor}|null, stem2: ...|null }, timer }
+// ---- the one open (recording) PASS at a time ----
+// A pass opens ONLY its own destination-slot files (msg.files carries just those),
+// so a take's already-recorded tracks are never opened here and thus never
+// truncated — that is what lets a take be filled over multiple passes. `stems` is
+// keyed by whatever slots this pass opened (any subset of stem1..stem4).
+let openTakeState = null; // { sizeFields, stems: { [slotKey]: {handle, cursor} }, timer }
 
 function closeOpenTakeIfAny() {
   if (!openTakeState) return;
   clearInterval(openTakeState.timer);
-  for (const key of ['stem1', 'stem2']) {
+  for (const key of Object.keys(openTakeState.stems)) {
     const s = openTakeState.stems[key];
     if (s) { try { s.handle.close(); } catch { /* already closed */ } }
   }
@@ -57,7 +61,7 @@ function closeOpenTakeIfAny() {
 
 function flushOpenTake() {
   if (!openTakeState) return;
-  for (const key of ['stem1', 'stem2']) {
+  for (const key of Object.keys(openTakeState.stems)) {
     const s = openTakeState.stems[key];
     if (!s) continue;
     patchSizeFields(s.handle, openTakeState.sizeFields, s.cursor - 44);
@@ -67,8 +71,8 @@ function flushOpenTake() {
 
 async function openTake(msg) {
   closeOpenTakeIfAny();
-  const stems = { stem1: null, stem2: null };
-  for (const key of ['stem1', 'stem2']) {
+  const stems = {};
+  for (const key of Object.keys(msg.files)) {
     const filename = msg.files[key];
     if (!filename) continue;
     const fh = await fileHandleAtPath(msg.dir + filename, true);
@@ -81,8 +85,10 @@ async function openTake(msg) {
   return { ok: true };
 }
 
-// Fire-and-forget: append one int16 chunk to the named stem's open file. Errors
-// push an async {type:'writeError'} rather than reply — there is no request id.
+// Fire-and-forget: append one int16 chunk to a slot's open file. `stemNum` is the
+// DESTINATION SLOT NUMBER (1..4) the capture worklet routed this channel to, not a
+// positional channel index. Errors push an async {type:'writeError'} rather than
+// reply — there is no request id.
 function handleAppend(stemNum, bytes) {
   if (!openTakeState) { postWriteError('append received with no take open'); return; }
   const s = openTakeState.stems['stem' + stemNum];
@@ -98,7 +104,7 @@ function handleAppend(stemNum, bytes) {
 function finalizeTake() {
   if (!openTakeState) return { ok: true, dataBytes: {} };
   const dataBytes = {};
-  for (const key of ['stem1', 'stem2']) {
+  for (const key of Object.keys(openTakeState.stems)) {
     const s = openTakeState.stems[key];
     if (!s) continue;
     const bytes = s.cursor - 44;

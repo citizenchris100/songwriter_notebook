@@ -2,9 +2,10 @@
 
 **Specification & Implementation Plan (build-ready)**
 
-> Status: approved spec, revision 2 (post adversarial review), not yet implemented. This document
-> is the deliverable — it is written so an implementing agent can build the whole feature from it,
-> and so a reviewer can scrutinize and improve it. Nothing here has been coded yet.
+> Status: **revision 3 — implemented and expanded to a 4-track portastudio.** The body below (§1–§9)
+> is the original revision-2 2-track spec, preserved as the design record; the **Revision 3 changelog**
+> immediately below supersedes it wherever the two conflict (4 tracks not 2, mono not stereo, multi-pass
+> fill, overdub monitoring, per-track ping-pong bounce, group-scoped retake). Read the changelog first.
 
 **Revision 2 changelog (2026-07-11).** Adversarial review against the real codebase produced these
 changes, all user-arbitrated: (1) worklet/worker scripts are loaded via `fetch → Blob URL` because
@@ -22,6 +23,63 @@ Phase-0 spike device; (10) `decodeAudioData` replaced by a pure `parseWav`; boun
 transferred MessagePort; (11) boot-time OPFS dir GC and the IndexedDB fallback are cut; (12) dial
 input follows the capture-only/no-render idiom with debounced manifest persistence; (13) the
 engine test suite currently reports 282 passing checks (the "456" claim was wrong).
+
+---
+
+## Revision 3 changelog (4-track portastudio; supersedes §1–§9 where they conflict)
+
+The 2-track deck below was expanded, at the user's direction, into a **4-track cassette portastudio**
+(Tascam-424 / Beatles bounce-down mental model). All of it is implemented and covered by
+`node engine.test.js`. The changes:
+
+1. **A take is a 4-track container, not a single pass.** A take owns four slots `stem1..stem4` (internal
+   keys kept so pre-existing 2-track takes still resolve; the UI labels them "Track 1..4"). A take is
+   filled over **multiple recording passes**; each pass writes one or more currently-free slots.
+2. **Multi-pass fill with input→track routing.** Arming a pass, the user maps interface inputs → free
+   slots (`min(interface inputs, free slots, 4)` at once — 2 on the EVO; 4 total via multiple passes).
+   The capture worklet tags each channel's chunk with its **destination slot number**; the OPFS worker
+   opens **only the pass's slot files**, so already-recorded tracks are never truncated.
+3. **Overdub monitoring (new capability; reverses the rev-2 no-overdub non-goal).** While recording a
+   pass, the deck plays the take's already-recorded tracks so the performer overdubs in time. Alignment
+   is a **capture gate**: the worklet discards frames until `beginFrame = (startAt + monitorLatencySec) *
+   rate`, so every stem file's sample 0 IS the shared timeline t=0 and playback/bounce need no alignment
+   code. `monitorLatencySec` is **measured on-device** (input latency is unexposed by Web Audio) with
+   `tools/latency-spike.html` (EVO loopback) and entered in the deck; a wrong value flams the overdub by
+   a fixed offset. iOS Safari lacks `AudioContext.outputLatency` → calibration is the reliable path.
+4. **Per-track ping-pong bounce.** Each track strip has a Bounce▸ button → pick a destination track; the
+   source + destination are summed (both effected, **mono**, limiter-guarded, no LUFS normalize) into the
+   destination's file, the destination resets to neutral settings, and the **source slot is freed** for
+   more recording. Destructive on the source (Share/Export is the backstop). The whole-take **master
+   bounce** (sum all tracks → one `_mix.wav` with the LUFS-target + limiter mastering) stays.
+5. **Group-scoped retake.** Every slot a pass writes is stamped with a monotonic `group`. "Retake"
+   re-records **only the last recorded group** (the filled slots whose group is the max present): it
+   frees those slots, deletes their audio, and re-arms a pass into exactly them (earlier groups play as
+   backing). Supersedes the rev-2 whole-take Keep/Discard/Cancel + take-menu flow (the take menu is
+   removed — passes stay within one take, so there's no cross-take ambiguity to resolve).
+6. **Explicit "+ New take."** Record fills the current take's free slots; a separate "+ New take" starts
+   a fresh empty container; a full take (4/4) disables Record (bounce a track to free one, or new take).
+7. **MONO FOREVER (supersedes D18).** The app has no panning/stereo concept and never will (Phil Spector
+   mono). The master bounce renders in a 1-channel `OfflineAudioContext` → `wavHeader(1,…)`; every track
+   file is mono. This replaces the rev-2 "stereo, pan-ready" bounce.
+8. **Manifest schema v2 + migration.** The manifest is `schemaVersion:2`; each slot gains `group` +
+   per-slot `durationSec` (take `durationSec` = max filled slot). `normalizeManifest` migrates any v1
+   take (scalar `channels`, no per-slot group) in place on first deck-open: stem1 (and stem2 iff
+   `channels===2`) → group-1 slots with `durationSec = take.durationSec`; stem3/stem4 → free. **Stem
+   filenames are unchanged**, so real on-device WAVs resolve; a migrated 2-track take opens as a partial
+   4-track take (2 filled, 2 free), ready to overdub or bounce.
+9. **New/changed pure transforms** (`takeModel.js`, all node-tested): `STEM_KEYS` = 4 + `MAX_TRACKS`;
+   `makeTake` (empty container), `appendPassTracks`, `nextGroup`, `lastGroupSlotKeys`, `freeSlotKeys`/
+   `filledSlotKeys`, `takeHasAudio`, `maxSlotDuration`, `defaultRouting`, `finalizePass` (replaces
+   `finalizeTake`), `finalizeRecoveredPass` (replaces `finalizeRecoveredTake` — recovers per pending
+   slot, frees empty ones, tombstones only an all-empty pass), `discardGroup`, `bounceTrackToTrack`;
+   `setStemSettings` now preserves `group`/`durationSec`; `mostRecentKeptTake` gates on `takeHasAudio`.
+10. **Capture ceiling raised to 4** (`devices.js` `channelCount:4` ideal; never over-constrains the 2-in
+    EVO). The ">2 inputs" warning becomes ">4 inputs." `sw.js` `CACHE` bumped to `sn-v20` (no new files
+    — all edits are to the existing ten `js/tape/*` modules; `tools/latency-spike.html` is a throwaway
+    diagnostic, not part of the app).
+
+**Still not a general DAW:** no timeline editing, no per-clip trimming, no plugin concept, no panning,
+and take audio never enters the song export bundle (Share/Export per file only).
 
 ---
 

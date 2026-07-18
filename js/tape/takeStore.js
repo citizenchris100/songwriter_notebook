@@ -125,6 +125,14 @@ export async function deleteSongTakes(slug) {
   await call('deleteDir', { dir: 'takes/' + slug });
 }
 
+// Delete just the named slot WAVs of one take (a ping-pong bounce frees its source
+// slot; a group-discard frees the last pass's slots) — the take's other tracks and
+// its mix stay on disc. Best-effort; missing files are fine.
+export async function deleteSlotFiles(slug, take, keys) {
+  const paths = keys.map((k) => 'takes/' + slug + '/' + stemFileName(slug, take, k));
+  await call('deleteFiles', { paths });
+}
+
 export async function estimateSpace() {
   try {
     if (!(navigator.storage && navigator.storage.estimate)) return null;
