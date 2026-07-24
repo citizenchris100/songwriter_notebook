@@ -290,3 +290,43 @@ export function renameSong(song, name, now) {
 export function finalizeDraft(draft, name, takenIds, now) {
   return { ...draft, id: slugifySongId(name, takenIds), name: String(name), updatedAt: now };
 }
+
+// ---- markdown export (pure: song -> a cleanly formatted .md string) ----
+// Rich layout: title + updated date, one heading per row (its section label plus captured
+// title / key / feel), the chords as an aligned table with their spelled notes, then a
+// Lyrics block. Stays PURE — no DOM/fetch/Date; the date is sliced off the ISO updatedAt
+// (never `new Date()`), so the node engine test can load and assert this.
+const mdCell = (x) => str(x).replace(/\|/g, '\\|');   // a "|" would break a table cell
+
+export function toMarkdown(song) {
+  const s = song || {};
+  const out = ['# ' + (str(s.name).trim() || 'Untitled'), ''];
+
+  const date = str(s.updatedAt).slice(0, 10);
+  out.push(date ? ('*Songwriter Notebook · updated ' + date + '*') : '*Songwriter Notebook*');
+
+  const rows = Array.isArray(s.progressions) ? s.progressions : [];
+  rows.forEach((p, i) => {
+    const prov = (p && p.provenance) || {};
+    const heading = str(p && p.label).trim() || ('Section ' + (i + 1));
+    const meta = [str(p && p.title).trim(), str(prov.keyLabel).trim(), str(prov.feelName).trim()].filter(Boolean);
+    out.push('', '## ' + heading + (meta.length ? (' — ' + meta.join(' · ')) : ''), '');
+
+    const chords = (p && Array.isArray(p.chords)) ? p.chords : [];
+    if (!chords.length) { out.push('_(no chords)_'); return; }
+
+    const names = chords.map((c) => mdCell(c && c.name));
+    const notes = chords.map((c) => mdCell((c && Array.isArray(c.notes)) ? c.notes.join(' ') : ''));
+    const wName = Math.max('Chord'.length, ...names.map((x) => x.length));
+    const wNotes = Math.max('Notes'.length, ...notes.map((x) => x.length));
+    const pad = (x, w) => x + ' '.repeat(w - x.length);
+    out.push('| ' + pad('Chord', wName) + ' | ' + pad('Notes', wNotes) + ' |');
+    out.push('| ' + '-'.repeat(wName) + ' | ' + '-'.repeat(wNotes) + ' |');
+    names.forEach((n, k) => out.push('| ' + pad(n, wName) + ' | ' + pad(notes[k], wNotes) + ' |'));
+  });
+
+  const lyrics = str(s.lyrics);
+  if (lyrics.trim()) out.push('', '## Lyrics', '', lyrics.replace(/\s+$/, ''));
+
+  return out.join('\n') + '\n';
+}

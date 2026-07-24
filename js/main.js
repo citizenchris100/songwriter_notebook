@@ -18,7 +18,7 @@ import {
   validateSong, normalizeSong, nextUntitledName, slugifySongId, buildCapturedProgression,
   createSong, appendProgressions, reorderProgression, removeProgression, copyProgression,
   setProgressionLabel, setLyrics, renameSong, finalizeDraft,
-  appendRow, addChord, setChord, removeChord,
+  appendRow, addChord, setChord, removeChord, toMarkdown,
 } from './songs.js';
 import { isAcceptedAudio, makeSketchMeta, addSketchMeta, removeSketchMeta, setSketchNotes } from './sketches.js';
 import * as audioStore from './audioStore.js';
@@ -497,6 +497,37 @@ async function writeJsonSink(sink, obj) {
   return await shareOrDownloadBlob(blob, sink.name, 'application/json');   // tiers 2+3
 }
 
+// ---- markdown companion export (.md next to the song's .json) ----
+// Mirrors openJsonSink/writeJsonSink but for text/markdown. `startInHandle` (the song's
+// retained .json handle, when we hold one) opens the desktop save dialog IN THE SONG'S
+// FOLDER, so the .md defaults right beside the .json. tiers 2+3 (share/download) are the
+// iOS / Firefox path, exactly as for JSON.
+async function openMdSink(suggestedName, startInHandle) {
+  if (typeof window !== 'undefined' && window.showSaveFilePicker) {
+    try {
+      const opts = { suggestedName, types: [{ description: 'Markdown', accept: { 'text/markdown': ['.md'] } }] };
+      if (startInHandle) opts.startIn = startInHandle;
+      const handle = await window.showSaveFilePicker(opts);
+      return { handle, name: suggestedName };
+    } catch (e) {
+      if (e && e.name === 'AbortError') return null;   // user dismissed the save dialog
+      // insecure context / blocked → fall through to the share-or-download path
+    }
+  }
+  return { name: suggestedName };
+}
+
+async function writeMdSink(sink, md) {
+  if (!sink) return false;
+  const blob = new Blob([md], { type: 'text/markdown' });
+  if (sink.handle) {                                       // tier 1: File System Access handle
+    const writable = await sink.handle.createWritable();
+    try { await writable.write(blob); } finally { await writable.close(); }
+    return true;
+  }
+  return await shareOrDownloadBlob(blob, sink.name, 'text/markdown');   // tiers 2+3
+}
+
 // ---- per-song save-in-place handles (File System Access API; desktop) ----
 
 // Ask (once, under the click gesture) for readwrite permission on a retained handle.
@@ -904,9 +935,12 @@ const handlers = {
       saveSongs(songs);
       if (currentSongId === id) { currentSongId = null; currentSketchId = null; sketchFlash = null; songFlash = null; resetTapeDeckUi(); }
       render();
-      // Best-effort: drop the deleted song's save-in-place handle (session + IndexedDB).
+      // Best-effort: drop the deleted song's save-in-place handles (session + IndexedDB):
+      // the .json handle (keyed by id) and the .md companion handle (id + '::md').
       fileHandles.delete(id);
       audioStore.deleteFileHandle(id).catch(() => {});
+      fileHandles.delete(id + '::md');
+      audioStore.deleteFileHandle(id + '::md').catch(() => {});
       // Best-effort: drop the deleted song's audio blobs (reconcile also GCs them later).
       if (gone && gone.sketches && gone.sketches.length) audioStore.deleteMany(gone.sketches.map((sk) => sk.id)).catch(() => {});
       // §5.7: also GC its OPFS take directory (no boot-time GC, D30 — deletion is
@@ -943,6 +977,40 @@ const handlers = {
       songs = songs.map((s) => (s.id === a.id ? { ...s, file: { name: savedName } } : s));
       saveSongs(songs);
       songFlash = { ok: true, name: savedName };
+      render();
+    },
+
+    // Export the current song as a cleanly formatted .md companion, next to its .json.
+    // Mirrors onSaveSongFile: silent in-place overwrite once a .md location is chosen
+    // (desktop), else the platform save/share flow (iOS "Save to Files" / download). The
+    // .md handle is retained under a DISTINCT key (a.id + '::md') so it never collides with
+    // the song's .json handle (keyed by a.id).
+    onExportMd: async () => {
+      const a = activeSong();
+      if (!a || !a.id) return;
+      const md = toMarkdown(a);
+      const mdName = a.id + '.md';
+      const mdKey = a.id + '::md';
+
+      // 1. Silent overwrite when we already hold a usable .md handle (desktop).
+      const existing = await handleForSong(mdKey);
+      if (existing && await ensureHandleWritable(existing)) {
+        try {
+          await writeMdSink({ handle: existing }, md);
+          songFlash = { ok: true, name: existing.name || mdName };
+          render();
+          return;
+        } catch { /* handle went stale (file moved/deleted) → fall through to re-pick */ }
+      }
+
+      // 2. First export (or no usable handle): pick a location, defaulting to the song's
+      //    own folder (startIn = the retained .json handle where we have one).
+      const jsonHandle = await handleForSong(a.id);
+      const sink = await openMdSink(mdName, jsonHandle);
+      if (!sink) return;   // cancelled the save dialog
+      await writeMdSink(sink, md);
+      if (sink.handle) await rememberHandle(mdKey, sink.handle);
+      songFlash = { ok: true, name: (sink.handle && sink.handle.name) || sink.name || mdName };
       render();
     },
 

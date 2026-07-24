@@ -18,7 +18,7 @@ import {
   validateSong, normalizeSong, nextUntitledName, slugifySongId, buildCapturedProgression,
   createSong, appendProgressions, reorderProgression, removeProgression, copyProgression,
   setProgressionLabel, setLyrics, renameSong, finalizeDraft,
-  appendRow, addChord, setChord, removeChord,
+  appendRow, addChord, setChord, removeChord, toMarkdown,
 } from './js/songs.js';
 import {
   isAcceptedAudio, makeSketchMeta, validateSketchMeta,
@@ -485,6 +485,31 @@ ok('validateSong rejects a non-object file', !validateSong({ ...goodSong, file: 
 ok('normalizeSong preserves a present file ref', normalizeSong({ ...goodSong, file: { name: 'My Song.json' } }).file.name === 'My Song.json');
 ok('normalizeSong reduces file to { name } only', !('handle' in normalizeSong({ ...goodSong, file: { name: 'x.json', handle: 1 } }).file));
 ok('normalizeSong omits the file key entirely when absent', !('file' in normalizeSong(goodSong)));
+
+// ---- toMarkdown: the pure Rich .md companion export (title, per-row headings, aligned
+// chord table with spelled notes, Lyrics block). Date is sliced off updatedAt, never Date. ----
+const mdSong = {
+  schemaVersion: 1, id: 'my-song', name: 'My Song', createdAt: 't', updatedAt: '2026-07-24T10:00:00.000Z',
+  lyrics: 'line one\nline two\n', progressions: [
+    { label: 'Verse', title: 'Main Progression',
+      chords: [{ name: 'F', notes: ['F', 'A', 'C'] }, { name: 'Dm7', notes: ['D', 'F', 'A', 'C'] }],
+      provenance: { feelName: 'Jangle Pop', keyLabel: 'F major' } },
+    { label: '', title: '', chords: [{ name: 'C', notes: ['C', 'E', 'G'] }] },
+  ],
+};
+const md = toMarkdown(mdSong);
+ok('toMarkdown starts with the song title', md.startsWith('# My Song\n'));
+ok('toMarkdown includes the updated date line', md.includes('*Songwriter Notebook · updated 2026-07-24*'));
+ok('toMarkdown heads a labeled row with its section + title/key/feel', md.includes('## Verse — Main Progression · F major · Jangle Pop'));
+ok('toMarkdown labels an unlabeled row Section N', md.includes('## Section 2'));
+ok('toMarkdown emits an aligned chord table header', md.includes('| Chord | Notes'));
+ok('toMarkdown emits a chord row with spelled notes', md.includes('| F ') && md.includes('| F A C'));
+ok('toMarkdown includes a Lyrics block with the lyrics', md.includes('## Lyrics') && md.includes('line one\nline two'));
+ok('toMarkdown ends with exactly one trailing newline', md.endsWith('\n') && !md.endsWith('\n\n'));
+ok('toMarkdown escapes a pipe in a chord name', toMarkdown({ name: 'P', progressions: [{ chords: [{ name: 'C|x', notes: ['C'] }] }] }).includes('C\\|x'));
+eq('toMarkdown omits the Lyrics heading when lyrics are empty',
+   toMarkdown({ name: 'X', updatedAt: '', progressions: [] }).includes('## Lyrics'), false);
+eq('toMarkdown falls back to Untitled for a nameless song', toMarkdown({}).startsWith('# Untitled\n'), true);
 
 // ============================================================================
 // 14. Tape deck (pure) — takeModel, wav, lufs, limiter

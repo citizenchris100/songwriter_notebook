@@ -14,7 +14,7 @@ export function mountSongsView(container, handlers) {
     onSelectSong, onSetLabel, onReorder, onRemoveProgression, onCopyProgression,
     onNewSong, onConfirmNewSong, onCancelNewSong, onNewRow, onAddChord, onSetChord, onRemoveChord,
     onLyricsChange, onRenameSong, onDeleteSong,
-    onOpenSongPicker, onOpenSongText, onSaveSongFile,
+    onOpenSongPicker, onOpenSongText, onSaveSongFile, onExportMd,
     onAddSketch, onSelectSketch, onDeleteSketch, onSketchNotesChange, onLoadSketchBlob,
     onOpenTapeDeck, onDeckLiveRefs,
   } = handlers;
@@ -215,6 +215,11 @@ export function mountSongsView(container, handlers) {
     const saveBtn = h('button', 'btn primary', 'Save');
     saveBtn.addEventListener('click', () => onSaveSongFile());
     btns.appendChild(saveBtn);
+
+    // Export a cleanly formatted .md companion, saved next to the song's .json.
+    const mdBtn = h('button', 'btn', 'Export md');
+    mdBtn.addEventListener('click', () => onExportMd());
+    btns.appendChild(mdBtn);
 
     // Rename.
     const renameBtn = h('button', 'btn', 'Rename');
