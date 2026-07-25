@@ -1,0 +1,10 @@
+{
+  "$schema": "./feel.schema.json",
+  "id": "dark-folk",
+  "name": "Dark Folk",
+  "progression": ["i", "iv", "bVII", "bIII"],
+  "description": "Aeolian folk loop, the murder-ballad four-chord cell that Henry Lee and The Curse of Millhaven share note for note (Am Dm G C). No functional dominant; the tonic is reached plagally and through the relative major.",
+  "tags": ["nick-cave", "bad-seeds", "murder-ballad", "dark-folk", "aeolian"],
+  "source": "Nick Cave & the Bad Seeds, via Ultimate Guitar chord sheets (Henry Lee, The Curse of Millhaven, Where the Wild Roses Grow)",
+  "schemaVersion": 2
+}

@@ -1,0 +1,10 @@
+{
+  "$schema": "./feel.schema.json",
+  "id": "red-right-hand",
+  "name": "Red Right Hand",
+  "progression": ["i", "iv", "V7", "IV7"],
+  "description": "The Red Right Hand hybrid: a minor drone (i, iv) plus a functional dominant that sidesteps down through a dorian major-IV7 back to the tonic instead of resolving straight home. In B minor this is Bm Em F#7 E7. Richer than the pure aeolian drones: it borrows a leading-tone V7 and a raised-6 IV7 at once.",
+  "tags": ["nick-cave", "bad-seeds", "dorian", "menace", "functional-dominant"],
+  "source": "Nick Cave & the Bad Seeds, Red Right Hand (Let Love In), chords provided by user",
+  "schemaVersion": 2
+}

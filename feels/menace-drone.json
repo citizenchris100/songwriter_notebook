@@ -1,0 +1,10 @@
+{
+  "$schema": "./feel.schema.json",
+  "id": "menace-drone",
+  "name": "Menace Drone",
+  "progression": ["i", "iv", "v"],
+  "description": "Static minor-tonic vamp with a minor v and no leading tone: the Nick Cave menace drone. Aeolian throughout, no functional dominant. The family also runs barer as i-bVII (Tupelo) or i-v (The Mercy Seat); this is Loverman's fuller three-chord form.",
+  "tags": ["nick-cave", "bad-seeds", "menace", "aeolian", "drone", "minor-vamp"],
+  "source": "Nick Cave & the Bad Seeds, via Ultimate Guitar chord sheets (Tupelo, The Mercy Seat, Loverman)",
+  "schemaVersion": 2
+}
