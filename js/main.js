@@ -24,6 +24,7 @@ import { isAcceptedAudio, makeSketchMeta, addSketchMeta, removeSketchMeta, setSk
 import * as audioStore from './audioStore.js';
 import { chordFromRootAndQuality } from './theory/roman.js';
 import * as takeModel from './tape/takeModel.js';
+import { clampClickConfig, defaultClickConfig } from './tape/clickModel.js';
 import * as takeStore from './tape/takeStore.js';
 import { SIZE_FIELDS } from './tape/wav.js';
 import { makeTapeDeck } from './tape/audioEngine.js';
@@ -93,6 +94,7 @@ let deckInputs = null;         // devices.probe() result: { inputs, preselectedI
 let deckSelectedInputId = null;
 let deckSpaceWarning = false;
 let deckCalibrating = false;   // an overdub-latency calibration is in flight (clicks playing)
+let deckClickDraft = null;     // the editable metronome config for a NEW take (last-used default)
 let stemSettingsDebounce = null;
 
 function recompute() {
@@ -130,6 +132,7 @@ function resetTapeDeckUi() {
   deckRecordingGroup = null;
   deckInputs = null;
   deckSelectedInputId = null;
+  deckClickDraft = null;
   clearTimeout(stemSettingsDebounce);
 }
 
@@ -173,6 +176,13 @@ function tapeDeckViewModel(active) {
   const routing = normalizeRouting(deckRouting, freeSlotKeys, maxCapture);
   deckRouting = routing; // cache the normalized routing so onSetRoutingSlot swaps off it
 
+  // Metronome config: editable for a new take (the last-used draft), read-only once the
+  // take has audio (its tempo is locked and every overdub reuses it).
+  const clickLocked = !pendingNewTake && filledSlotKeys.length > 0;
+  const clickConfig = clickLocked
+    ? ((loadedTake && loadedTake.click) || defaultClickConfig())
+    : (deckClickDraft || readClickDefault());
+
   return {
     songId: active ? active.id : null,
     path: active ? takeModel.tapeDeckRef(active.id).path : '',
@@ -206,6 +216,8 @@ function tapeDeckViewModel(active) {
     canBounceTracks: !deckRecording && !deckBouncing && filledSlotKeys.length >= 2,
     showStrips: deckRecording || !!loadedTake,
     showLoadedActions: !deckRecording && !!loadedTake,
+    clickConfig,
+    clickLocked,
   };
 }
 
@@ -588,6 +600,22 @@ function writeLatency(deviceId, obj) {
 function getMonitorLatencyMs() { return readLatency(deckSelectedInputId).ms; }
 function getMonitorLatencySec() { return getMonitorLatencyMs() / 1000; }
 
+// The last-used metronome config for a NEW take (a take carries its own tempo, so this is
+// only a UI default, not a scoped value). Absent = "default ON": the click starts enabled
+// the first time, but the schema default (defaultClickConfig) stays OFF so a legacy take
+// never gains a click on read.
+const CLICK_KEY = 'sn_tape_click';
+function readClickDefault() {
+  try {
+    const raw = localStorage.getItem(CLICK_KEY);
+    if (raw) return clampClickConfig(JSON.parse(raw));
+  } catch { /* ignore */ }
+  return clampClickConfig({ ...defaultClickConfig(), enabled: true });
+}
+function writeClickDefault(cfg) {
+  try { localStorage.setItem(CLICK_KEY, JSON.stringify(cfg)); } catch { /* ignore */ }
+}
+
 // The audioEngine controller — created once, lazily (an AudioContext needs a
 // user gesture), and never rebuilt. Its callbacks write into whatever DOM nodes
 // `tapeLive` currently points at (refreshed every render by tapeView, exactly
@@ -647,15 +675,40 @@ async function handleDeckStatus(s) {
 
 async function finalizeStoppedTake(s, message) {
   deckRecording = false;
+  const passGroup = deckRecordingGroup;
+  let emptied = false;
   if (deckManifest && deckManifest.slug === s.slug) {
-    // finalizePass sets this pass's per-slot durations, recomputes the take length,
-    // and flips it active. Passes stay within one take now, so there's no take menu —
-    // the just-finished take simply loads.
-    deckManifest = takeModel.finalizePass(deckManifest, s.take, s.slotDurations || {});
+    const captured = (s.durationSec || 0) > 0;
+    if (!captured && passGroup != null) {
+      // Nothing was committed this pass — e.g. Stop during the count-in, before the
+      // capture gate opened. Free the just-armed slots instead of leaving 0-length
+      // stems: discard this group, then either re-activate the take (earlier passes
+      // survive) or tombstone it if that leaves no audio at all.
+      deckManifest = takeModel.discardGroup(deckManifest, s.take, passGroup);
+      const take = deckManifest.takes.find((t) => t.take === s.take);
+      if (take && takeModel.takeHasAudio(take)) {
+        deckManifest = takeModel.finalizePass(deckManifest, s.take, {}); // 'recording' -> 'active', keep earlier tracks
+      } else {
+        deckManifest = takeModel.discardTake(deckManifest, s.take);
+        emptied = true;
+      }
+      takeStore.deleteSlotFiles(s.slug, s.take, s.slotKeys || []).catch(() => {}); // best-effort: drop the empty header-only WAVs
+    } else {
+      // finalizePass sets this pass's per-slot durations, recomputes the take length,
+      // and flips it active. Passes stay within one take now, so there's no take menu —
+      // the just-finished take simply loads.
+      deckManifest = takeModel.finalizePass(deckManifest, s.take, s.slotDurations || {});
+    }
     await takeStore.writeManifest(manifestPath(s.slug), deckManifest);
   }
-  currentTake = s.take;
-  deckPendingNewTake = false;
+  if (emptied) {
+    const kept = takeModel.mostRecentKeptTake(deckManifest);
+    currentTake = kept ? kept.take : null;
+    deckPendingNewTake = currentTake == null;
+  } else {
+    currentTake = s.take;
+    deckPendingNewTake = false;
+  }
   deckRecordingSlotKeys = [];
   deckRecordingGroup = null;
   deckStatus = message ? { type: 'warn', message } : null;
@@ -698,6 +751,10 @@ async function armRecording() {
   // The take's already-recorded tracks play as backing while overdubbing (empty for
   // a first pass); latency-aligned via the measured monitor round-trip.
   const existingTracks = (baseTake ? takeModel.filledSlotKeys(baseTake) : []).map((k) => ({ meta: baseTake.stems[k] }));
+  // The metronome config for this pass: the new-take draft for a first pass, else the
+  // take's locked config (overdubs share the take's tempo). Drives the count-in + click
+  // AND is stamped onto the take at creation.
+  const clickCfg = isNew ? (deckClickDraft || readClickDefault()) : (baseTake && baseTake.click);
 
   let started = false;
   try {
@@ -707,6 +764,7 @@ async function armRecording() {
       routing,
       monitorLatencySec: getMonitorLatencySec(),
       existingTracks,
+      clickConfig: clickCfg,
       onPassOpen: async (capture, sampleRate) => {
         // Resolve this pass's destination slots from the routing (dedup, cap at the
         // real captured channel count, only into free slots).
@@ -716,7 +774,7 @@ async function armRecording() {
         if (isNew) {
           takeNo = takeModel.nextTakeNumber(deckManifest);
           group = 1;
-          deckManifest = takeModel.appendTake(deckManifest, takeModel.makeTake({ take: takeNo, sampleRate }, nowISO()));
+          deckManifest = takeModel.appendTake(deckManifest, takeModel.makeTake({ take: takeNo, sampleRate, click: clickCfg }, nowISO()));
         } else {
           takeNo = currentTake;
           group = takeModel.nextGroup(baseTake);
@@ -1111,6 +1169,7 @@ const handlers = {
       if (stale()) return;
 
       deckManifest = manifest;
+      deckClickDraft = readClickDefault();
       const kept = takeModel.mostRecentKeptTake(manifest);
       currentTake = kept ? kept.take : null;
 
@@ -1141,11 +1200,22 @@ const handlers = {
       deckPendingNewTake = true;
       currentTake = null;
       deckRouting = takeModel.defaultRouting(takeModel.STEM_KEYS.slice(), takeModel.MAX_TRACKS);
+      deckClickDraft = readClickDefault();
       deckStatus = null;
       render();
     },
 
     onArmRecordPass: () => armRecording(),
+
+    // Edit the new-take metronome draft (BPM/meter/subdivision/accent/on-off), persisted
+    // as the last-used default. A patch that changes the time signature re-clamps the
+    // accent index to the new meter's option list (clampClickConfig).
+    onSetClick: (patch) => {
+      const next = clampClickConfig({ ...(deckClickDraft || readClickDefault()), ...patch });
+      deckClickDraft = next;
+      writeClickDefault(next);
+      render();
+    },
 
     // Reassign one input's destination slot, swapping with whichever input held it
     // (keeps the routing a bijection over the free slots). deckRouting is the

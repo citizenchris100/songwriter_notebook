@@ -18,6 +18,11 @@
 //
 // Mono forever: every track file is a single mono channel and the master bounce
 // sums to one mono channel. There is no stereo/panning concept anywhere.
+//
+// A take also carries a per-take metronome `click` config (clickModel.js is pure too,
+// so this stays node-importable): the take's tempo/meter, set on its first pass and
+// reused by every overdub pass.
+import { clampClickConfig, defaultClickConfig } from './clickModel.js';
 
 const str = (x) => (typeof x === 'string' ? x : '');
 const isNum = (x) => typeof x === 'number' && isFinite(x);
@@ -179,6 +184,7 @@ export function makeTake(fields, now) {
     sampleRate: fields.sampleRate,
     stems: { stem1: null, stem2: null, stem3: null, stem4: null },
     bounce: null,
+    click: fields.click ? clampClickConfig(fields.click) : defaultClickConfig(),
   };
 }
 
@@ -356,7 +362,15 @@ export function validateTake(t) {
     else {
       if (typeof t.bounce.file !== 'string' && t.bounce.file !== null) errors.push('bounce file must be a string or null');
       if ('bouncedAt' in t.bounce && typeof t.bounce.bouncedAt !== 'string') errors.push('bounce bouncedAt must be a string');
-      if ('lufs' in t.bounce && !isNum(t.bounce.lufs)) errors.push('bounce lufs must be a number');
+      if ('lufs' in t.bounce && t.bounce.lufs !== null && !isNum(t.bounce.lufs)) errors.push('bounce lufs must be a number or null'); // normalizeBounce emits null for a silent mix — accept it (else reopen wipes the take history)
+    }
+  }
+  // `click` is an additive field: absent on legacy takes (accepted, defaulted on read).
+  if (t.click !== null && t.click !== undefined) {
+    if (typeof t.click !== 'object' || Array.isArray(t.click)) errors.push('take click must be an object or null');
+    else {
+      if (typeof t.click.enabled !== 'boolean') errors.push('click enabled must be a boolean');
+      for (const f of ['bpm', 'timeSigIndex', 'subdivision', 'accentIndex']) if (!isNum(t.click[f])) errors.push('click ' + f + ' must be a number');
     }
   }
   return { ok: errors.length === 0, errors };
@@ -378,6 +392,12 @@ function normalizeBounce(b) {
   return (b && typeof b === 'object')
     ? { file: typeof b.file === 'string' ? b.file : null, bouncedAt: str(b.bouncedAt), lufs: isNum(b.lufs) ? b.lufs : null }
     : null;
+}
+
+// A legacy take has no `click`, so it normalizes to the DISABLED default — overdubbing an
+// old take adds no click, matching its click-less first pass.
+function normalizeClick(c) {
+  return (c && typeof c === 'object' && !Array.isArray(c)) ? clampClickConfig(c) : defaultClickConfig();
 }
 
 export function normalizeTake(t) {
@@ -414,6 +434,7 @@ export function normalizeTake(t) {
     sampleRate: isNum(t.sampleRate) ? t.sampleRate : 48000,
     stems,
     bounce: normalizeBounce(t.bounce),
+    click: normalizeClick(t.click),
   };
 }
 

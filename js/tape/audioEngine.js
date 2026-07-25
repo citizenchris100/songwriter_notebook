@@ -14,6 +14,7 @@ import {
   EQ_BANDS, LIMITER_CEILING_DB, defaultStemSettings,
 } from './takeModel.js';
 import { detectClickSample, rttSeconds, summarizeTrials } from './latency.js';
+import { makeClick } from './click.js';
 
 const BOUNCE_RATE = 48000;
 
@@ -93,6 +94,15 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
   let recordMeta = null;      // { slug, take, sampleRate, slotKeys, overdub, cleanup }
   let playChains = null;      // { slug, take, sumBus, stems: { stem1: {buffer, chain, activeSource}|null, ... } }
   let monitorGraph = null;    // overdub backing playback during a pass: { sumBus, sources: [] }
+  let clickEngine = null;     // the record-only metronome (count-in + click), null when off
+
+  // Stop + tear down the metronome click. Idempotent; called on Stop AND every teardown
+  // path (interruption/dispose) so the click can never outlive a recording pass.
+  function stopClick() {
+    if (!clickEngine) return;
+    try { clickEngine.stop(); } catch { /* already stopped */ }
+    clickEngine = null;
+  }
 
   if (onWriteError) {
     takeStore.onWriteError((message) => {
@@ -151,7 +161,7 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
   // existingTracks: [{ meta }] of the take's already-recorded slots to monitor (empty
   // for a take's first pass). monitorLatencySec: the measured round-trip to align
   // the overdub (0 disables the gate — a first pass records from sample 0).
-  async function record({ slug, deviceId, routing, monitorLatencySec = 0, existingTracks = [], onPassOpen }) {
+  async function record({ slug, deviceId, routing, monitorLatencySec = 0, existingTracks = [], clickConfig = null, onPassOpen }) {
     const acquired = await devices.acquireForRecording(deviceId);
     if (!acquired.ok) { onStatus && onStatus({ type: 'blocked' }); return { ok: false, denied: true }; }
     mediaStream = acquired.stream;
@@ -171,6 +181,7 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
     const take = passInfo.take;
     const slotKeys = (passInfo.slotKeys && passInfo.slotKeys.length ? passInfo.slotKeys : routeKeys).slice(0, capture);
     const overdub = !!(existingTracks && existingTracks.length);
+    const clickEnabled = !!(clickConfig && clickConfig.enabled);
 
     // Pre-load the backing buffers BEFORE choosing startAt, so the scheduled start
     // is always in the future no matter how long the OPFS reads take.
@@ -184,10 +195,11 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
     const node = new AudioWorkletNode(audioCtx, 'capture-processor', {
       numberOfInputs: 1, numberOfOutputs: 1,
       channelCount: capture, channelCountMode: 'explicit', channelInterpretation: 'discrete',
-      // beginFrame Infinity for an overdub: the gate stays shut until we send the
-      // real begin frame AFTER the backing playback is scheduled (below), so setup
-      // latency can never desync the two. A first pass records from frame 0.
-      processorOptions: { channelCount: capture, slots: slotNums, beginFrame: overdub ? Number.MAX_SAFE_INTEGER : 0 },
+      // beginFrame Infinity keeps the gate shut until we send the real begin frame AFTER
+      // the count-in / backing playback is scheduled (below), so setup latency can never
+      // desync them. Needed for an overdub AND for a click-enabled first pass (its gate
+      // opens at the count-in's downbeat). A click-off first pass records from frame 0.
+      processorOptions: { channelCount: capture, slots: slotNums, beginFrame: (overdub || clickEnabled) ? Number.MAX_SAFE_INTEGER : 0 },
     });
     workletNode = node;
 
@@ -221,12 +233,37 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
     for (const key of slotKeys) files[key] = stemFileName(slug, take, key);
     await takeStore.openTakeFiles('takes/' + slug + '/', files, header, SIZE_FIELDS);
 
-    // Everything is wired; NOW pick a common t=0 in the near future, start the
-    // backing playback there, and open the capture gate one round-trip later.
-    if (overdub) {
+    // Everything is wired; NOW pick a common t=0 in the near future. If a click is on,
+    // run a 2-bar count-in from there and treat its first recorded downbeat as the
+    // musical t=0; the backing (overdub) starts at that downbeat and the capture gate
+    // opens one round-trip later. Click-off keeps today's behavior exactly (a click-off
+    // first pass took the beginFrame:0 immediate path above and skips this block).
+    if (overdub || clickEnabled) {
       const startAt = audioCtx.currentTime + 0.15;
-      startMonitorFromBuffers(monitorItems, startAt);
-      const beginFrame = Math.round((startAt + (monitorLatencySec || 0)) * audioCtx.sampleRate);
+      let musicStart = startAt; // ctx time of the first RECORDED bar's downbeat
+
+      if (clickEnabled) {
+        clickEngine = makeClick(audioCtx, audioCtx.destination);
+        const info = clickEngine.start({
+          bpm: clickConfig.bpm,
+          timeSigIndex: clickConfig.timeSigIndex,
+          subdivision: clickConfig.subdivision,
+          accentIndex: clickConfig.accentIndex,
+          startAt,
+          countInBars: 2,
+        });
+        musicStart = info.musicStartTime;
+      }
+
+      if (overdub) startMonitorFromBuffers(monitorItems, musicStart);
+      // A click-on first pass compensates by the SAME monitor round-trip as an overdub. The
+      // per-take click is a persistent grid and an overdub's click is locked on, so the
+      // performer follows the click on BOTH passes; shifting the gate identically means a
+      // click-following take lands the same on the first pass and every later overdub (no
+      // inter-track flam). Uncalibrated => monitorLatencySec 0 => no shift, as before. A
+      // click-off overdub keeps its existing shift; a click-off first pass never reaches here.
+      const shift = (overdub || clickEnabled) ? (monitorLatencySec || 0) : 0;
+      const beginFrame = Math.round((musicStart + shift) * audioCtx.sampleRate);
       node.port.postMessage({ op: 'begin', beginFrame });
     }
 
@@ -262,6 +299,7 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
     if (!recording) return null;
     recording = false;
     if (recordMeta && recordMeta.cleanup) recordMeta.cleanup();
+    stopClick(); // silence the metronome the instant Stop is hit, before the flush wait
 
     // Snapshot the node: a stray late ack must never touch whatever `workletNode`
     // the outer closure points at BY THEN (a subsequent record() may have
@@ -298,6 +336,7 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
   }
 
   function teardownCaptureGraph() {
+    stopClick();
     stopMonitor();
     if (mediaStream) { mediaStream.getTracks().forEach((t) => t.stop()); mediaStream = null; }
     if (workletNode) { try { workletNode.disconnect(); } catch { /* already disconnected */ } workletNode = null; }

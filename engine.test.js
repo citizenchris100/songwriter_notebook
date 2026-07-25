@@ -42,6 +42,10 @@ import {
   detectClickSample, rttSeconds, median, summarizeTrials, isPlausibleRtt,
   PLAUSIBLE_RTT_MIN, PLAUSIBLE_RTT_MAX,
 } from './js/tape/latency.js';
+import {
+  TIME_SIGS, SUBS, MIN_BPM, MAX_BPM, computeLevels, accentGroups,
+  barSeconds, countInSeconds, defaultAccentIndex, defaultClickConfig, clampClickConfig,
+} from './js/tape/clickModel.js';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const readJSON = (p) => JSON.parse(readFileSync(here(p), 'utf8'));
@@ -833,8 +837,63 @@ ok('summarizeTrials fails on all-silent trials', !summarizeTrials([null, null, n
 // ============================================================================
 // 18. Tape deck — sw.js caches every new module (tape/… asset-list assertion)
 // ============================================================================
-for (const f of ['tape/takeModel', 'tape/wav', 'tape/lufs', 'tape/limiter', 'tape/latency', 'tape/audioEngine', 'tape/takeStore', 'tape/opfsWorker', 'tape/captureProcessor', 'tape/devices', 'tape/tapeView']) {
+for (const f of ['tape/takeModel', 'tape/clickModel', 'tape/click', 'tape/wav', 'tape/lufs', 'tape/limiter', 'tape/latency', 'tape/audioEngine', 'tape/takeStore', 'tape/opfsWorker', 'tape/captureProcessor', 'tape/devices', 'tape/tapeView']) {
   ok('sw.js caches ' + f + '.js', sw.includes(`"./js/${f}.js"`));
+}
+
+// ============================================================================
+// 19. Metronome click model (the tape deck's per-take click track)
+// ============================================================================
+// Ported time-sig / subdivision / BPM tables match the standalone app.
+eq('clickModel has 16 time sigs', TIME_SIGS.length, 16);
+eq('clickModel BPM range', MIN_BPM + '-' + MAX_BPM, '20-300');
+eq('clickModel has 4 subdivisions', SUBS.length, 4);
+
+// computeLevels turns a meter+accent into per-beat tiers (2 downbeat / 1 group / 0 beat).
+eq('4/4 "On" accents only the downbeat', computeLevels(2, 1).join(','), '2,0,0,0');
+eq('4/4 "Off" has no accents', computeLevels(2, 0).join(','), '0,0,0,0');
+// 7/8 (index 7) grouped 3+2+2 (accent index 4) -> downbeat + two group starts.
+eq('7/8 3+2+2 tiers', computeLevels(7, 4).join(','), '2,0,0,1,0,1,0');
+eq('accentGroups parses a compound grouping', accentGroups('3+2+2', 7).join(','), '3,2,2');
+eq('accentGroups "Off" is null', accentGroups('Off', 4), null);
+
+// Count-in length is 2 bars of beats; subdivision does not change it.
+eq('4/4 @120 bar is 2s', barSeconds(120, 2), 2);
+eq('2-bar count-in @120 4/4 is 4s', countInSeconds(120, 2), 4);
+eq('2-bar count-in @60 3/4 is 6s', countInSeconds(60, 1), 6);
+
+// clampClickConfig: schema baseline is DISABLED; clamps every field into range.
+eq('defaultClickConfig is disabled', defaultClickConfig().enabled, false);
+const cc = clampClickConfig({ enabled: true, bpm: 999, timeSigIndex: 99, subdivision: 9, accentIndex: 50 });
+eq('clamp bpm to max', cc.bpm, 300);
+eq('clamp bpm to min', clampClickConfig({ bpm: 1 }).bpm, 20);
+eq('clamp timeSigIndex into range', cc.timeSigIndex, 15);
+eq('clamp subdivision into range', cc.subdivision, 4);
+ok('clamp keeps enabled', cc.enabled === true);
+// A stranded accentIndex (too big for the selected meter) falls back to that meter's default.
+eq('out-of-range accent falls back to default', clampClickConfig({ timeSigIndex: 2, accentIndex: 9 }).accentIndex, defaultAccentIndex(2));
+eq('valid accent is kept', clampClickConfig({ timeSigIndex: 7, accentIndex: 4 }).accentIndex, 4);
+
+// ============================================================================
+// 20. Take schema carries the per-take click config (additive, defaulted on read)
+// ============================================================================
+const clickTake = makeTake({ take: 1, sampleRate: 48000, click: { enabled: true, bpm: 96, timeSigIndex: 3, subdivision: 2, accentIndex: 2 } }, '2026-07-25T00:00:00Z');
+eq('makeTake stores the click bpm', clickTake.click.bpm, 96);
+eq('makeTake stores click enabled', clickTake.click.enabled, true);
+eq('makeTake without a click defaults to disabled', makeTake({ take: 2, sampleRate: 48000 }, '2026-07-25T00:00:00Z').click.enabled, false);
+// A legacy take with NO click field normalizes to the disabled default (no click gained).
+const legacy = normalizeTake({ take: 3, status: 'active', createdAt: 'x', sampleRate: 48000, stems: { stem1: { file: 'a.wav', group: 1, durationSec: 1, vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0 }, stem2: null, stem3: null, stem4: null }, bounce: null });
+eq('legacy take normalizes click to disabled', legacy.click.enabled, false);
+ok('legacy take click has a bpm', typeof legacy.click.bpm === 'number');
+// validateTake accepts an absent click and a well-formed one, rejects a malformed one.
+ok('validateTake ok with no click', validateTake({ take: 4, status: 'active', createdAt: 'x', durationSec: null, sampleRate: 48000, stems: { stem1: null, stem2: null, stem3: null, stem4: null }, bounce: null }).ok);
+ok('validateTake rejects a bad click', !validateTake({ take: 5, status: 'active', createdAt: 'x', durationSec: null, sampleRate: 48000, stems: { stem1: null, stem2: null, stem3: null, stem4: null }, bounce: null, click: { enabled: 'yes', bpm: 'fast' } }).ok);
+// Regression: a silent-mix bounce has lufs:null (normalizeBounce emits it); validateTake must
+// accept it, else reopening the deck wipes the whole take history.
+{
+  const silentBounce = { take: 6, status: 'active', createdAt: 'x', durationSec: 1, sampleRate: 48000, stems: { stem1: { file: 'a.wav', group: 1, durationSec: 1, vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0 }, stem2: null, stem3: null, stem4: null }, bounce: { file: 'm.wav', bouncedAt: 'x', lufs: null } };
+  ok('validateTake accepts a bounce lufs:null', validateTake(silentBounce).ok);
+  ok('normalize->validate round-trips a silent bounce', validateManifest(normalizeManifest({ schemaVersion: 2, slug: 's', takes: [silentBounce] })).ok);
 }
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');

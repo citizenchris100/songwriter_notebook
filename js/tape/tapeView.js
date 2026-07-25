@@ -16,6 +16,7 @@
 // registration per render, exactly like the sketches player.
 import { h } from '../dom.js';
 import { STEM_KEYS } from './takeModel.js';
+import { TIME_SIGS, SUBS, countInSeconds } from './clickModel.js';
 
 const STEM_LABELS = { stem1: 'Track 1', stem2: 'Track 2', stem3: 'Track 3', stem4: 'Track 4' };
 
@@ -35,7 +36,7 @@ export function buildDeckView(deck, handlers, songName) {
   const {
     onCloseTapeDeck, onNewTake, onArmRecordPass, onSetRoutingSlot, onStopTake,
     onDiscardLastGroup, onBounceStemToTrack, onBounceTake, onDeleteTake, onSelectTake,
-    onSelectInput, onSetMonitorLatency, onCalibrateLatency, onPreviewStemSetting, onSetStemSetting, onShareTake,
+    onSelectInput, onSetMonitorLatency, onCalibrateLatency, onSetClick, onPreviewStemSetting, onSetStemSetting, onShareTake,
     onPlayTake, onReplayTake, onStopPlayTake,
   } = handlers;
 
@@ -76,7 +77,7 @@ export function buildDeckView(deck, handlers, songName) {
   }
 
   // ---- transport ----
-  const transport = transportSection(deck, { onNewTake, onArmRecordPass, onSetRoutingSlot, onSetMonitorLatency, onCalibrateLatency, onStopTake, onPlayTake, onReplayTake, onStopPlayTake, songId: deck.songId });
+  const transport = transportSection(deck, { onNewTake, onArmRecordPass, onSetRoutingSlot, onSetMonitorLatency, onCalibrateLatency, onSetClick, onStopTake, onPlayTake, onReplayTake, onStopPlayTake, songId: deck.songId });
   wrap.appendChild(transport.el);
   live.timerEl = transport.timerEl;
   live.meterEls = transport.meterEls;
@@ -121,6 +122,7 @@ function armPanel(deck, ctx) {
   // shifts a new track earlier to cancel the interface's round-trip delay so it
   // lands in time. Only relevant once there are tracks to play under the new one.
   if (deck.filledCount > 0) box.appendChild(latencyPanel(deck, ctx));
+  box.appendChild(clickCard(deck, ctx));
   const recBtn = h('button', 'btn primary grow', '● Record');
   recBtn.disabled = !!(deck.blocked || deck.unsupported || maxCap < 1);
   recBtn.addEventListener('click', () => ctx.onArmRecordPass());
@@ -151,6 +153,60 @@ function latencyPanel(deck, ctx) {
   row.append(latIn, calBtn);
   box.appendChild(row);
   box.appendChild(h('div', 'feel-empty', 'Loop the EVO output to input 1 (or hold the mic to your headphones), then Calibrate. Or type a value if you already know it.'));
+  return box;
+}
+
+// The per-take metronome config: a 2-bar count-in + a click during recording, at a BPM
+// (and full time-sig/subdivision/accent options matching the standalone metronome). The
+// tempo is a property of the TAKE — editable for a new take, read-only once the take has
+// audio, since every overdub pass must share the take's tempo.
+function clickCard(deck, ctx) {
+  const cfg = deck.clickConfig || { enabled: false, bpm: 120, timeSigIndex: 2, subdivision: 1, accentIndex: 1 };
+  const box = h('div', 'col armpanel clickcard');
+  const sig = TIME_SIGS[cfg.timeSigIndex] || TIME_SIGS[2];
+
+  if (deck.clickLocked) {
+    const summary = cfg.enabled
+      ? 'Click: ' + cfg.bpm + ' BPM · ' + sig.label + ' · ' + ((SUBS[cfg.subdivision - 1] || SUBS[0]).name) + ' · ' + (sig.accents[cfg.accentIndex] || 'On')
+      : 'Click: off';
+    box.appendChild(h('div', 'subtitle', summary + ' — locked to this take'));
+    return box;
+  }
+
+  box.appendChild(h('div', 'subtitle', 'Metronome'));
+  const toggle = h('button', 'btn mini' + (cfg.enabled ? ' primary' : ''), cfg.enabled ? 'Click: On' : 'Click: Off');
+  toggle.addEventListener('click', () => ctx.onSetClick({ enabled: !cfg.enabled }));
+  box.appendChild(rowOf(toggle));
+
+  if (cfg.enabled) {
+    const numRow = (label, cfgKey, min, max, val) => {
+      const row = h('div', 'row routerow');
+      row.appendChild(h('span', 'lbl', label));
+      const inp = h('input', 'tapedial-range');
+      inp.type = 'number'; inp.min = String(min); inp.max = String(max); inp.step = '1'; inp.value = String(val);
+      inp.style.width = '5rem';
+      inp.addEventListener('change', () => ctx.onSetClick({ [cfgKey]: Number(inp.value) }));
+      row.appendChild(inp);
+      return row;
+    };
+    const selRow = (label, options, value, cfgKey) => {
+      const row = h('div', 'row routerow');
+      row.appendChild(h('span', 'lbl', label));
+      const sel = h('select');
+      options.forEach(([v, text]) => { const o = h('option', null, text); o.value = String(v); sel.appendChild(o); });
+      sel.value = String(value);
+      sel.addEventListener('change', () => ctx.onSetClick({ [cfgKey]: Number(sel.value) }));
+      row.appendChild(sel);
+      return row;
+    };
+
+    box.appendChild(numRow('BPM', 'bpm', 20, 300, cfg.bpm));
+    box.appendChild(selRow('Time sig', TIME_SIGS.map((m, i) => [i, m.label]), cfg.timeSigIndex, 'timeSigIndex'));
+    box.appendChild(selRow('Subdivision', SUBS.map((s) => [s.n, s.name]), cfg.subdivision, 'subdivision'));
+    box.appendChild(selRow('Accent', sig.accents.map((name, i) => [i, name]), Math.min(cfg.accentIndex, sig.accents.length - 1), 'accentIndex'));
+    box.appendChild(h('div', 'feel-empty', '2-bar count-in ≈ ' + countInSeconds(cfg.bpm, cfg.timeSigIndex).toFixed(1) + ' s before recording starts.'));
+  }
+
   return box;
 }
 
