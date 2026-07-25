@@ -24,6 +24,7 @@ import { isAcceptedAudio, makeSketchMeta, addSketchMeta, removeSketchMeta, setSk
 import * as audioStore from './audioStore.js';
 import { chordFromRootAndQuality } from './theory/roman.js';
 import * as takeModel from './tape/takeModel.js';
+import * as meterModel from './tape/meterModel.js';
 import { clampClickConfig, defaultClickConfig } from './tape/clickModel.js';
 import * as takeStore from './tape/takeStore.js';
 import { SIZE_FIELDS } from './tape/wav.js';
@@ -87,7 +88,9 @@ let deckArming = false;        // synchronous re-entrancy guard for the Record b
 let deckBouncing = false;
 let deckOpenSeq = 0;           // bumped on every onOpenTapeDeck call; a stale in-flight open detects itself via this
 let deckPendingNewTake = false; // a "+ New take" container awaiting its first pass (materialized lazily at Record)
-let deckRouting = [];           // input-channel index -> destination slot key, for the next pass (normalized each render)
+let deckArmed = [];             // [{ slotKey, inputIndex }] — REC-armed strips for the next pass (normalized each render)
+let deckPanelOpen = null;       // 'click' | 'cal' | 'share' | null — which flip-panel is open (UI-local, not persisted)
+let deckLogOpen = false;        // TAPE LOG <details> open state (UI-local; the <details> reflects it, no render on toggle)
 let deckRecordingSlotKeys = []; // the in-flight pass's destination slot keys (meter routing + finalize)
 let deckRecordingGroup = null;  // the in-flight pass's group number
 let deckInputs = null;         // devices.probe() result: { inputs, preselectedId, warnMoreThanMax, isLikelyInterface, channels }
@@ -127,7 +130,9 @@ function resetTapeDeckUi() {
   deckBouncing = false;
   deckCalibrating = false;
   deckPendingNewTake = false;
-  deckRouting = [];
+  deckArmed = [];
+  deckPanelOpen = null;
+  deckLogOpen = false;
   deckRecordingSlotKeys = [];
   deckRecordingGroup = null;
   deckInputs = null;
@@ -139,19 +144,27 @@ function resetTapeDeckUi() {
 // The tape-deck slice of the view-model — see js/tape/tapeView.js for the shape
 // this feeds. Cheap to compute even when the deck isn't open (deckManifest is
 // null until onOpenTapeDeck loads it, so `takes` is just []).
-// Normalize the input->slot routing into a valid bijection over the free slots,
-// length maxCapture, honoring the user's choices where still valid. Recomputed each
-// render and cached back into deckRouting so onSetRoutingSlot's swap works off the
-// same array the UI is showing.
-function normalizeRouting(prev, freeKeys, maxCapture) {
-  const used = new Set();
+//
+// Normalize the ARMED set [{slotKey, inputIndex}] against the take's actually-free
+// slots and the interface's real input count: drop entries whose slot is no longer
+// free, reassign an input index that's out of range or collides to the lowest free
+// input, dedupe, and cap at maxCapture. Recomputed each render and cached back into
+// deckArmed so onArmTrack/onCycleInput act off the same array the UI shows. NO
+// autofill — arming is explicit (tap REC), unlike the old routing model.
+function normalizeArmed(prev, freeKeys, channels, maxCapture) {
   const out = [];
-  for (let i = 0; i < maxCapture; i++) {
-    let k = prev[i];
-    if (!freeKeys.includes(k) || used.has(k)) k = freeKeys.find((f) => !used.has(f));
-    if (k == null) break;
-    out.push(k);
-    used.add(k);
+  const usedInputs = new Set();
+  for (const a of (prev || [])) {
+    if (!a || !freeKeys.includes(a.slotKey)) continue;            // slot no longer free
+    if (out.some((x) => x.slotKey === a.slotKey)) continue;       // dedupe slots
+    if (out.length >= maxCapture) break;                          // capacity (min inputs/free/4)
+    let idx = a.inputIndex;
+    if (!(idx >= 0 && idx < channels) || usedInputs.has(idx)) {   // out of range or taken -> lowest free input
+      idx = 0; while (idx < channels && usedInputs.has(idx)) idx++;
+      if (idx >= channels) continue;                              // no free input left
+    }
+    usedInputs.add(idx);
+    out.push({ slotKey: a.slotKey, inputIndex: idx });
   }
   return out;
 }
@@ -173,8 +186,27 @@ function tapeDeckViewModel(active) {
   const inputChannels = (deckInputs && deckInputs.channels) || 1;
   const freeSlots = freeSlotKeys.length;
   const maxCapture = Math.min(inputChannels, freeSlots, takeModel.MAX_TRACKS);
-  const routing = normalizeRouting(deckRouting, freeSlotKeys, maxCapture);
-  deckRouting = routing; // cache the normalized routing so onSetRoutingSlot swaps off it
+
+  // Normalize + cache the armed set (drops slots that filled, reassigns stale inputs).
+  const armed = normalizeArmed(deckArmed, freeSlotKeys, inputChannels, maxCapture);
+  deckArmed = armed;
+  const armedByKey = {};
+  armed.forEach((a) => { armedByKey[a.slotKey] = a.inputIndex; });
+
+  // Per-strip state for the four ALWAYS-present strips (precedence: recording > armed >
+  // filled > empty). The view renders every strip; empty ones are grayed/disabled.
+  const recordingSet = new Set(deckRecordingSlotKeys);
+  const strips = {};
+  takeModel.STEM_KEYS.forEach((key) => {
+    const stem = (loadedTake && loadedTake.stems) ? loadedTake.stems[key] : null;
+    const hasAudio = takeModel.slotHasAudio(stem);
+    let state;
+    if (recordingSet.has(key)) state = 'recording';
+    else if (armedByKey[key] != null) state = 'armed';
+    else if (hasAudio) state = 'filled';
+    else state = 'empty';
+    strips[key] = { state, inputIndex: armedByKey[key] != null ? armedByKey[key] : null, stem: hasAudio ? stem : null };
+  });
 
   // Metronome config: editable for a new take (the last-used draft), read-only once the
   // take has audio (its tempo is locked and every overdub reuses it).
@@ -183,10 +215,14 @@ function tapeDeckViewModel(active) {
     ? ((loadedTake && loadedTake.click) || defaultClickConfig())
     : (deckClickDraft || readClickDefault());
 
+  // The number shown in the LED counter window.
+  const counterTakeNo = loadedTake ? loadedTake.take : (pendingNewTake ? takeModel.nextTakeNumber(deckManifest) : (currentTake || null));
+
   return {
     songId: active ? active.id : null,
     path: active ? takeModel.tapeDeckRef(active.id).path : '',
     currentTakeNo: loadedTake ? loadedTake.take : null,
+    counterTakeNo,
     manifestTakes: takes,
     loadedTake,
     pendingNewTake,
@@ -210,14 +246,18 @@ function tapeDeckViewModel(active) {
     freeSlots,
     filledCount: filledSlotKeys.length,
     maxCapture,
-    routing,
+    armed,
+    strips,
     recordingSlotKeys: deckRecordingSlotKeys,
     lastGroupKeys: (loadedTake && !deckRecording) ? takeModel.lastGroupSlotKeys(loadedTake) : [],
     canBounceTracks: !deckRecording && !deckBouncing && filledSlotKeys.length >= 2,
-    showStrips: deckRecording || !!loadedTake,
     showLoadedActions: !deckRecording && !!loadedTake,
     clickConfig,
     clickLocked,
+    masterVol: readMasterVol(),
+    panelOpen: deckPanelOpen,
+    logOpen: deckLogOpen,
+    canRecord: armed.length >= 1 && !deckBlocked && !deckUnsupported && !deckRecording && !deckBouncing,
   };
 }
 
@@ -616,6 +656,19 @@ function writeClickDefault(cfg) {
   try { localStorage.setItem(CLICK_KEY, JSON.stringify(cfg)); } catch { /* ignore */ }
 }
 
+// The master MONITOR volume (D35): an app-level monitor setting, NOT part of any take,
+// never in the manifest, never in the bounce. Persisted like the click default. 0..1.5,
+// default 1.0 (unity), clamped to match the per-track vol range.
+const MASTER_KEY = 'sn_tape_master';
+function clampMasterVol(v) { const n = Number(v); return isFinite(n) ? Math.max(0, Math.min(1.5, n)) : 1.0; }
+function readMasterVol() {
+  try { const raw = localStorage.getItem(MASTER_KEY); if (raw != null) return clampMasterVol(JSON.parse(raw)); } catch { /* ignore */ }
+  return 1.0;
+}
+function writeMasterVol(v) {
+  try { localStorage.setItem(MASTER_KEY, JSON.stringify(clampMasterVol(v))); } catch { /* ignore */ }
+}
+
 // The audioEngine controller — created once, lazily (an AudioContext needs a
 // user gesture), and never rebuilt. Its callbacks write into whatever DOM nodes
 // `tapeLive` currently points at (refreshed every render by tapeView, exactly
@@ -623,33 +676,73 @@ function writeClickDefault(cfg) {
 function ensureTapeDeck() {
   if (tapeDeck) return tapeDeck;
   tapeDeck = makeTapeDeck({
-    onMeter: (m) => {
-      if (tapeLive.timerEl) tapeLive.timerEl.textContent = fmtElapsed(m.frames, m.sampleRate);
-      updateMeterEls(m);
-    },
+    onLevels: applyLevels,
+    onClock: applyClock,
     onStatus: handleDeckStatus,
     onWriteError: (message) => { deckStatus = { type: 'error', message: 'Storage error: ' + message }; render(); },
   });
+  tapeDeck.setMasterVol(readMasterVol()); // apply the persisted monitor level (lands when the ctx opens)
   return tapeDeck;
 }
 
-function fmtElapsed(frames, sampleRate) {
-  const s = Math.floor(frames / (sampleRate || 48000));
+function fmtClock(sec) {
+  const s = Math.max(0, Math.floor(sec || 0));
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
 }
 
-function updateMeterEls(m) {
-  if (!tapeLive.meterEls || !m.peaks) return;
-  // Route each capture channel's peak to its assigned track meter (input->slot
-  // routing), not positional order.
-  const keys = m.slotKeys || deckRecordingSlotKeys;
-  keys.forEach((key, i) => {
-    const el = tapeLive.meterEls[key];
-    if (!el) return;
-    const peak = m.peaks[i] || 0;
-    el.style.width = Math.min(100, Math.round(peak * 100)) + '%';
-    el.classList.toggle('clip', peak > 0.98);
-  });
+// ---- meter merge layer: raw engine peaks (capture 10 Hz + playback/monitor ~12 Hz)
+// -> smoothed, dB-spaced, clip-latched per-strip {lit, clip} the LED ladders consume,
+// via meterModel (pure). Never goes through render(); writes only the live DOM refs. ----
+let meterState = {};    // key ('stem1'..'stem4'|'master') -> { displayed, clip:{clipped,until} }
+let meterLastMs = 0;
+function meterKeyState(k) { return meterState[k] || (meterState[k] = { displayed: 0, clip: { clipped: false, until: 0 } }); }
+function shapeKey(key, peak, nowMs, dtMs) {
+  const st = meterKeyState(key);
+  st.displayed = meterModel.decayPeak(st.displayed, peak, dtMs);
+  st.clip = meterModel.clipState(st.clip, peak, nowMs);
+  return { lit: meterModel.peakToLit(st.displayed, meterModel.METER_SEGMENTS), clip: st.clip.clipped };
+}
+
+function applyLevels(frame) {
+  const nowMs = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  const dtMs = meterLastMs ? (nowMs - meterLastMs) : meterModel.CLIP_HOLD_MS;
+  meterLastMs = nowMs;
+  const recordingSet = new Set(deckRecordingSlotKeys);
+  const perKey = {};
+  const levels = frame.levels || {};
+  for (const key of Object.keys(levels)) {
+    // A strip being recorded takes ONLY its live input (capture); every other strip
+    // takes playback/monitor. This keeps an armed input meter from flickering against
+    // its own (silent) playback tap, and vice-versa.
+    const isRec = recordingSet.has(key);
+    if (isRec && frame.source !== 'capture') continue;
+    if (!isRec && frame.source === 'capture') continue;
+    perKey[key] = shapeKey(key, levels[key].peak, nowMs, dtMs);
+  }
+  let master = null;
+  if (deckRecording) {
+    // No summed node exists during record — approximate the master as the loudest of
+    // this frame's strips (the capture frame carries the armed inputs).
+    if (frame.source === 'capture') {
+      let mp = 0; for (const key of Object.keys(levels)) mp = Math.max(mp, levels[key].peak);
+      master = shapeKey('master', mp, nowMs, dtMs);
+    }
+  } else if (frame.master) {
+    master = shapeKey('master', frame.master.peak, nowMs, dtMs);
+  }
+  if (tapeLive.setLevels) { tapeLive.setLevels(perKey, master); return; }   // new portastudio view
+  // Transitional shim: the pre-overhaul view exposes per-slot .meterfill divs + timerEl.
+  if (tapeLive.meterEls) {
+    for (const key of Object.keys(perKey)) {
+      const el = tapeLive.meterEls[key];
+      if (el) { el.style.width = Math.round(perKey[key].lit * 100) + '%'; el.classList.toggle('clip', perKey[key].clip); }
+    }
+  }
+}
+
+function applyClock(clock) {
+  if (tapeLive.setCounter) { tapeLive.setCounter(clock); return; }          // new portastudio view
+  if (tapeLive.timerEl) tapeLive.timerEl.textContent = fmtClock(clock.elapsedSec); // transitional shim
 }
 
 // The controller's single onStatus slot (registered once, at ensureTapeDeck()).
@@ -711,6 +804,7 @@ async function finalizeStoppedTake(s, message) {
   }
   deckRecordingSlotKeys = [];
   deckRecordingGroup = null;
+  deckArmed = [];             // the just-recorded slots are filled now — clear the arm set
   deckStatus = message ? { type: 'warn', message } : null;
   await refreshSpaceWarning();
   render();
@@ -747,10 +841,18 @@ async function armRecording() {
   const isNew = deckPendingNewTake || currentTake == null;
   const baseTake = isNew ? null : (deckManifest.takes.find((t) => t.take === currentTake) || null);
   const freeKeys = isNew ? takeModel.STEM_KEYS.slice() : (baseTake ? takeModel.freeSlotKeys(baseTake) : []);
-  const routing = (deckRouting && deckRouting.length) ? deckRouting.slice() : takeModel.defaultRouting(freeKeys, takeModel.MAX_TRACKS);
+  // Build the per-CHANNEL routing (indexed by interface input; null = that input isn't
+  // armed to any track, captured only for its meter) from the armed set. Guard: nothing
+  // armed -> nothing to record.
+  const channels = (deckInputs && deckInputs.channels) || 1;
+  const armedNow = normalizeArmed(deckArmed, freeKeys, channels, Math.min(channels, freeKeys.length, takeModel.MAX_TRACKS));
+  if (!armedNow.length) { deckArming = false; return; }
+  const maxIdx = Math.max.apply(null, armedNow.map((x) => x.inputIndex));
+  const routing = new Array(maxIdx + 1).fill(null);
+  armedNow.forEach((x) => { routing[x.inputIndex] = x.slotKey; });
   // The take's already-recorded tracks play as backing while overdubbing (empty for
   // a first pass); latency-aligned via the measured monitor round-trip.
-  const existingTracks = (baseTake ? takeModel.filledSlotKeys(baseTake) : []).map((k) => ({ meta: baseTake.stems[k] }));
+  const existingTracks = (baseTake ? takeModel.filledSlotKeys(baseTake) : []).map((k) => ({ key: k, meta: baseTake.stems[k] }));
   // The metronome config for this pass: the new-take draft for a first pass, else the
   // take's locked config (overdubs share the take's tempo). Drives the count-in + click
   // AND is stamped onto the take at creation.
@@ -766,10 +868,10 @@ async function armRecording() {
       existingTracks,
       clickConfig: clickCfg,
       onPassOpen: async (capture, sampleRate) => {
-        // Resolve this pass's destination slots from the routing (dedup, cap at the
-        // real captured channel count, only into free slots).
+        // Resolve this pass's destination slots from the routing (skip null/discard
+        // channels, dedup, cap at the real captured channel count, only into free slots).
         const slotKeys = [];
-        for (const k of routing) { if (freeKeys.includes(k) && !slotKeys.includes(k) && slotKeys.length < capture) slotKeys.push(k); }
+        for (const k of routing) { if (k && freeKeys.includes(k) && !slotKeys.includes(k) && slotKeys.length < capture) slotKeys.push(k); }
         let takeNo, group;
         if (isNew) {
           takeNo = takeModel.nextTakeNumber(deckManifest);
@@ -1118,6 +1220,9 @@ const handlers = {
       songSubView = 'tapedeck';
       deckStatus = null;
       deckPendingNewTake = false;
+      deckArmed = [];
+      deckPanelOpen = null;
+      deckLogOpen = false;
       deckRecordingSlotKeys = [];
       deckRecordingGroup = null;
       render();
@@ -1190,6 +1295,7 @@ const handlers = {
       songSubView = 'sections';
       if (tapeDeck) tapeDeck.stopPlay();
       deckPendingNewTake = false;
+      deckPanelOpen = null;
       render();
     },
 
@@ -1199,13 +1305,58 @@ const handlers = {
       if (tapeDeck) tapeDeck.stopPlay();
       deckPendingNewTake = true;
       currentTake = null;
-      deckRouting = takeModel.defaultRouting(takeModel.STEM_KEYS.slice(), takeModel.MAX_TRACKS);
+      deckArmed = [];          // nothing armed until the user taps a strip's REC
       deckClickDraft = readClickDefault();
       deckStatus = null;
+      deckPanelOpen = null;
       render();
     },
 
     onArmRecordPass: () => armRecording(),
+
+    // Toggle a strip's record-arm. Arming assigns the lowest interface input not
+    // already claimed by another armed strip; the next render's normalizeArmed enforces
+    // capacity/uniqueness. Only free strips are armable (the view gates the button).
+    onArmTrack: (slotKey) => {
+      if (deckRecording || deckBouncing) return;
+      if (deckArmed.some((a) => a.slotKey === slotKey)) {
+        deckArmed = deckArmed.filter((a) => a.slotKey !== slotKey); // toggle off
+      } else {
+        const channels = (deckInputs && deckInputs.channels) || 1;
+        const used = new Set(deckArmed.map((a) => a.inputIndex));
+        let inputIndex = 0; while (inputIndex < channels && used.has(inputIndex)) inputIndex++;
+        if (inputIndex >= channels) return; // every interface input already assigned
+        deckArmed = deckArmed.concat({ slotKey, inputIndex });
+      }
+      render();
+    },
+
+    // Cycle an armed strip's interface input to the next one, swapping with whichever
+    // strip currently holds that input (keeps inputs unique across armed strips).
+    onCycleInput: (slotKey) => {
+      if (deckRecording || deckBouncing) return;
+      const channels = (deckInputs && deckInputs.channels) || 1;
+      if (channels < 2) return; // only one input — nothing to cycle
+      const me = deckArmed.find((a) => a.slotKey === slotKey);
+      if (!me) return;
+      const next = (me.inputIndex + 1) % channels;
+      const other = deckArmed.find((a) => a.slotKey !== slotKey && a.inputIndex === next);
+      deckArmed = deckArmed.map((a) => {
+        if (a.slotKey === slotKey) return { ...a, inputIndex: next };
+        if (other && a.slotKey === other.slotKey) return { ...a, inputIndex: me.inputIndex }; // swap
+        return a;
+      });
+      render();
+    },
+
+    // Flip-open panels (CLICK / CAL / SHARE) — one open at a time; tapping the open one
+    // closes it. UI-local state, so it must live in the view-model (onSetClick renders).
+    onTogglePanel: (name) => { deckPanelOpen = (deckPanelOpen === name) ? null : name; render(); },
+
+    // TAPE LOG <details> open state. The <details> element reflects `open` in the DOM
+    // itself, so this only records the flag for the next rebuild — no render (which would
+    // fight the native toggle).
+    onToggleTakeLog: (open) => { deckLogOpen = !!open; },
 
     // Edit the new-take metronome draft (BPM/meter/subdivision/accent/on-off), persisted
     // as the last-used default. A patch that changes the time signature re-clamps the
@@ -1214,19 +1365,6 @@ const handlers = {
       const next = clampClickConfig({ ...(deckClickDraft || readClickDefault()), ...patch });
       deckClickDraft = next;
       writeClickDefault(next);
-      render();
-    },
-
-    // Reassign one input's destination slot, swapping with whichever input held it
-    // (keeps the routing a bijection over the free slots). deckRouting is the
-    // normalized array the last render produced (see tapeDeckViewModel).
-    onSetRoutingSlot: (i, key) => {
-      const r = deckRouting.slice();
-      const j = r.findIndex((k, idx) => idx !== i && k === key);
-      const prev = r[i];
-      r[i] = key;
-      if (j >= 0) r[j] = prev; // swap
-      deckRouting = r;
       render();
     },
 
@@ -1250,7 +1388,7 @@ const handlers = {
       await takeStore.writeManifest(manifestPath(a.id), deckManifest);
       takeStore.deleteSlotFiles(a.id, currentTake, keys).catch(() => {}); // metadata first, best-effort delete second
       if (tapeDeck) tapeDeck.stopPlay();
-      deckRouting = takeModel.defaultRouting(keys, takeModel.MAX_TRACKS); // re-arm into exactly the freed slots
+      deckArmed = keys.map((k, i) => ({ slotKey: k, inputIndex: i })); // re-arm exactly the freed slots
       render();
       await armRecording();
     },
@@ -1281,6 +1419,8 @@ const handlers = {
       if (tapeDeck) tapeDeck.stopPlay();
       currentTake = takeNo;
       deckPendingNewTake = false;
+      deckArmed = [];       // a freshly-loaded take starts with nothing armed
+      deckPanelOpen = null;
       render();
     },
 
@@ -1339,6 +1479,12 @@ const handlers = {
       stemSettingsDebounce = setTimeout(() => { if (a) takeStore.writeManifest(manifestPath(a.id), deckManifest).catch(() => {}); }, 300);
       render();
     },
+
+    // Master MONITOR fader (D35/D32 twin): preview on drag applies live gain, no persist,
+    // no render; commit on release persists to localStorage and renders. Never touches the
+    // take/manifest and never affects the bounce.
+    onPreviewMasterVol: (v) => { if (tapeDeck) tapeDeck.setMasterVol(v); },
+    onSetMasterVol: (v) => { writeMasterVol(v); if (tapeDeck) tapeDeck.setMasterVol(v); render(); },
 
     onBounceTake: async () => {
       const a = activeSong();

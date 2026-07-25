@@ -8,6 +8,7 @@
   --muted: #8b93a3;
   --accent: #ff5a3c;
   --accent-soft: #ff7a60;
+  --led: #4f8cff;
   --radius: 14px;
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -213,38 +214,141 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
 .sketch-pstat { font-size: 12px; color: var(--muted); margin-left: 2px; }
 .sketch-notes { margin-top: 0; }
 
-/* ===== Tape deck ===== */
+/* ===== Tape deck — flat portastudio face ===== */
 .tapewrap { display: flex; flex-direction: column; gap: 12px; }
 .tapehead { align-items: center; gap: 12px; }
 .tapetitle { display: flex; flex-direction: column; gap: 2px; }
 .tapetitle .nm { font-size: 15px; font-weight: 700; }
-.tapebanner { border-radius: 10px; padding: 9px 12px; font-size: 13px; font-weight: 600; }
-.tapebanner.warn { background: rgba(255, 122, 96, .12); border: 1px solid var(--accent-soft); color: var(--accent-soft); }
-.tapebanner.err { background: rgba(255, 90, 60, .14); border: 1px solid var(--accent); color: #ff8a7a; }
 
-.tapetransport { align-items: stretch; }
-.tapetimer { font: 700 34px/1 ui-monospace, Menlo, Consolas, monospace; text-align: center; margin: 4px 0 10px; font-variant-numeric: tabular-nums; }
-.tapemeters { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
-.meterrow { display: flex; align-items: center; gap: 8px; }
-.meterlabel { font-size: 11px; color: var(--muted); width: 44px; flex: none; }
-.meterbar { flex: 1 1 auto; height: 10px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--line); overflow: hidden; }
-.meterfill { height: 100%; width: 0%; background: linear-gradient(90deg, #43d39e 0%, #43d39e 70%, var(--accent) 100%); transition: width 60ms linear; }
-.meterfill.clip { background: var(--accent); }
+/* Status strip: compact chips + input picker + a single hint line. */
+.tapestatus { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.tapechip { border-radius: 9px; padding: 6px 10px; font-size: 12px; font-weight: 600; }
+.tapechip.warn { background: rgba(255, 122, 96, .12); border: 1px solid var(--accent-soft); color: var(--accent-soft); }
+.tapechip.err { background: rgba(255, 90, 60, .14); border: 1px solid var(--accent); color: #ff8a7a; }
+.tapein { width: auto; flex: 1 1 200px; }
+.tapehint { flex: 1 1 100%; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 
-.tapestrip { min-width: 150px; }
-.tapedial { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
-.tapedial-label { font-size: 11px; color: var(--muted); width: 44px; flex: none; }
-.tapedial-range { flex: 1 1 auto; accent-color: var(--accent); }
+/* The deck face: four channel strips + a master strip, always all five columns. */
+.tapedeck {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr)) minmax(0, 1.25fr);
+  gap: clamp(4px, 1.2vw, 12px);
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: clamp(8px, 1.5vw, 14px);
+}
+.tapestrip {
+  display: flex; flex-direction: column; align-items: center; gap: 7px; min-width: 0;
+}
+.tapestrip.empty { opacity: .82; }
+.tapestrip.master { border-left: 1px solid var(--line); padding-left: clamp(4px, 1vw, 10px); gap: 9px; }
+.tsname { font-size: 9px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
 
-.armpanel { gap: 6px; margin-top: 8px; }
-.routerow { align-items: center; gap: 8px; }
-.routerow .lbl { width: 92px; flex: none; font-size: 12px; color: var(--muted); }
-.routerow select, .routerow input[type="number"] { flex: 0 0 auto; }
-.tapestrip .btn.mini { margin-top: 6px; }
-.tapeloaded { align-items: center; }
-.takemenu .saved { cursor: pointer; }
-.takemenu .saved.on { border-color: var(--accent); }
-.takemenu .saved.tombstone, .saved.tombstone { opacity: .5; cursor: default; }
+/* Knobs: a flat disc with a rotating indicator line + a micro label. */
+.tsknobs { display: flex; flex-direction: column; align-items: center; gap: clamp(6px, 1.4vw, 11px); }
+.knob { display: flex; flex-direction: column; align-items: center; gap: 2px; touch-action: none; user-select: none; -webkit-user-select: none; }
+.knob-face {
+  position: relative; width: clamp(40px, 11vw, 54px); height: clamp(40px, 11vw, 54px);
+  border-radius: 50%; background: var(--panel-2); border: 1px solid var(--line);
+  will-change: transform;
+}
+.knob-ind {
+  position: absolute; left: 50%; top: 6%; width: 2px; height: 40%;
+  margin-left: -1px; border-radius: 1px; background: var(--text);
+}
+.knob-lbl { font-size: 8px; letter-spacing: .08em; color: var(--muted); }
+.knob.disabled { opacity: .35; pointer-events: none; }
+.knob.disabled .knob-ind { background: var(--muted); }
+
+/* Fader + meter side by side. */
+.tsfm { display: flex; align-items: stretch; justify-content: center; gap: 5px; width: 100%; }
+.fader {
+  position: relative; width: clamp(30px, 8vw, 40px); height: clamp(120px, 26vw, 170px);
+  touch-action: none; user-select: none; -webkit-user-select: none; flex: none;
+}
+.fader-slot { position: absolute; left: 50%; top: 6px; bottom: 6px; width: 2px; margin-left: -1px; background: var(--line); border-radius: 1px; }
+.fader-unity { position: absolute; left: 6px; right: 6px; height: 0; border-top: 1px dashed var(--muted); transform: translateY(1px); opacity: .7; }
+.fader-cap {
+  position: absolute; left: 50%; width: clamp(26px, 7vw, 34px); height: 15px; margin-left: calc(clamp(26px, 7vw, 34px) / -2);
+  transform: translateY(50%); background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px;
+}
+.fader-cap::after { content: ""; position: absolute; left: 3px; right: 3px; top: 50%; height: 1px; background: var(--muted); }
+.fader.disabled { opacity: .35; pointer-events: none; }
+
+.ledmeter { position: relative; width: 12px; flex: none; border-radius: 3px; overflow: hidden; background: #0d0f13; border: 1px solid var(--line); }
+.led-off, .led-on {
+  position: absolute; inset: 1px;
+  background: repeating-linear-gradient(to top,
+    var(--ledc) 0 calc((100% - (var(--seg) - 1) * 2px) / var(--seg)),
+    transparent calc((100% - (var(--seg) - 1) * 2px) / var(--seg)) calc((100% - (var(--seg) - 1) * 2px) / var(--seg) + 2px));
+}
+.led-off { --ledc: #262b36; }
+.led-on { --ledc: var(--led); clip-path: inset(calc((1 - var(--lit)) * 100%) 0 0 0); }
+.ledmeter.clip .led-on { --ledc: var(--accent); clip-path: none; }
+
+/* REC arm + input badge + bounce buttons on the strip. */
+.tsarm {
+  display: inline-flex; align-items: center; justify-content: center; gap: 5px; width: 100%;
+  min-height: 40px; padding: 6px 4px; font-size: 10px; font-weight: 700; letter-spacing: .08em;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; color: var(--text); cursor: pointer;
+  touch-action: manipulation;
+}
+.tsarm .recdot { width: 9px; height: 9px; border-radius: 50%; border: 1px solid var(--muted); box-sizing: border-box; flex: none; }
+.tsarm.on { border-color: var(--accent); color: var(--accent-soft); }
+.tsarm.on .recdot { background: var(--accent); border-color: var(--accent); }
+.tsarm:disabled { opacity: .38; cursor: default; }
+.tsarm:not(:disabled):active { transform: translateY(1px); }
+.tsin, .tsbounce {
+  width: 100%; min-height: 28px; padding: 4px; font-size: 10px; font-weight: 700; letter-spacing: .06em;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; color: var(--muted); cursor: pointer; touch-action: manipulation;
+}
+.tsin { color: var(--accent-soft); border-color: var(--accent-soft); }
+.tsin:disabled, .tsbounce:disabled { opacity: .4; }
+.tsbounce:active, .tsin:active { transform: translateY(1px); }
+
+/* LED counter window (flat inset). */
+.tapecounter { width: 100%; background: #0d0f13; border: 1px solid var(--line); border-radius: 8px; padding: 7px 8px; text-align: center; }
+.tc-time { font: 700 clamp(18px, 4.6vw, 26px)/1 ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; color: var(--accent-soft); }
+.tc-take { font-size: 9px; letter-spacing: .12em; color: var(--muted); margin-top: 3px; }
+.tc-stat { font-size: 9px; letter-spacing: .08em; color: var(--accent-soft); min-height: 11px; margin-top: 2px; }
+
+/* Function row. */
+.fnrow { display: flex; flex-wrap: wrap; gap: 6px; }
+.fnbtn {
+  flex: 1 1 auto; min-height: 40px; padding: 8px 6px; font-size: 11px; font-weight: 700; letter-spacing: .08em;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px; color: var(--text); cursor: pointer; touch-action: manipulation;
+}
+.fnbtn.on { border-color: var(--accent); color: var(--accent-soft); }
+.fnbtn:disabled { opacity: .4; cursor: default; }
+.fnbtn:not(:disabled):active { transform: translateY(1px); }
+.tapepanel { margin-top: 2px; }
+.tapepanel .routerow { align-items: center; gap: 8px; }
+.tapepanel .routerow .lbl { width: 92px; flex: none; margin: 0; font-size: 12px; color: var(--muted); }
+.tapedrawer:empty { display: none; }
+
+/* Piano-key transport. */
+.pkeys { display: flex; gap: 3px; }
+.pkey {
+  flex: 1 1 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+  min-height: 54px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 0 0 9px 9px; border-top-width: 3px;
+  color: var(--text); cursor: pointer; touch-action: manipulation;
+}
+.pk-glyph { font-size: 17px; line-height: 1; }
+.pk-lbl { font-size: 9px; letter-spacing: .1em; color: var(--muted); }
+.pkey.rec .pk-glyph { color: var(--accent); }
+.pkey.on { border-color: var(--accent); border-top-color: var(--accent); }
+.pkey:disabled { opacity: .4; cursor: default; }
+.pkey:not(:disabled):active { background: var(--panel); transform: translateY(1px); }
+
+/* Take log. */
+.tapelog { border-top: 1px solid var(--line); }
+.tapelog > summary { font-size: 10px; letter-spacing: .13em; text-transform: uppercase; color: var(--muted); }
 .historyrowwrap { display: flex; flex-direction: column; gap: 4px; }
-.takehistory .saved.on { border-color: var(--accent); }
+.tapelog .saved.on { border-color: var(--accent); }
+.saved.tombstone { opacity: .5; cursor: default; }
 .tapenote { margin: 4px 0 0; text-align: center; }
+
+@media (max-width: 430px) {
+  .tsname, .knob-lbl { font-size: 8px; }
+  .pkey { min-height: 48px; }
+  .fnbtn { min-height: 36px; }
+}

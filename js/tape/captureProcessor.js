@@ -27,7 +27,10 @@ class CaptureProcessor extends AudioWorkletProcessor {
     const channelCount = opts.channelCount || 2;
     this.channelCount = channelCount;
     // slots[c] = the DESTINATION slot number (1..4) capture channel c is routed to
-    // (input->track routing). Defaults to positional 1..N when no routing is given.
+    // (input->track routing), or 0 to DISCARD that channel (an interface input the
+    // user didn't arm to any track). Defaults to positional 1..N when no routing is
+    // given. A discarded channel is still peaked (for its input meter) but never
+    // opens or writes a stem file.
     this.slots = (opts.slots && opts.slots.length === channelCount) ? opts.slots.slice() : Array.from({ length: channelCount }, (_, c) => c + 1);
     // Latency gate: frames before beginFrame are discarded (an overdub's pre-roll,
     // so the new track's sample 0 lines up with the backing at t=0). 0 = record from
@@ -84,6 +87,7 @@ class CaptureProcessor extends AudioWorkletProcessor {
 
   flushChunk(frames) {
     for (let c = 0; c < this.channelCount; c++) {
+      if (this.slots[c] === 0) continue; // unrouted input — discard, no stem file
       const i16 = this.floatToInt16(this.buffers[c].subarray(0, frames));
       const msg = { op: 'append', stem: this.slots[c], bytes: i16.buffer }; // route channel c -> its destination slot
       if (this.workerPort) this.workerPort.postMessage(msg, [i16.buffer]);

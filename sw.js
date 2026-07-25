@@ -1,7 +1,7 @@
 // sw.js — offline cache. Same recipe as the metronome/fretboard siblings.
 // IMPORTANT: bump CACHE on any file change, and keep ASSETS listing EVERY shipped
 // file (cache-first means anything not listed is unavailable offline).
-const CACHE = "sn-v25";
+const CACHE = "sn-v26";
 
 const ASSETS = [
   "./",
@@ -23,6 +23,7 @@ const ASSETS = [
   "./js/audioStore.js",
   "./js/sketchesView.js",
   "./js/tape/takeModel.js",
+  "./js/tape/meterModel.js",
   "./js/tape/clickModel.js",
   "./js/tape/click.js",
   "./js/tape/wav.js",
@@ -34,6 +35,7 @@ const ASSETS = [
   "./js/tape/opfsWorker.js",
   "./js/tape/captureProcessor.js",
   "./js/tape/devices.js",
+  "./js/tape/deckControls.js",
   "./js/tape/tapeView.js",
   "./js/theory/pitch.js",
   "./js/theory/spell.js",

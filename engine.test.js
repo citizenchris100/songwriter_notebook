@@ -46,6 +46,10 @@ import {
   TIME_SIGS, SUBS, MIN_BPM, MAX_BPM, computeLevels, accentGroups,
   barSeconds, countInSeconds, defaultAccentIndex, defaultClickConfig, clampClickConfig,
 } from './js/tape/clickModel.js';
+import {
+  CLIP_THRESHOLD, METER_TOP_DB, METER_FLOOR_DB, FALL_DB_PER_SEC, CLIP_HOLD_MS,
+  peakToSegments, peakToLit, decayPeak, clipState,
+} from './js/tape/meterModel.js';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const readJSON = (p) => JSON.parse(readFileSync(here(p), 'utf8'));
@@ -837,7 +841,7 @@ ok('summarizeTrials fails on all-silent trials', !summarizeTrials([null, null, n
 // ============================================================================
 // 18. Tape deck — sw.js caches every new module (tape/… asset-list assertion)
 // ============================================================================
-for (const f of ['tape/takeModel', 'tape/clickModel', 'tape/click', 'tape/wav', 'tape/lufs', 'tape/limiter', 'tape/latency', 'tape/audioEngine', 'tape/takeStore', 'tape/opfsWorker', 'tape/captureProcessor', 'tape/devices', 'tape/tapeView']) {
+for (const f of ['tape/takeModel', 'tape/meterModel', 'tape/clickModel', 'tape/click', 'tape/wav', 'tape/lufs', 'tape/limiter', 'tape/latency', 'tape/audioEngine', 'tape/takeStore', 'tape/opfsWorker', 'tape/captureProcessor', 'tape/devices', 'tape/deckControls', 'tape/tapeView']) {
   ok('sw.js caches ' + f + '.js', sw.includes(`"./js/${f}.js"`));
 }
 
@@ -894,6 +898,42 @@ ok('validateTake rejects a bad click', !validateTake({ take: 5, status: 'active'
   const silentBounce = { take: 6, status: 'active', createdAt: 'x', durationSec: 1, sampleRate: 48000, stems: { stem1: { file: 'a.wav', group: 1, durationSec: 1, vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0 }, stem2: null, stem3: null, stem4: null }, bounce: { file: 'm.wav', bouncedAt: 'x', lufs: null } };
   ok('validateTake accepts a bounce lufs:null', validateTake(silentBounce).ok);
   ok('normalize->validate round-trips a silent bounce', validateManifest(normalizeManifest({ schemaVersion: 2, slug: 's', takes: [silentBounce] })).ok);
+}
+
+// ============================================================================
+// 21. Meter model (the tape deck's LED-ladder math — peaks, ballistics, clip latch)
+// ============================================================================
+eq('CLIP_THRESHOLD is 0.98', CLIP_THRESHOLD, 0.98);
+// Segment mapping: silence -> 0, full-scale -> all, dB-spaced and monotonic.
+eq('peakToSegments(0) is 0', peakToSegments(0, 12), 0);
+eq('peakToSegments(1.0) lights all 12', peakToSegments(1, 12), 12);
+eq('peakToSegments respects the segment count', peakToSegments(1, 16), 16);
+ok('peakToSegments below the floor is 0', peakToSegments(Math.pow(10, (METER_FLOOR_DB - 6) / 20), 12) === 0);
+ok('peakToSegments is monotonic non-decreasing', (() => {
+  let prev = -1;
+  for (let p = 0; p <= 1.0001; p += 0.05) { const s = peakToSegments(p, 12); if (s < prev) return false; prev = s; }
+  return true;
+})());
+ok('an audible peak above the floor lights at least one segment', peakToSegments(Math.pow(10, (METER_FLOOR_DB + 1) / 20), 12) >= 1);
+// peakToLit is the quantized fraction for the CSS var.
+eq('peakToLit(1.0) is 1', peakToLit(1, 12), 1);
+eq('peakToLit(0) is 0', peakToLit(0, 12), 0);
+ok('peakToLit lands on a segment boundary', Math.abs(peakToLit(0.5, 12) * 12 - Math.round(peakToLit(0.5, 12) * 12)) < 1e-9);
+// Ballistics: instant attack, decay falls strictly between full and silence over one frame.
+eq('decayPeak attack is instant', decayPeak(0.2, 0.9, 50), 0.9);
+ok('decayPeak falls between frames', (() => { const d = decayPeak(1.0, 0, 100); return d > 0 && d < 1; })());
+ok('decayPeak never drops below the incoming peak', decayPeak(1.0, 0.5, 1000) >= 0.5);
+ok('decayPeak fall rate matches FALL_DB_PER_SEC', Math.abs(decayPeak(1.0, 0, 1000) - Math.pow(10, -FALL_DB_PER_SEC / 20)) < 1e-9);
+// Clip latch: a clip holds for holdMs, then releases.
+{
+  const c1 = clipState(null, 1.0, 1000);
+  ok('clipState latches on an overload', c1.clipped && c1.until === 1000 + CLIP_HOLD_MS);
+  const c2 = clipState(c1, 0.1, 1000 + CLIP_HOLD_MS - 1);
+  ok('clipState holds during the latch window', c2.clipped);
+  const c3 = clipState(c2, 0.1, 1000 + CLIP_HOLD_MS + 1);
+  ok('clipState releases after the hold', !c3.clipped && c3.until === 0);
+  ok('clipState stays clear below threshold', !clipState(null, 0.5, 0).clipped);
+  ok('a peak exactly at threshold clips', clipState(null, CLIP_THRESHOLD, 0).clipped);
 }
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');

@@ -2,10 +2,12 @@
 
 **Specification & Implementation Plan (build-ready)**
 
-> Status: **revision 3 — implemented and expanded to a 4-track portastudio.** The body below (§1–§9)
-> is the original revision-2 2-track spec, preserved as the design record; the **Revision 3 changelog**
-> immediately below supersedes it wherever the two conflict (4 tracks not 2, mono not stereo, multi-pass
-> fill, overdub monitoring, per-track ping-pong bounce, group-scoped retake). Read the changelog first.
+> Status: **revision 4 — implemented; the deck now wears a portastudio face.** The body below (§1–§9)
+> is the original revision-2 2-track spec, preserved as the design record; the **Revision 3** and
+> **Revision 4** changelogs immediately below supersede it wherever they conflict (rev 3: 4 tracks not
+> 2, mono not stereo, multi-pass fill, overdub monitoring, ping-pong bounce, group-scoped retake; rev
+> 4: portastudio channel strips, playback/monitor metering, master monitor gain, per-strip arming).
+> Read the changelogs first.
 
 **Revision 2 changelog (2026-07-11).** Adversarial review against the real codebase produced these
 changes, all user-arbitrated: (1) worklet/worker scripts are loaded via `fetch → Blob URL` because
@@ -86,6 +88,74 @@ The 2-track deck below was expanded, at the user's direction, into a **4-track c
 
 **Still not a general DAW:** no timeline editing, no per-clip trimming, no plugin concept, no panning,
 and take audio never enters the song export bundle (Share/Export per file only).
+
+---
+
+## Revision 4 changelog (portastudio face; supersedes the presentation of §3/§5.6 where they conflict)
+
+At the user's direction the deck UI was rebuilt to read like the Tascam 414/424 portastudio it
+behaves as. This is a UI + metering + monitor-gain change; the take/manifest model, storage, bounce
+mastering, and crash-recovery are untouched. New/changed files: `js/tape/deckControls.js` (knob/
+fader/LED-meter/counter widgets), `js/tape/meterModel.js` (pure meter math), rewritten
+`js/tape/tapeView.js`, engine + main + worklet edits below, `styles.css` tape block, `sw.js`
+`CACHE` → `sn-v26` (+ the two new modules in `ASSETS`). `node engine.test.js` stays green (the pure
+`meterModel.js` gains its own assertions).
+
+1. **Four always-present vertical channel strips + a master strip** (amends **D12** and §5.6's record
+   UI). Each strip: a `Track N` label, a vertical stack of four rotary knobs (**HI** = the highshelf
+   treble band, **MID**, **LO** = the lowshelf bass band, **CMP** = the one-knob compressor), a
+   vertical fader (per-track vol, unity detent marked at 66.7%), a segmented LED meter, a REC-arm
+   button, an input badge, and a BOUNCE button. Empty strips render grayed/disabled. Knobs turn by
+   vertical drag and double-tap to the detent (0 dB / comp-off / unity); they keep the **D32** two-
+   phase contract exactly (preview on drag → live audio no-render; commit on release → debounced
+   persist + render). No input gain/trim anywhere (the interface owns it).
+
+2. **Playback + overdub-monitor metering via AnalyserNode taps (new decision D34; scopes, does not
+   overturn, D28).** D28 chose worklet peaks for CAPTURE metering because the capture worklet already
+   touches every sample; the playback path has no worklet, so playback/monitor meters are passive
+   `AnalyserNode` time-domain taps — one per stem `chain.output` plus one on the playback `sumBus`
+   (**pre**-master-fader, so the master meter answers "is the mix clipping", not "how loud are my
+   headphones"). One `setInterval(83 ms)` loop (not rAF — PWA background-throttle-proof) polls the
+   taps and emits levels; it is guarded on `ctx.state === 'running'`. A meter shows **input** level on
+   a strip being recorded and **playback** level otherwise; blue normally, red (whole ladder) when a
+   sample hits ≥ `CLIP_THRESHOLD` (0.98, latched ~400 ms). The engine's `onMeter` callback is replaced
+   by `onLevels({source, levels, master})` + `onClock({mode, elapsedSec, durationSec})`; main.js's
+   merge layer applies the pure `meterModel.js` ballistics (dB-spaced segment mapping, fall/decay,
+   clip latch) and writes only the live DOM refs, never `render()`.
+
+3. **Master MONITOR gain (new decision D35).** A single persistent `masterBus` GainNode sits between
+   the playback/overdub `sumBus` and `ctx.destination`; the record-only click routes through it too
+   (so a low monitor fader dims the count-in — documented tradeoff; the LED meters stay the visual
+   cue). **Calibration and every bounce path bypass it** — calibration wires its click straight to
+   `ctx.destination` (a half-closed fader must not fail loopback detection) and `renderMonoMix` uses
+   its own OfflineAudioContext, so the LUFS-target master/ping-pong bounces are provably unaffected by
+   the monitor level. Range 0–1.5, default 1.0 (matching per-track vol); persisted app-level in
+   `localStorage` `sn_tape_master`, **never** in the take/manifest. Preview/commit mirror D32.
+
+4. **Per-strip REC-arming with input-badge cycling (new decision D36; amends the Rev-3 item-2 /
+   AC-2 / AC-25 arm flow).** The "Input N → Track" routing-select panel is gone. Tapping a free
+   strip's REC arms it and auto-assigns the lowest interface input not already claimed; the strip then
+   shows an `IN n` badge that cycles/swaps inputs on tap. `● RECORD` is enabled only when ≥ 1 strip is
+   armed. State is `deckArmed: [{slotKey, inputIndex}]`, normalized each render (drop filled slots,
+   reassign stale inputs, dedupe, cap at `min(inputs, freeSlots, 4)`). Because arming can now skip an
+   interface channel, the per-pass routing is a per-CHANNEL array with **null** holes: `record()` maps
+   a null channel to worklet slot **0**, and `captureProcessor.js` treats slot 0 as a discard channel
+   (peaked for its meter, written to no file). This closes the pre-existing positional-fallback trap
+   in `captureProcessor.js` (a sparse routing array would otherwise silently mis-route).
+
+5. **LED counter window** in the master strip: a flat inset showing take number + a `M:SS` time —
+   the take's duration when idle, worklet-frame elapsed while recording, `ctx`-clock elapsed while
+   playing (amends D12's plain timer).
+
+6. **Function-button row + collapsed-by-default take log** (amends §3.3 presentation only; AC-10/22/23
+   semantics unchanged). NEW TAKE / RETAKE / MIX / CLICK / CAL / SHARE; CLICK, CAL, and SHARE flip
+   open a compact inline panel whose open state lives in the view-model (so an edit's `render()` can't
+   snap it shut); NEW TAKE and RETAKE keep their inline confirm bars. The take history moves into a
+   `<details>` "TAPE LOG" whose open flag is UI-local and reflected in the DOM without a render.
+
+7. **New pure module `meterModel.js` (new decision D37):** `CLIP_THRESHOLD`, `METER_SEGMENTS`,
+   dB-spaced `peakToSegments`/`peakToLit`, `decayPeak` ballistics, and the `clipState` latch — all
+   node-tested, so the LED math is verified independent of the audio graph.
 
 ---
 

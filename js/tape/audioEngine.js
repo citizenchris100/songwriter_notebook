@@ -15,8 +15,11 @@ import {
 } from './takeModel.js';
 import { detectClickSample, rttSeconds, summarizeTrials } from './latency.js';
 import { makeClick } from './click.js';
+import { CLIP_THRESHOLD } from './meterModel.js';
 
 const BOUNCE_RATE = 48000;
+const METER_INTERVAL_MS = 83; // ~12 Hz playback/monitor metering (setInterval, not rAF — PWA-throttle-proof)
+const TAP_FFT = 4096;         // AnalyserNode time-domain window (~85 ms @48k): near-gapless peak coverage
 
 // D21: worklet module fetches bypass the service worker — load the module
 // source via fetch (SW-cache-served offline) into a Blob URL, exactly as
@@ -82,11 +85,25 @@ async function loadStemBuffer(ctx, slug, stemMeta) {
   return buffer;
 }
 
-// makeTapeDeck({ onMeter, onStatus, onWriteError }) -> the persistent per-deck
-// controller. Public: { probe, record, stop, play, replay, stopPlay, bounce,
-// applySettings, dispose }.
-export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
+// makeTapeDeck({ onLevels, onClock, onStatus, onWriteError }) -> the persistent
+// per-deck controller. Public: { probe, record, stop, play, replay, stopPlay,
+// bounce, applySettings, setMasterVol, dispose }.
+//
+// Metering is unified across capture and playback into ONE callback shape:
+//   onLevels({ source: 'capture'|'playback'|'monitor',
+//              levels: { stem1:{peak,clip}, ... only present keys ... },
+//              master: {peak,clip} | null })
+// Capture levels come from the capture worklet's per-batch peaks (D28); playback +
+// overdub-monitor levels come from passive AnalyserNode taps polled by one interval
+// loop (D34). A separate onClock({ mode:'record'|'play', elapsedSec, durationSec })
+// drives the LED counter.
+export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {}) {
   let ctx = null;
+  let masterBus = null;       // master MONITOR gain (D35): the last node before ctx.destination for
+                              // playback + overdub backing + click. Monitor-only — the bounce path
+                              // (renderMonoMix's OfflineAudioContext) never routes through it, and
+                              // calibration wires around it, so it can't affect exports or loopback.
+  let masterVol = 1;          // 0..1.5, applied to masterBus; survives ctx (re)creation
   let workletNode = null;
   let mediaStream = null;
   let wakeLock = null;
@@ -112,9 +129,67 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
   }
 
   async function ensureContext() {
-    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (!ctx) {
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      masterBus = ctx.createGain();
+      masterBus.gain.value = masterVol;
+      masterBus.connect(ctx.destination);
+    }
     if (ctx.state === 'suspended') { try { await ctx.resume(); } catch { /* resumed by the next gesture */ } }
     return ctx;
+  }
+
+  // The master MONITOR volume (D35): live, non-destructive, persisted app-level by the
+  // caller (localStorage sn_tape_master), NEVER in the take/manifest and never seen by
+  // the bounce. D32-style: preview-caller sets it live every tick, persistence is the
+  // caller's separate concern.
+  function setMasterVol(v) {
+    masterVol = Math.max(0, Math.min(1.5, isFinite(v) ? v : 1));
+    if (masterBus) masterBus.gain.setTargetAtTime(masterVol, ctx.currentTime, 0.01);
+  }
+
+  // ---- playback / overdub-monitor metering (D34): passive AnalyserNode taps polled by
+  // one interval loop. `playState` also drives the playback clock. ----
+  let meterTimer = null;
+  let playState = null;         // { startAt, durationSec } while a take is playing (else null)
+  const meterScratch = new Float32Array(TAP_FFT);
+  const lv = (peak) => ({ peak, clip: peak >= CLIP_THRESHOLD });
+
+  function makeTap(audioCtx) { const a = audioCtx.createAnalyser(); a.fftSize = TAP_FFT; return a; }
+  function tapPeak(analyser) {
+    analyser.getFloatTimeDomainData(meterScratch);
+    let p = 0;
+    for (let i = 0; i < meterScratch.length; i++) { const a = meterScratch[i] < 0 ? -meterScratch[i] : meterScratch[i]; if (a > p) p = a; }
+    return p;
+  }
+
+  function anyActiveSource() {
+    return !!(playChains && STEM_KEYS.some((k) => playChains.stems[k] && playChains.stems[k].activeSource));
+  }
+  function startMeterLoop() { if (!meterTimer) meterTimer = setInterval(meterTick, METER_INTERVAL_MS); }
+  function stopMeterLoop() { if (meterTimer) { clearInterval(meterTimer); meterTimer = null; } }
+  function maybeStopMeterLoop() { if (!anyActiveSource() && !monitorGraph) stopMeterLoop(); }
+
+  function meterTick() {
+    if (!ctx || ctx.state !== 'running') return; // suspended/interrupted -> nothing to read
+    if (playChains && anyActiveSource()) {
+      const levels = {};
+      for (const key of STEM_KEYS) {
+        const s = playChains.stems[key];
+        if (s && s.tap && s.activeSource) levels[key] = lv(tapPeak(s.tap));
+      }
+      const master = playChains.masterTap ? lv(tapPeak(playChains.masterTap)) : null;
+      onLevels && onLevels({ source: 'playback', levels, master });
+      if (playState) {
+        const elapsed = Math.max(0, Math.min(playState.durationSec, ctx.currentTime - playState.startAt));
+        onClock && onClock({ mode: 'play', elapsedSec: elapsed, durationSec: playState.durationSec });
+      }
+    }
+    if (monitorGraph && monitorGraph.taps) {
+      const levels = {};
+      for (const key of Object.keys(monitorGraph.taps)) levels[key] = lv(tapPeak(monitorGraph.taps[key]));
+      onLevels && onLevels({ source: 'monitor', levels, master: null });
+    }
   }
 
   function probe(deviceId) {
@@ -129,18 +204,21 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
     const audioCtx = ctx;
     const sumBus = audioCtx.createGain();
     sumBus.gain.value = 1;
-    sumBus.connect(audioCtx.destination);
+    sumBus.connect(masterBus); // overdub backing follows the monitor fader (D35)
     const sources = [];
+    const taps = {};
     for (const it of items) {
       const chain = buildEffectChain(audioCtx, it.meta);
       chain.output.connect(sumBus);
+      if (it.key) { const tap = makeTap(audioCtx); chain.output.connect(tap); taps[it.key] = tap; } // per-backing-track meter (D34)
       const source = audioCtx.createBufferSource();
       source.buffer = it.buffer;
       source.connect(chain.input);
       source.start(startAt);
       sources.push(source);
     }
-    monitorGraph = { sumBus, sources };
+    monitorGraph = { sumBus, sources, taps };
+    startMeterLoop();
   }
 
   function stopMonitor() {
@@ -148,6 +226,7 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
     for (const s of monitorGraph.sources) { try { s.onended = null; s.stop(); } catch { /* already stopped */ } }
     try { monitorGraph.sumBus.disconnect(); } catch { /* already disconnected */ }
     monitorGraph = null;
+    maybeStopMeterLoop();
   }
 
   // `onPassOpen(capture, sampleRate)` is called the instant the capture channel
@@ -156,11 +235,12 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
   // crash-consistent ordering). It must resolve to { take, slotKeys } (the take
   // number and the resolved destination slot keys for this pass, length === capture).
   //
-  // routing: array of destination slot keys indexed by capture channel (input i ->
-  // routing[i]); capture = min(device channels, routing length, MAX_TRACKS).
-  // existingTracks: [{ meta }] of the take's already-recorded slots to monitor (empty
-  // for a take's first pass). monitorLatencySec: the measured round-trip to align
-  // the overdub (0 disables the gate — a first pass records from sample 0).
+  // routing: array indexed by capture channel (input i -> routing[i]); each entry is a
+  // destination slot key ('stem1'..'stem4') OR null for an interface input the user did
+  // not arm (that channel is captured for its input meter but written to no file).
+  // capture = min(device channels, routing length). existingTracks: [{ key, meta }] of
+  // the take's already-recorded slots to monitor (empty for a first pass).
+  // monitorLatencySec: the measured round-trip to align the overdub (0 disables the gate).
   async function record({ slug, deviceId, routing, monitorLatencySec = 0, existingTracks = [], clickConfig = null, onPassOpen }) {
     const acquired = await devices.acquireForRecording(deviceId);
     if (!acquired.ok) { onStatus && onStatus({ type: 'blocked' }); return { ok: false, denied: true }; }
@@ -179,7 +259,14 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
     // manifest before any OPFS file is opened. sampleRate is already known.
     const passInfo = await onPassOpen(capture, audioCtx.sampleRate);
     const take = passInfo.take;
-    const slotKeys = (passInfo.slotKeys && passInfo.slotKeys.length ? passInfo.slotKeys : routeKeys).slice(0, capture);
+    // channelKeys: per-capture-channel slot key or null (discard) — drives the worklet's
+    // per-channel routing AND the input-meter mapping, so a sparse arm (e.g. only input 2
+    // -> Track 2) can't be positionally mis-read. slotKeys: the COMPACT non-null list, for
+    // finalize/recordMeta (the slots that actually got a file).
+    const channelKeys = routeKeys.slice(0, capture);
+    const slotKeys = (passInfo.slotKeys && passInfo.slotKeys.length)
+      ? passInfo.slotKeys.slice(0, capture)
+      : channelKeys.filter(Boolean);
     const overdub = !!(existingTracks && existingTracks.length);
     const clickEnabled = !!(clickConfig && clickConfig.enabled);
 
@@ -187,11 +274,11 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
     // is always in the future no matter how long the OPFS reads take.
     const monitorItems = [];
     if (overdub) {
-      for (const t of existingTracks) monitorItems.push({ meta: t.meta, buffer: await loadStemBuffer(audioCtx, slug, t.meta) });
+      for (const t of existingTracks) monitorItems.push({ key: t.key, meta: t.meta, buffer: await loadStemBuffer(audioCtx, slug, t.meta) });
     }
 
     const source = audioCtx.createMediaStreamSource(mediaStream);
-    const slotNums = slotKeys.map((k) => Number(String(k).slice(4))); // 'stem3' -> 3
+    const slotNums = channelKeys.map((k) => (k ? Number(String(k).slice(4)) : 0)); // 'stem3' -> 3, null -> 0 (discard)
     const node = new AudioWorkletNode(audioCtx, 'capture-processor', {
       numberOfInputs: 1, numberOfOutputs: 1,
       channelCount: capture, channelCountMode: 'explicit', channelInterpretation: 'discrete',
@@ -216,7 +303,17 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
     node.port.onmessage = (e) => {
       const msg = e.data;
       if (!msg) return;
-      if (typeof msg.frames === 'number') { onMeter && onMeter({ frames: msg.frames, peaks: msg.peaks, sampleRate: audioCtx.sampleRate, slotKeys }); return; }
+      if (typeof msg.frames === 'number') {
+        // Capture meter tick: map each channel's peak to its destination slot key
+        // (peaks[c] <-> channelKeys[c], positional; null channels are discards and skipped)
+        // and drive the record clock.
+        const levels = {};
+        const pk = msg.peaks || [];
+        for (let c = 0; c < channelKeys.length; c++) { if (channelKeys[c]) levels[channelKeys[c]] = lv(pk[c] || 0); }
+        onLevels && onLevels({ source: 'capture', levels, master: null });
+        onClock && onClock({ mode: 'record', elapsedSec: msg.frames / audioCtx.sampleRate, durationSec: null });
+        return;
+      }
       if (msg.op === 'append' && !portTransferOk) takeStore.relayAppend(msg.stem, msg.bytes);
     };
 
@@ -243,7 +340,7 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
       let musicStart = startAt; // ctx time of the first RECORDED bar's downbeat
 
       if (clickEnabled) {
-        clickEngine = makeClick(audioCtx, audioCtx.destination);
+        clickEngine = makeClick(audioCtx, masterBus); // click follows the monitor fader (D35)
         const info = clickEngine.start({
           bpm: clickConfig.bpm,
           timeSigIndex: clickConfig.timeSigIndex,
@@ -348,7 +445,9 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
     const audioCtx = await ensureContext();
     const sumBus = audioCtx.createGain();
     sumBus.gain.value = 1;
-    sumBus.connect(audioCtx.destination);
+    sumBus.connect(masterBus); // playback mix follows the monitor fader (D35)
+    const masterTap = makeTap(audioCtx);
+    sumBus.connect(masterTap);  // master meter taps PRE-fader (D34): "is the mix clipping", not headphone loudness
     const stems = {};
     for (const key of STEM_KEYS) {
       const stemMeta = take.stems && take.stems[key];
@@ -356,9 +455,10 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
       const buffer = await loadStemBuffer(audioCtx, slug, stemMeta);
       const chain = buildEffectChain(audioCtx, stemMeta);
       chain.output.connect(sumBus);
-      stems[key] = { buffer, chain, activeSource: null };
+      const tap = makeTap(audioCtx); chain.output.connect(tap); // per-track playback meter (D34)
+      stems[key] = { buffer, chain, tap, activeSource: null };
     }
-    playChains = { slug, take: take.take, sumBus, stems };
+    playChains = { slug, take: take.take, sumBus, masterTap, stems };
   }
 
   function disposePlayback() {
@@ -368,11 +468,14 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
   }
 
   function stopPlaySources() {
-    if (!playChains) return;
-    for (const key of STEM_KEYS) {
-      const s = playChains.stems[key];
-      if (s && s.activeSource) { try { s.activeSource.onended = null; s.activeSource.stop(); } catch { /* already stopped */ } s.activeSource = null; }
+    if (playChains) {
+      for (const key of STEM_KEYS) {
+        const s = playChains.stems[key];
+        if (s && s.activeSource) { try { s.activeSource.onended = null; s.activeSource.stop(); } catch { /* already stopped */ } s.activeSource = null; }
+      }
     }
+    playState = null;
+    maybeStopMeterLoop();
   }
 
   async function play(take, slug) {
@@ -380,6 +483,7 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
     stopPlaySources();
     const audioCtx = ctx;
     const startAt = audioCtx.currentTime + 0.1; // all stems start together -> sample-locked
+    const durationSec = maxKeyDuration(STEM_KEYS, take) || take.durationSec || 0;
     let any = false, primary = null;
     for (const key of STEM_KEYS) {
       const s = playChains.stems[key];
@@ -392,7 +496,12 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
       any = true;
       if (!primary) primary = source;
     }
-    if (primary) primary.onended = () => { onStatus && onStatus({ type: 'ended' }); };
+    if (any) { playState = { startAt, durationSec }; startMeterLoop(); }
+    if (primary) primary.onended = () => {
+      onClock && onClock({ mode: 'play', elapsedSec: durationSec, durationSec }); // land the counter on the exact end
+      stopPlaySources();                                                          // clears activeSource/playState, stops the loop
+      onStatus && onStatus({ type: 'ended' });
+    };
     return any;
   }
 
@@ -573,11 +682,12 @@ export function makeTapeDeck({ onMeter, onStatus, onWriteError } = {}) {
 
   function dispose() {
     if (recording) stop('interrupted');
+    stopMeterLoop();
     stopMonitor();
     disposePlayback();
     if (wakeLock) { try { wakeLock.release(); } catch { /* already released */ } wakeLock = null; }
-    if (ctx) { try { ctx.close(); } catch { /* already closed */ } ctx = null; }
+    if (ctx) { try { ctx.close(); } catch { /* already closed */ } ctx = null; masterBus = null; }
   }
 
-  return { probe, record, stop, play, replay, stopPlay, bounce, bounceTracks, applySettings, calibrateLatency, dispose };
+  return { probe, record, stop, play, replay, stopPlay, bounce, bounceTracks, applySettings, setMasterVol, calibrateLatency, dispose };
 }

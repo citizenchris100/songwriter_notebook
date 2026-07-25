@@ -1,49 +1,61 @@
-// js/tape/tapeView.js — the deck UI (§5.6). Built with dom.js's h(), called fresh
-// on every songsView.update() (the same rebuild-from-view-model discipline as the
-// rest of the Songs tab). The AudioContext/graph-owning controller
-// (js/tape/audioEngine.js) is NOT built here — main.js owns ONE instance for the
-// lifetime of the app (its own module scope is never torn down, so the
-// AudioContext survives every rebuild without needing a special DOM container).
+// js/tape/tapeView.js — the deck UI, rebuilt as a 4-track PORTASTUDIO face (§5.6, Rev-4).
+// Built with dom.js's h() and the widget builders in deckControls.js, called fresh on
+// every songsView.update() (the same rebuild-from-view-model discipline as the rest of
+// the Songs tab). The AudioContext/graph-owning controller (js/tape/audioEngine.js) is
+// NOT built here — main.js owns ONE instance for the app's lifetime.
 //
-// A take is a 4-TRACK CONTAINER filled over multiple passes. Each pass records into
-// currently-free slots via input->track routing; tracks can be ping-ponged (bounced
-// one onto another) to free slots for more recording; retake re-records only the
-// last group. Mono forever — the master bounce and every track are single-channel.
+// Layout: four ALWAYS-present vertical channel strips (HI/MID/LO/COMP knobs, a fader +
+// segmented LED meter, a REC arm button with an input badge, a BOUNCE button) plus a
+// master strip (LED counter window + monitor fader + master meter), a function-button
+// row, a piano-key transport, and a collapsible take log. A take is a 4-TRACK CONTAINER
+// filled over multiple passes; mono forever.
 //
-// Two things in this view genuinely cannot go through a full render(): the elapsed
-// timer + level meters (mutated at ~10 Hz from the worklet) and the inline
-// play-status text. Both are handed back as `live` — one small "current DOM node"
-// registration per render, exactly like the sketches player.
+// Three things can't go through a full render(): the LED meters + the counter time (both
+// mutated at ~10-12 Hz from the engine) and the inline play-status. All three are handed
+// back as `live` — { setLevels, setCounter, setPlayStatus } — refreshed every render, and
+// driven by main.js's meter merge layer.
 import { h } from '../dom.js';
 import { STEM_KEYS } from './takeModel.js';
 import { TIME_SIGS, SUBS, countInSeconds } from './clickModel.js';
+import { buildKnob, buildFader, buildLedMeter, buildCounter } from './deckControls.js';
+import { METER_SEGMENTS } from './meterModel.js';
 
 const STEM_LABELS = { stem1: 'Track 1', stem2: 'Track 2', stem3: 'Track 3', stem4: 'Track 4' };
+const STEM_SHORT = { stem1: 'TRACK 1', stem2: 'TRACK 2', stem3: 'TRACK 3', stem4: 'TRACK 4' };
 
 const fmtTime = (sec) => {
   const s = Math.max(0, Math.floor(sec || 0));
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
 };
 const fmtWhen = (iso) => { try { return new Date(iso).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }); } catch { return iso || ''; } };
-const rowOf = (child) => { const r = h('div', 'row'); r.appendChild(child); return r; };
-const banner = (kind, text) => h('div', 'tapebanner ' + kind, text);
 const labelList = (keys) => (keys || []).map((k) => STEM_LABELS[k]).join(' & ');
 
-// Build the whole deck subview. `deck` is the tape-deck slice of the view-model
-// (assembled by main.js's tapeDeckViewModel()); `handlers` are the callbacks from
-// main.js. Returns { el, live }.
 export function buildDeckView(deck, handlers, songName) {
   const {
-    onCloseTapeDeck, onNewTake, onArmRecordPass, onSetRoutingSlot, onStopTake,
+    onCloseTapeDeck, onNewTake, onArmRecordPass, onArmTrack, onCycleInput, onStopTake,
     onDiscardLastGroup, onBounceStemToTrack, onBounceTake, onDeleteTake, onSelectTake,
-    onSelectInput, onSetMonitorLatency, onCalibrateLatency, onSetClick, onPreviewStemSetting, onSetStemSetting, onShareTake,
+    onSelectInput, onSetMonitorLatency, onCalibrateLatency, onSetClick,
+    onPreviewStemSetting, onSetStemSetting, onPreviewMasterVol, onSetMasterVol,
+    onTogglePanel, onToggleTakeLog, onShareTake,
     onPlayTake, onReplayTake, onStopPlayTake,
   } = handlers;
 
   const wrap = h('div', 'songswrap tapewrap');
-  const live = { timerEl: null, meterEls: null, setPlayStatus: null };
 
-  // ---- header (AC-18: song name, take #, OPFS path) ----
+  // ---- live refs: the LED meters, the counter, and the play-status text ----
+  const meterSetters = {};   // 'stem1'..'stem4' + 'master' -> ledmeter.set(lit, clip)
+  let counter = null;        // { el, timeEl, takeEl, statEl } once the master strip is built
+  const setStat = (t) => { if (counter) counter.statEl.textContent = t; };
+  const live = {
+    setLevels(perKey, master) {
+      if (perKey) for (const k of Object.keys(perKey)) { const s = meterSetters[k]; if (s) s(perKey[k].lit, perKey[k].clip); }
+      if (master && meterSetters.master) meterSetters.master(master.lit, master.clip);
+    },
+    setCounter(clock) { if (counter && clock) counter.timeEl.textContent = fmtTime(clock.elapsedSec); },
+    setPlayStatus: setStat,
+  };
+
+  // ---- header ----
   const head = h('div', 'row tapehead');
   const back = h('button', 'btn mini', '‹ Back to song');
   back.disabled = !!deck.recording;
@@ -56,136 +68,245 @@ export function buildDeckView(deck, handlers, songName) {
   head.append(back, title);
   wrap.appendChild(head);
 
-  // ---- status banners ----
-  if (deck.blocked) wrap.appendChild(banner('err', 'Microphone access is blocked — enable it in Settings for this site.'));
-  else if (deck.unsupported) wrap.appendChild(banner('err', 'Recording needs a current Safari or Chrome (this browser lacks on-device audio storage).'));
-  else if (deck.noInterface) wrap.appendChild(banner('warn', 'No multi-input audio interface detected — the built-in mic records one track at a time.'));
-  if (deck.warnMoreThanMax) wrap.appendChild(banner('warn', 'This interface has more than four inputs — only the first four are available per pass.'));
-  if (deck.status && deck.status.message) wrap.appendChild(banner(deck.status.type === 'error' ? 'err' : 'warn', deck.status.message));
-  if (deck.spaceWarning) wrap.appendChild(banner('warn', 'Storage is running low. Delete a take to free space, or export what you need to keep.'));
+  // ---- status strip: banners -> chips, input-device picker, one hint line ----
+  wrap.appendChild(statusStrip(deck, { onSelectInput }));
 
-  // ---- input picker (AC-25) ----
-  if (deck.inputs && deck.inputs.length > 1 && !deck.recording) {
-    const card = h('div', 'card grow');
-    card.appendChild(h('span', 'lbl', 'Input'));
-    const sel = h('select');
-    deck.inputs.forEach((d) => { const o = h('option', null, d.label); o.value = d.deviceId; sel.appendChild(o); });
-    sel.value = deck.selectedInputId || '';
-    sel.addEventListener('change', () => onSelectInput(sel.value));
-    card.appendChild(sel);
-    wrap.appendChild(rowOf(card));
-  }
+  // ---- the deck face: 4 strips + master ----
+  const face = h('div', 'tapedeck');
+  const bounceBars = {}; // key -> the (hidden) full-width destination-confirm bar in the drawer
+  STEM_KEYS.forEach((key) => face.appendChild(trackStrip(key, deck, handlers, meterSetters, bounceBars)));
+  const master = masterStrip(deck, { onPreviewMasterVol, onSetMasterVol }, meterSetters);
+  counter = master.counter;
+  face.appendChild(master.el);
+  wrap.appendChild(face);
 
-  // ---- transport ----
-  const transport = transportSection(deck, { onNewTake, onArmRecordPass, onSetRoutingSlot, onSetMonitorLatency, onCalibrateLatency, onSetClick, onStopTake, onPlayTake, onReplayTake, onStopPlayTake, songId: deck.songId });
-  wrap.appendChild(transport.el);
-  live.timerEl = transport.timerEl;
-  live.meterEls = transport.meterEls;
-  live.setPlayStatus = transport.setPlayStatus;
+  // ---- drawer: per-strip bounce destination-confirm bars (won't fit in a 63px strip) ----
+  const drawer = h('div', 'tapedrawer');
+  STEM_KEYS.forEach((key) => { if (bounceBars[key]) drawer.appendChild(bounceBars[key]); });
+  wrap.appendChild(drawer);
 
-  // ---- track strips (vol/EQ/comp + per-track bounce) — shown while recording OR a take is loaded ----
-  if (deck.showStrips && deck.loadedTake) wrap.appendChild(trackStrips(deck, { onPreviewStemSetting, onSetStemSetting, onBounceStemToTrack }));
+  // ---- function row + its inline confirm bars ----
+  wrap.appendChild(functionRow(deck, handlers));
 
-  // ---- retake / master bounce / share for the loaded take ----
-  if (deck.showLoadedActions && deck.loadedTake) {
-    wrap.appendChild(loadedActions(deck, { onDiscardLastGroup, onBounceTake, onShareTake }));
-  }
+  // ---- flip-open panel (click / cal / share) ----
+  if (deck.panelOpen) wrap.appendChild(flipPanel(deck, handlers));
 
-  // ---- take history (AC-10, AC-22, AC-23) ----
-  wrap.appendChild(takeHistory(deck, { onSelectTake, onDeleteTake, onShareTake }));
+  // ---- piano-key transport ----
+  wrap.appendChild(transport(deck, { onArmRecordPass, onStopTake, onPlayTake, onReplayTake, onStopPlayTake, songId: deck.songId, setStat }));
+
+  // ---- collapsible take log ----
+  wrap.appendChild(takeLog(deck, { onSelectTake, onDeleteTake, onShareTake, onToggleTakeLog }));
 
   wrap.appendChild(h('div', 'feel-empty tapenote', 'Takes live on this device — Share/Export any take you can’t lose.'));
 
   return { el: wrap, live };
 }
 
-// The arm-pass routing panel (AC-2/25): one row per available input mapping it to a
-// currently-free track slot, defaulted from deck.routing, plus the Record button.
-function armPanel(deck, ctx) {
-  const box = h('div', 'col armpanel');
-  const maxCap = deck.maxCapture || 0;
-  const free = deck.freeSlotKeys || [];
-  box.appendChild(h('div', 'subtitle', 'Record ' + maxCap + ' track' + (maxCap === 1 ? '' : 's') + ' this pass · ' + deck.inputChannels + ' input' + (deck.inputChannels === 1 ? '' : 's') + ' → ' + deck.freeSlots + ' free'));
-  const routing = deck.routing || [];
-  for (let i = 0; i < maxCap; i++) {
-    const row = h('div', 'row routerow');
-    row.appendChild(h('span', 'lbl', 'Input ' + (i + 1) + ' →'));
-    const sel = h('select');
-    free.forEach((key) => { const o = h('option', null, STEM_LABELS[key]); o.value = key; sel.appendChild(o); });
-    sel.value = routing[i] || free[i] || '';
-    sel.addEventListener('change', () => ctx.onSetRoutingSlot(i, sel.value));
-    row.appendChild(sel);
-    box.appendChild(row);
+// ---- status strip ----
+function statusStrip(deck, ctx) {
+  const box = h('div', 'tapestatus');
+  const chip = (kind, text) => box.appendChild(h('div', 'tapechip ' + kind, text));
+  if (deck.blocked) chip('err', 'Microphone access is blocked — enable it in Settings for this site.');
+  else if (deck.unsupported) chip('err', 'Recording needs a current Safari or Chrome (no on-device audio storage here).');
+  else if (deck.noInterface) chip('warn', 'No multi-input interface — the built-in mic records one track at a time.');
+  if (deck.warnMoreThanMax) chip('warn', 'Interface has more than four inputs — only the first four are available.');
+  if (deck.status && deck.status.message) chip(deck.status.type === 'error' ? 'err' : 'warn', deck.status.message);
+  if (deck.spaceWarning) chip('warn', 'Storage is running low. Delete a take, or export what you need to keep.');
+
+  if (deck.inputs && deck.inputs.length > 1 && !deck.recording) {
+    const sel = h('select', 'tapein');
+    deck.inputs.forEach((d) => { const o = h('option', null, d.label); o.value = d.deviceId; sel.appendChild(o); });
+    sel.value = deck.selectedInputId || '';
+    sel.addEventListener('change', () => ctx.onSelectInput(sel.value));
+    box.appendChild(sel);
   }
-  if (deck.inputChannels > deck.freeSlots) box.appendChild(banner('warn', 'More inputs than free tracks — only ' + deck.freeSlots + ' will be recorded this pass.'));
-  // Overdub timing: the tracks play back and you monitor via the interface; this
-  // shifts a new track earlier to cancel the interface's round-trip delay so it
-  // lands in time. Only relevant once there are tracks to play under the new one.
-  if (deck.filledCount > 0) box.appendChild(latencyPanel(deck, ctx));
-  box.appendChild(clickCard(deck, ctx));
-  const recBtn = h('button', 'btn primary grow', '● Record');
-  recBtn.disabled = !!(deck.blocked || deck.unsupported || maxCap < 1);
-  recBtn.addEventListener('click', () => ctx.onArmRecordPass());
-  box.appendChild(rowOf(recBtn));
+
+  box.appendChild(h('div', 'tapehint', hintText(deck)));
   return box;
 }
 
-// Overdub timing panel: a measured round-trip (via the loopback calibration) or a
-// manual value, applied as the shift that lands a new track in time with the backing.
-function latencyPanel(deck, ctx) {
-  const lat = deck.monitorLatency || { ms: 0, source: 'none', spreadMs: null };
-  const box = h('div', 'col armpanel');
-  const desc = lat.source === 'measured'
-    ? 'Overdub sync: ' + lat.ms + ' ms measured' + (lat.spreadMs != null ? ' (±' + lat.spreadMs + ' ms)' : '')
-    : lat.source === 'manual'
-      ? 'Overdub sync: ' + lat.ms + ' ms (manual)'
-      : 'Overdub sync: none — playback + capture only';
-  box.appendChild(h('div', 'subtitle', desc));
-  const row = h('div', 'row routerow');
-  row.appendChild(h('span', 'lbl', 'Latency (ms)'));
-  const latIn = h('input', 'tapedial-range');
-  latIn.type = 'number'; latIn.min = '0'; latIn.max = '400'; latIn.step = '1'; latIn.value = String(lat.ms || 0);
-  latIn.style.width = '5rem';
-  latIn.addEventListener('change', () => ctx.onSetMonitorLatency(Number(latIn.value) || 0));
-  const calBtn = h('button', 'btn mini', deck.calibrating ? 'Calibrating…' : 'Calibrate');
-  calBtn.disabled = !!(deck.calibrating || deck.blocked || deck.unsupported);
-  calBtn.addEventListener('click', () => ctx.onCalibrateLatency());
-  row.append(latIn, calBtn);
-  box.appendChild(row);
-  box.appendChild(h('div', 'feel-empty', 'Loop the EVO output to input 1 (or hold the mic to your headphones), then Calibrate. Or type a value if you already know it.'));
+function hintText(deck) {
+  if (deck.recording) return deck.overdub ? 'Overdub — backing tracks playing' : 'Recording…';
+  if (deck.bouncing) return 'Bouncing…';
+  if (deck.armed && deck.armed.length) return deck.armed.map((a) => 'IN ' + (a.inputIndex + 1) + ' → ' + STEM_LABELS[a.slotKey]).join('  ·  ');
+  if (deck.pendingNewTake) return 'New take — tap a track’s REC to arm it, then press ● REC.';
+  if (deck.loadedTake) return 'Take ' + deck.loadedTake.take + (deck.loadedTake.recovered ? ' (recovered)' : '') + ' · ' + fmtTime(deck.loadedTake.durationSec) + ' · ' + deck.filledCount + '/4 tracks';
+  if (deck.hasHistory) return 'No take loaded — arm a track and record, or load one from the log below.';
+  return 'No takes yet — tap a track’s REC to arm it, then press ● REC.';
+}
+
+// ---- one channel strip ----
+function trackStrip(key, deck, handlers, meterSetters, bounceBars) {
+  const st = deck.strips[key];
+  const state = st.state; // 'empty' | 'armed' | 'recording' | 'filled'
+  const filled = !!st.stem;
+  const stem = st.stem || { vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0 };
+  const card = h('div', 'tapestrip ' + state);
+  card.appendChild(h('div', 'tsname', STEM_SHORT[key]));
+
+  // Knobs are live only when there's a playback chain to preview (a loaded, idle take).
+  const knobsOn = filled && !deck.recording && !deck.bouncing;
+  const mkKnob = (label, min, max, step, val, patchOf) => buildKnob({
+    label, value: val, min, max, step, detent: 0, disabled: !knobsOn,
+    onPreview: (v) => handlers.onPreviewStemSetting(key, patchOf(v)),
+    onCommit: (v) => handlers.onSetStemSetting(key, patchOf(v)),
+  }).el;
+  const knobs = h('div', 'tsknobs');
+  knobs.append(
+    mkKnob('HI', -12, 12, 0.5, stem.eq.treble, (v) => ({ eq: { ...stem.eq, treble: v } })),
+    mkKnob('MID', -12, 12, 0.5, stem.eq.mid, (v) => ({ eq: { ...stem.eq, mid: v } })),
+    mkKnob('LO', -12, 12, 0.5, stem.eq.bass, (v) => ({ eq: { ...stem.eq, bass: v } })),
+    mkKnob('CMP', 0, 1, 0.01, stem.comp, (v) => ({ comp: v })),
+  );
+  card.appendChild(knobs);
+
+  // Fader + meter.
+  const fader = buildFader({
+    value: stem.vol, min: 0, max: 1.5, detent: 1.0, disabled: !knobsOn,
+    onPreview: (v) => handlers.onPreviewStemSetting(key, { vol: v }),
+    onCommit: (v) => handlers.onSetStemSetting(key, { vol: v }),
+  });
+  const meter = buildLedMeter({ segments: METER_SEGMENTS });
+  meterSetters[key] = meter.set;
+  const fm = h('div', 'tsfm');
+  fm.append(fader.el, meter.el);
+  card.appendChild(fm);
+
+  // REC arm button (red dot) — armable only on a free/armed strip, off during record/bounce.
+  const arm = h('button', 'tsarm' + ((state === 'armed' || state === 'recording') ? ' on' : ''));
+  arm.append(h('span', 'recdot'), 'REC');
+  const atCapacity = state === 'empty' && deck.armed.length >= deck.maxCapture;
+  arm.disabled = deck.recording || deck.bouncing || deck.blocked || deck.unsupported
+    || !(state === 'empty' || state === 'armed') || atCapacity;
+  arm.addEventListener('click', () => handlers.onArmTrack(key));
+  card.appendChild(arm);
+
+  // Input badge on an armed/recording strip (tap to cycle when >1 input).
+  if ((state === 'armed' || state === 'recording') && st.inputIndex != null) {
+    const badge = h('button', 'tsin', 'IN ' + (st.inputIndex + 1));
+    badge.disabled = deck.recording || deck.bouncing || deck.inputChannels < 2;
+    badge.addEventListener('click', () => handlers.onCycleInput(key));
+    card.appendChild(badge);
+  }
+
+  // BOUNCE ▸ (filled strips only, when a ping-pong is possible) -> reveals its drawer bar.
+  if (filled && deck.canBounceTracks) {
+    const others = (deck.filledSlotKeys || []).filter((k) => k !== key);
+    if (others.length) {
+      const bar = h('div', 'namebar hidden');
+      bar.appendChild(h('span', 'savehint', 'Bounce ' + STEM_LABELS[key] + ' into… (frees this track)'));
+      others.forEach((k) => { const b = h('button', 'btn mini', STEM_LABELS[k]); b.addEventListener('click', () => handlers.onBounceStemToTrack(key, k)); bar.appendChild(b); });
+      const cancel = h('button', 'btn mini', 'Cancel'); cancel.addEventListener('click', () => bar.classList.add('hidden')); bar.appendChild(cancel);
+      bounceBars[key] = bar;
+      const btn = h('button', 'tsbounce', 'BNC ▸');
+      btn.addEventListener('click', () => { Object.keys(bounceBars).forEach((k) => bounceBars[k].classList.add('hidden')); bar.classList.remove('hidden'); });
+      card.appendChild(btn);
+    }
+  }
+
+  return card;
+}
+
+// ---- master strip ----
+function masterStrip(deck, ctx, meterSetters) {
+  const card = h('div', 'tapestrip master');
+  card.appendChild(h('div', 'tsname', 'MASTER'));
+
+  const initTime = deck.recording ? 0 : (deck.loadedTake ? (deck.loadedTake.durationSec || 0) : 0);
+  const counter = buildCounter({
+    time: fmtTime(initTime),
+    take: deck.counterTakeNo ? ('TAKE ' + deck.counterTakeNo) : '',
+    stat: deck.bouncing ? 'BOUNCING' : (deck.overdub ? 'OVERDUB' : ''),
+  });
+  card.appendChild(counter.el);
+
+  const fader = buildFader({
+    value: deck.masterVol, min: 0, max: 1.5, detent: 1.0, disabled: false,
+    onPreview: (v) => ctx.onPreviewMasterVol(v),
+    onCommit: (v) => ctx.onSetMasterVol(v),
+  });
+  const meter = buildLedMeter({ segments: METER_SEGMENTS });
+  meterSetters.master = meter.set;
+  const fm = h('div', 'tsfm');
+  fm.append(fader.el, meter.el);
+  card.appendChild(fm);
+
+  return { el: card, counter };
+}
+
+// ---- function row ----
+function functionRow(deck, handlers) {
+  const wrap = h('div', 'col');
+  const row = h('div', 'fnrow');
+  const haveAudio = !!deck.loadedTake && deck.filledCount > 0;
+  const busy = deck.recording || deck.bouncing;
+
+  const fn = (label, on, disabled, click) => {
+    const b = h('button', 'fnbtn' + (on ? ' on' : ''), label);
+    b.disabled = !!disabled;
+    b.addEventListener('click', click);
+    row.appendChild(b);
+    return b;
+  };
+
+  // NEW TAKE — inline confirm bar.
+  const newBar = h('div', 'namebar hidden');
+  newBar.append(
+    h('span', 'savehint', 'Start a new take? The current take stays in the log.'),
+    (() => { const b = h('button', 'btn mini', 'Start'); b.addEventListener('click', () => { newBar.classList.add('hidden'); handlers.onNewTake(); }); return b; })(),
+    (() => { const b = h('button', 'btn mini', 'Cancel'); b.addEventListener('click', () => newBar.classList.add('hidden')); return b; })(),
+  );
+  fn('NEW TAKE', false, busy || deck.blocked || deck.unsupported, () => newBar.classList.remove('hidden'));
+
+  // RETAKE — inline confirm bar (re-records the last group).
+  const retakeBar = h('div', 'namebar hidden');
+  if (deck.lastGroupKeys && deck.lastGroupKeys.length) {
+    retakeBar.append(
+      h('span', 'savehint', 'Re-record the last group (' + labelList(deck.lastGroupKeys) + ')? This erases it.'),
+      (() => { const b = h('button', 'btn mini danger', 'Re-record'); b.addEventListener('click', () => handlers.onDiscardLastGroup()); return b; })(),
+      (() => { const b = h('button', 'btn mini', 'Cancel'); b.addEventListener('click', () => retakeBar.classList.add('hidden')); return b; })(),
+    );
+  }
+  fn('RETAKE', false, busy || !(deck.lastGroupKeys && deck.lastGroupKeys.length), () => retakeBar.classList.remove('hidden'));
+
+  fn('MIX', false, busy || !haveAudio, () => handlers.onBounceTake());
+  fn('CLICK', deck.clickConfig && deck.clickConfig.enabled, deck.recording, () => handlers.onTogglePanel('click'));
+  fn('CAL', deck.panelOpen === 'cal', deck.recording, () => handlers.onTogglePanel('cal'));
+  fn('SHARE', deck.panelOpen === 'share', !haveAudio && !(deck.loadedTake && deck.loadedTake.bounce), () => handlers.onTogglePanel('share'));
+
+  wrap.append(row, newBar, retakeBar);
+  return wrap;
+}
+
+// ---- flip-open panel ----
+function flipPanel(deck, handlers) {
+  const box = h('div', 'card grow tapepanel');
+  if (deck.panelOpen === 'click') clickPanel(box, deck, handlers);
+  else if (deck.panelOpen === 'cal') calPanel(box, deck, handlers);
+  else if (deck.panelOpen === 'share') sharePanel(box, deck, handlers);
   return box;
 }
 
-// The per-take metronome config: a 2-bar count-in + a click during recording, at a BPM
-// (and full time-sig/subdivision/accent options matching the standalone metronome). The
-// tempo is a property of the TAKE — editable for a new take, read-only once the take has
-// audio, since every overdub pass must share the take's tempo.
-function clickCard(deck, ctx) {
+function clickPanel(box, deck, handlers) {
   const cfg = deck.clickConfig || { enabled: false, bpm: 120, timeSigIndex: 2, subdivision: 1, accentIndex: 1 };
-  const box = h('div', 'col armpanel clickcard');
   const sig = TIME_SIGS[cfg.timeSigIndex] || TIME_SIGS[2];
-
   if (deck.clickLocked) {
     const summary = cfg.enabled
       ? 'Click: ' + cfg.bpm + ' BPM · ' + sig.label + ' · ' + ((SUBS[cfg.subdivision - 1] || SUBS[0]).name) + ' · ' + (sig.accents[cfg.accentIndex] || 'On')
       : 'Click: off';
     box.appendChild(h('div', 'subtitle', summary + ' — locked to this take'));
-    return box;
+    return;
   }
-
   box.appendChild(h('div', 'subtitle', 'Metronome'));
   const toggle = h('button', 'btn mini' + (cfg.enabled ? ' primary' : ''), cfg.enabled ? 'Click: On' : 'Click: Off');
-  toggle.addEventListener('click', () => ctx.onSetClick({ enabled: !cfg.enabled }));
+  toggle.addEventListener('click', () => handlers.onSetClick({ enabled: !cfg.enabled }));
   box.appendChild(rowOf(toggle));
-
   if (cfg.enabled) {
     const numRow = (label, cfgKey, min, max, val) => {
       const row = h('div', 'row routerow');
       row.appendChild(h('span', 'lbl', label));
-      const inp = h('input', 'tapedial-range');
-      inp.type = 'number'; inp.min = String(min); inp.max = String(max); inp.step = '1'; inp.value = String(val);
-      inp.style.width = '5rem';
-      inp.addEventListener('change', () => ctx.onSetClick({ [cfgKey]: Number(inp.value) }));
+      const inp = h('input', 'nameinput'); inp.type = 'number'; inp.min = String(min); inp.max = String(max); inp.step = '1'; inp.value = String(val); inp.style.maxWidth = '6rem';
+      inp.addEventListener('change', () => handlers.onSetClick({ [cfgKey]: Number(inp.value) }));
       row.appendChild(inp);
       return row;
     };
@@ -195,175 +316,39 @@ function clickCard(deck, ctx) {
       const sel = h('select');
       options.forEach(([v, text]) => { const o = h('option', null, text); o.value = String(v); sel.appendChild(o); });
       sel.value = String(value);
-      sel.addEventListener('change', () => ctx.onSetClick({ [cfgKey]: Number(sel.value) }));
+      sel.addEventListener('change', () => handlers.onSetClick({ [cfgKey]: Number(sel.value) }));
       row.appendChild(sel);
       return row;
     };
-
     box.appendChild(numRow('BPM', 'bpm', 20, 300, cfg.bpm));
     box.appendChild(selRow('Time sig', TIME_SIGS.map((m, i) => [i, m.label]), cfg.timeSigIndex, 'timeSigIndex'));
     box.appendChild(selRow('Subdivision', SUBS.map((s) => [s.n, s.name]), cfg.subdivision, 'subdivision'));
     box.appendChild(selRow('Accent', sig.accents.map((name, i) => [i, name]), Math.min(cfg.accentIndex, sig.accents.length - 1), 'accentIndex'));
     box.appendChild(h('div', 'feel-empty', '2-bar count-in ≈ ' + countInSeconds(cfg.bpm, cfg.timeSigIndex).toFixed(1) + ' s before recording starts.'));
   }
-
-  return box;
 }
 
-function transportSection(deck, ctx) {
-  const box = h('div', 'card grow tapetransport');
-
-  if (deck.recording) {
-    const timerEl = h('div', 'tapetimer', '0:00');
-    const meterWrap = h('div', 'tapemeters');
-    const meterEls = {};
-    (deck.recordingSlotKeys || []).forEach((key) => {
-      const row = h('div', 'meterrow');
-      row.appendChild(h('span', 'meterlabel', STEM_LABELS[key]));
-      const bar = h('div', 'meterbar');
-      const fill = h('div', 'meterfill');
-      bar.appendChild(fill);
-      row.appendChild(bar);
-      meterWrap.appendChild(row);
-      meterEls[key] = fill;
-    });
-    const stopBtn = h('button', 'btn primary grow', '■ Stop');
-    stopBtn.addEventListener('click', () => ctx.onStopTake());
-    box.append(h('div', 'subtitle', deck.overdub ? 'Overdub — backing tracks playing' : 'Recording'), timerEl, meterWrap, rowOf(stopBtn));
-    return { el: box, timerEl, meterEls, setPlayStatus: null };
-  }
-
-  if (deck.bouncing) {
-    box.appendChild(h('div', 'feel-empty pad', 'Bouncing…'));
-    return { el: box, timerEl: null, meterEls: null, setPlayStatus: null };
-  }
-
-  let setPlayStatus = null;
-
-  // A loaded take with audio: Play / Stop / Replay (ephemeral — ends in the
-  // audioEngine controller directly, not a manifest-mutating handler).
-  if (deck.loadedTake) {
-    const take = deck.loadedTake;
-    box.appendChild(h('div', 'subtitle', 'Take ' + take.take + (take.recovered ? ' (recovered)' : '') + ' · ' + fmtTime(take.durationSec) + ' · ' + deck.filledCount + '/4 tracks'));
-    const btnRow = h('div', 'row');
-    const playBtn = h('button', 'btn mini', '▶ Play');
-    const stopBtn = h('button', 'btn mini', '■ Stop');
-    const replayBtn = h('button', 'btn mini', '↻ Replay');
-    const pstat = h('span', 'sketch-pstat');
-    const setStat = (t) => { pstat.textContent = t; };
-    playBtn.addEventListener('click', async () => { setStat('Loading…'); setStat((await ctx.onPlayTake(take, ctx.songId)) ? 'Playing' : 'Audio unavailable'); });
-    replayBtn.addEventListener('click', async () => { setStat('Loading…'); setStat((await ctx.onReplayTake(take, ctx.songId)) ? 'Playing' : 'Audio unavailable'); });
-    stopBtn.addEventListener('click', () => { ctx.onStopPlayTake(); setStat(''); });
-    btnRow.append(playBtn, stopBtn, replayBtn, pstat);
-    box.appendChild(btnRow);
-    setPlayStatus = (t) => setStat(t);
-  } else {
-    box.appendChild(h('div', 'feel-empty pad', deck.pendingNewTake ? 'New take — route your inputs and hit Record.' : (deck.hasHistory ? 'No take loaded. Record a new one, or load one from history below.' : 'No takes yet — route your inputs and hit Record.')));
-  }
-
-  // Arm a pass into free slots, or explain the full-take options.
-  if (deck.freeSlots > 0 && deck.maxCapture > 0) box.appendChild(armPanel(deck, ctx));
-  else if (deck.loadedTake) box.appendChild(h('div', 'feel-empty', 'All 4 tracks are full — bounce a track onto another to free one, or start a new take.'));
-
-  // + New take (a fresh empty 4-track container).
-  const newBtn = h('button', 'btn mini', '+ New take');
-  newBtn.disabled = !!(deck.blocked || deck.unsupported);
-  newBtn.addEventListener('click', () => ctx.onNewTake());
-  box.appendChild(rowOf(newBtn));
-
-  return { el: box, timerEl: null, meterEls: null, setPlayStatus };
+function calPanel(box, deck, handlers) {
+  const lat = deck.monitorLatency || { ms: 0, source: 'none', spreadMs: null };
+  const desc = lat.source === 'measured'
+    ? 'Overdub sync: ' + lat.ms + ' ms measured' + (lat.spreadMs != null ? ' (±' + lat.spreadMs + ' ms)' : '')
+    : lat.source === 'manual' ? 'Overdub sync: ' + lat.ms + ' ms (manual)' : 'Overdub sync: none — playback + capture only';
+  box.appendChild(h('div', 'subtitle', desc));
+  const row = h('div', 'row routerow');
+  row.appendChild(h('span', 'lbl', 'Latency (ms)'));
+  const latIn = h('input', 'nameinput'); latIn.type = 'number'; latIn.min = '0'; latIn.max = '400'; latIn.step = '1'; latIn.value = String(lat.ms || 0); latIn.style.maxWidth = '6rem';
+  latIn.addEventListener('change', () => handlers.onSetMonitorLatency(Number(latIn.value) || 0));
+  const calBtn = h('button', 'btn mini', deck.calibrating ? 'Calibrating…' : 'Calibrate');
+  calBtn.disabled = !!(deck.calibrating || deck.blocked || deck.unsupported);
+  calBtn.addEventListener('click', () => handlers.onCalibrateLatency());
+  row.append(latIn, calBtn);
+  box.appendChild(row);
+  box.appendChild(h('div', 'feel-empty', 'Loop the EVO output to input 1 (or hold the mic to your headphones), then Calibrate. Or type a value if you already know it.'));
 }
 
-function trackStrips(deck, handlers) {
-  const wrap = h('div', 'row');
-  STEM_KEYS.forEach((key) => {
-    const stem = deck.loadedTake.stems && deck.loadedTake.stems[key];
-    if (!stem || !stem.file) return;
-    wrap.appendChild(trackStrip(key, stem, deck, handlers));
-  });
-  return wrap;
-}
-
-function dial(label, min, max, step, value, onInput, onChange) {
-  const box = h('div', 'tapedial');
-  box.appendChild(h('span', 'tapedial-label', label));
-  const input = h('input', 'tapedial-range');
-  input.type = 'range'; input.min = String(min); input.max = String(max); input.step = String(step); input.value = String(value);
-  input.addEventListener('input', () => onInput(Number(input.value)));       // capture-only, no render (D32)
-  input.addEventListener('change', () => onChange(Number(input.value)));     // pointer-up: persist debounced + render
-  box.appendChild(input);
-  return box;
-}
-
-function trackStrip(stemKey, stem, deck, handlers) {
-  const card = h('div', 'card grow tapestrip');
-  card.appendChild(h('span', 'lbl', STEM_LABELS[stemKey]));
-
-  const patch = (fields) => ({ ...fields });
-  const preview = (fields) => handlers.onPreviewStemSetting(stemKey, patch(fields));
-  const commit = (fields) => handlers.onSetStemSetting(stemKey, patch(fields));
-
-  card.appendChild(dial('Vol', 0, 1.5, 0.01, stem.vol,
-    (v) => preview({ vol: v }), (v) => commit({ vol: v })));
-  card.appendChild(dial('Bass', -12, 12, 0.5, stem.eq.bass,
-    (v) => preview({ eq: { ...stem.eq, bass: v } }), (v) => commit({ eq: { ...stem.eq, bass: v } })));
-  card.appendChild(dial('Mid', -12, 12, 0.5, stem.eq.mid,
-    (v) => preview({ eq: { ...stem.eq, mid: v } }), (v) => commit({ eq: { ...stem.eq, mid: v } })));
-  card.appendChild(dial('Treble', -12, 12, 0.5, stem.eq.treble,
-    (v) => preview({ eq: { ...stem.eq, treble: v } }), (v) => commit({ eq: { ...stem.eq, treble: v } })));
-  card.appendChild(dial('Comp', 0, 1, 0.01, stem.comp,
-    (v) => preview({ comp: v }), (v) => commit({ comp: v })));
-
-  // Per-track ping-pong bounce (freeing this slot): pick a destination from the
-  // OTHER filled tracks. Inline confirm bar, plain classList toggle (no re-render).
-  if (deck.canBounceTracks) {
-    const others = (deck.filledSlotKeys || []).filter((k) => k !== stemKey);
-    if (others.length) {
-      const bounceBtn = h('button', 'btn mini', 'Bounce ▸');
-      const bar = h('div', 'namebar hidden');
-      bar.appendChild(h('span', 'savehint', 'Bounce ' + STEM_LABELS[stemKey] + ' into… (frees this track)'));
-      others.forEach((k) => {
-        const b = h('button', 'btn mini', STEM_LABELS[k]);
-        b.addEventListener('click', () => handlers.onBounceStemToTrack(stemKey, k));
-        bar.appendChild(b);
-      });
-      const cancel = h('button', 'btn mini', 'Cancel');
-      cancel.addEventListener('click', () => bar.classList.add('hidden'));
-      bar.appendChild(cancel);
-      bounceBtn.addEventListener('click', () => bar.classList.remove('hidden'));
-      card.append(bounceBtn, bar);
-    }
-  }
-
-  return card;
-}
-
-// Retake (rescoped to the last recorded group) + master bounce + per-file Share.
-// The retake bar reuses the inline-confirm-bar idiom (built hidden, toggled with a
-// classList flip): re-recording erases only the last pass's tracks (AC: retake
-// affects only the last recorded set of tracks) and re-arms them for recording.
-function loadedActions(deck, handlers) {
-  const wrap = h('div', 'col');
-  const row = h('div', 'row tapeloaded');
-
-  if (deck.lastGroupKeys && deck.lastGroupKeys.length) {
-    const retakeBtn = h('button', 'btn', 'Retake last group');
-    const retakeBar = h('div', 'namebar hidden');
-    const redoBtn = h('button', 'btn mini danger', 'Re-record');
-    const cancelBtn = h('button', 'btn mini', 'Cancel');
-    retakeBar.append(h('span', 'savehint', 'Re-record the last group (' + labelList(deck.lastGroupKeys) + ')? This erases it.'), redoBtn, cancelBtn);
-    retakeBtn.addEventListener('click', () => retakeBar.classList.remove('hidden'));
-    redoBtn.addEventListener('click', () => handlers.onDiscardLastGroup());
-    cancelBtn.addEventListener('click', () => retakeBar.classList.add('hidden'));
-    row.appendChild(retakeBtn);
-    wrap.appendChild(retakeBar);
-  }
-
-  const bounceBtn = h('button', 'btn primary', 'Bounce to mix');
-  bounceBtn.disabled = !!deck.bouncing;
-  bounceBtn.addEventListener('click', () => handlers.onBounceTake());
-  row.appendChild(bounceBtn);
-
+function sharePanel(box, deck, handlers) {
+  box.appendChild(h('div', 'subtitle', 'Share / Export'));
+  const row = h('div', 'row');
   if (deck.loadedTake && deck.loadedTake.stems) {
     STEM_KEYS.forEach((key) => {
       const stem = deck.loadedTake.stems[key];
@@ -378,28 +363,51 @@ function loadedActions(deck, handlers) {
     btn.addEventListener('click', () => handlers.onShareTake('bounce'));
     row.appendChild(btn);
   }
-
-  wrap.insertBefore(row, wrap.firstChild);
-  return wrap;
+  box.appendChild(row);
 }
 
-function takeHistory(deck, handlers) {
-  const box = h('div', 'card grow takehistory');
-  box.appendChild(h('span', 'lbl', 'Take history'));
-  const takes = (deck.manifestTakes || []).slice().sort((a, b) => b.take - a.take);
-  if (!takes.length) { box.appendChild(h('div', 'feel-empty', 'No takes recorded yet.')); return box; }
-  const list = h('div', 'savedlist');
-  takes.forEach((t) => list.appendChild(historyRow(t, deck, handlers)));
-  box.appendChild(list);
+// ---- piano-key transport ----
+function transport(deck, ctx) {
+  const box = h('div', 'pkeys');
+  const haveAudio = !!deck.loadedTake && deck.filledCount > 0;
+  const key = (cls, glyph, label, disabled, click) => {
+    const b = h('button', 'pkey ' + cls, '');
+    b.append(h('span', 'pk-glyph', glyph), h('span', 'pk-lbl', label));
+    b.disabled = !!disabled;
+    b.addEventListener('click', click);
+    box.appendChild(b);
+    return b;
+  };
+  key('', '⏮', 'RTZ', deck.recording || deck.bouncing || !haveAudio, async () => {
+    ctx.setStat('Loading…'); ctx.setStat((await ctx.onReplayTake(deck.loadedTake, ctx.songId)) ? 'Playing' : 'Audio unavailable');
+  });
+  key('', '▶', 'PLAY', deck.recording || deck.bouncing || !haveAudio, async () => {
+    ctx.setStat('Loading…'); ctx.setStat((await ctx.onPlayTake(deck.loadedTake, ctx.songId)) ? 'Playing' : 'Audio unavailable');
+  });
+  key('', '■', 'STOP', deck.bouncing, () => { if (deck.recording) ctx.onStopTake(); else { ctx.onStopPlayTake(); ctx.setStat(''); } });
+  key('rec' + (deck.recording ? ' on' : ''), '●', 'REC', deck.recording || deck.bouncing || !deck.canRecord, () => ctx.onArmRecordPass());
   return box;
 }
 
-// The count of filled tracks in a take (for the history "N/4 tracks" line).
+// ---- collapsible take log ----
+function takeLog(deck, handlers) {
+  const takes = (deck.manifestTakes || []).slice().sort((a, b) => b.take - a.take);
+  const details = h('details', 'tapelog');
+  if (deck.logOpen) details.open = true;
+  const sum = h('summary', null, 'TAPE LOG — ' + takes.length + ' take' + (takes.length === 1 ? '' : 's'));
+  details.appendChild(sum);
+  details.addEventListener('toggle', () => handlers.onToggleTakeLog(details.open));
+  if (!takes.length) { details.appendChild(h('div', 'feel-empty', 'No takes recorded yet.')); return details; }
+  const list = h('div', 'savedlist');
+  takes.forEach((t) => list.appendChild(historyRow(t, deck, handlers)));
+  details.appendChild(list);
+  return details;
+}
+
 function filledCountOf(t) {
   if (!t || !t.stems) return 0;
   return STEM_KEYS.reduce((n, k) => n + (t.stems[k] && t.stems[k].file ? 1 : 0), 0);
 }
-// First shareable ref for a take without loading it: the mix, else the first track.
 function firstShareRef(t) {
   if (t.bounce && t.bounce.file) return 'bounce';
   if (!t.stems) return null;
@@ -424,15 +432,13 @@ function historyRow(t, deck, handlers) {
   const when = h('div', 'stuning', fmtWhen(t.createdAt) + ' · ' + fmtTime(t.durationSec) + ' · ' + filledCountOf(t) + '/4');
   const loadBtn = h('button', 'btn mini', 'Load');
   loadBtn.addEventListener('click', (e) => { e.stopPropagation(); handlers.onSelectTake(t.take); });
-  // AC-10: active rows offer Load, Share, and Delete. Share the finished mix when
-  // one exists, else the first available track — reachable without first Loading.
   const shareRef = firstShareRef(t);
   const shareBtn = h('button', 'btn mini', 'Share');
   shareBtn.disabled = !shareRef;
   shareBtn.addEventListener('click', (e) => { e.stopPropagation(); if (shareRef) handlers.onShareTake(shareRef, t.take); });
   const delBtn = h('button', 'btn mini danger', '✕');
   delBtn.title = 'Delete take';
-  delBtn.disabled = !!deck.bouncing; // a bounce in flight may be writing this exact take's mix file (AC-13/22 race)
+  delBtn.disabled = !!deck.bouncing; // a bounce in flight may be writing this take's mix file (AC-13/22 race)
   const confirmBar = h('div', 'namebar hidden');
   const delOk = h('button', 'btn mini danger', 'Delete');
   const delCancel = h('button', 'btn mini', 'Cancel');
@@ -445,3 +451,5 @@ function historyRow(t, deck, handlers) {
   wrap.append(row, confirmBar);
   return wrap;
 }
+
+const rowOf = (child) => { const r = h('div', 'row'); r.appendChild(child); return r; };
