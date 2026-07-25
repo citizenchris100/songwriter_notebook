@@ -1,0 +1,10 @@
+{
+  "$schema": "./feel.schema.json",
+  "id": "like-a-rolling-stone",
+  "name": "Like a Rolling Stone",
+  "progression": ["I", "ii", "iii", "IV", "V"],
+  "description": "The stepwise diatonic climb up the major scale that opens Like a Rolling Stone and drives I Shall Be Released. Each chord steps up one scale degree, I to ii to iii to IV to V. Fully functional major.",
+  "tags": ["bob-dylan", "electric", "stepwise-climb", "functional-major"],
+  "source": "Bob Dylan, via Ultimate Guitar chord sheets (Like a Rolling Stone; I Shall Be Released)",
+  "schemaVersion": 2
+}

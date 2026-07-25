@@ -1,0 +1,10 @@
+{
+  "$schema": "./feel.schema.json",
+  "id": "simple-twist",
+  "name": "Simple Twist",
+  "progression": ["I", "Imaj7", "I7", "IV", "iv", "I", "V"],
+  "description": "The confessional Blood on the Tracks move from Simple Twist of Fate: a chromatic descent on the tonic (I to Imaj7 to I7) down into the subdominant, then the borrowed minor iv darkening the return home. The IV-to-iv darkening recurs in Make You Feel My Love.",
+  "tags": ["bob-dylan", "confessional", "minor-iv", "ballad", "blood-on-the-tracks"],
+  "source": "Bob Dylan, via Ultimate Guitar chord sheets (Simple Twist of Fate; minor-iv corroborated by Make You Feel My Love)",
+  "schemaVersion": 2
+}

@@ -1,0 +1,10 @@
+{
+  "$schema": "./feel.schema.json",
+  "id": "watchtower",
+  "name": "Watchtower",
+  "progression": ["i", "bVII", "bVI", "bVII"],
+  "description": "The aeolian descent of All Along the Watchtower: a minor tonic that rocks down to bVI and back with no functional dominant. The same modal palette drives Man in the Long Black Coat.",
+  "tags": ["bob-dylan", "aeolian", "modal", "minor-vamp"],
+  "source": "Bob Dylan, via Ultimate Guitar chord sheets (All Along the Watchtower; Man in the Long Black Coat)",
+  "schemaVersion": 2
+}
