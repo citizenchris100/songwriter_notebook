@@ -316,7 +316,10 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
         onClock && onClock({ mode: 'record', elapsedSec: msg.frames / audioCtx.sampleRate, durationSec: null });
         return;
       }
-      if (msg.op === 'append' && !portTransferOk) takeStore.relayAppend(msg.stem, msg.bytes);
+      if (!portTransferOk) {
+        if (msg.op === 'append') takeStore.relayAppend(msg.stem, msg.bytes);
+        else if (msg.op === 'drain') takeStore.relayDrain(msg.drainId); // relay the end-of-stream barrier too
+      }
     };
 
     // Open this pass's stem files BEFORE the capture graph is connected, so the
@@ -407,21 +410,25 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     if (recordMeta && recordMeta.cleanup) recordMeta.cleanup();
     stopClick(); // silence the metronome the instant Stop is hit, before the flush wait
 
-    // Snapshot the node: a stray late ack must never touch whatever `workletNode`
-    // the outer closure points at BY THEN (a subsequent record() may have
-    // already replaced it, or teardownCaptureGraph() may have nulled it).
+    // Snapshot the node: a stray late message must never touch whatever `workletNode`
+    // the outer closure points at BY THEN (a subsequent record() may have already
+    // replaced it, or teardownCaptureGraph() may have nulled it).
     const node = workletNode;
     if (node) {
+      // Drain barrier (sample-perfect tails): register a drainId-correlated waiter, tell
+      // the worklet to flush AND emit its end-of-stream marker stamped with that id, then
+      // wait for the worker to confirm every append (including the final flush chunk) is
+      // written BEFORE finalizing. The marker rides the SAME channel as the appends (the
+      // worker port, or the main-thread relay), so it can't overtake them. The 500 ms race
+      // is the liveness net for a lost/late drain (suspended context / wedged worker) — the
+      // same bound the old flush-ack had, with the same worst case (finalize anyway). The
+      // persistent node.port handler stays active: it relays the drain in the fallback and
+      // harmlessly ignores the {flushed:true} ack.
+      const { id: drainId, promise: drained } = takeStore.awaitDrain();
+      node.port.postMessage({ op: 'flush', drainId });
       await new Promise((resolve) => {
-        const prevHandler = node.port.onmessage;
-        let settled = false;
-        const finish = () => { if (settled) return; settled = true; node.port.onmessage = prevHandler; resolve(); };
-        const timeout = setTimeout(finish, 500); // safety net if the ack is ever lost
-        node.port.onmessage = (e) => {
-          if (e.data && e.data.flushed) { clearTimeout(timeout); finish(); return; }
-          prevHandler && prevHandler(e);
-        };
-        node.port.postMessage({ op: 'flush' });
+        const timer = setTimeout(resolve, 500);
+        drained.then(() => { clearTimeout(timer); resolve(); });
       });
     }
 

@@ -197,6 +197,16 @@ function postWriteError(message) {
   self.postMessage({ type: 'writeError', message });
 }
 
+// The drain barrier (sample-perfect tails): the worklet posts {op:'drain',drainId} on the
+// SAME channel as its appends (the transferred audio port, or — in the D33 fallback —
+// relayed over the control channel), so by the time we see it every prior append for this
+// take is already written. Echo it back so the main thread's stop() can finalize ONLY
+// after the final flush chunk has landed. Drain does NOT finalize (that stays a separate
+// op that closes handles + the flush timer); it is purely an ordered "all appends in" ack.
+function postDrained(drainId) {
+  self.postMessage({ type: 'drained', drainId });
+}
+
 // createSyncAccessHandle exists ONLY on the Worker-realm FileSystemFileHandle —
 // checking `'createSyncAccessHandle' in FileSystemFileHandle.prototype` from the
 // main thread always reports false, even on browsers that fully support it.
@@ -210,7 +220,8 @@ const REQUEST_HANDLERS = { openTake, finalizeTake: async () => finalizeTake(), f
 async function handleControlMessage(msg) {
   if (!msg || typeof msg !== 'object') return;
   if (msg.op === 'append') { handleAppend(msg.stem, msg.bytes); return; }             // fire-and-forget
-  if (msg.op === 'bindPort') { msg.port.onmessage = (e) => { const m = e.data; if (m && m.op === 'append') handleAppend(m.stem, m.bytes); }; return; }
+  if (msg.op === 'drain') { postDrained(msg.drainId); return; }                       // fallback: relayed end-of-stream barrier
+  if (msg.op === 'bindPort') { msg.port.onmessage = (e) => { const m = e.data; if (!m) return; if (m.op === 'append') handleAppend(m.stem, m.bytes); else if (m.op === 'drain') postDrained(m.drainId); }; return; }
   const fn = REQUEST_HANDLERS[msg.op];
   if (!fn) { self.postMessage({ id: msg.id, ok: false, error: 'unknown op ' + msg.op }); return; }
   try {

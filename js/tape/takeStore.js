@@ -10,6 +10,11 @@ let idSeq = 0;
 const pending = new Map();
 const writeErrorCbs = [];
 let offlineSafeFlag = true;
+// Drain barrier (sample-perfect tails): a single-slot waiter for the worker's
+// {type:'drained', drainId} ack, correlated by a monotonic drainId so a late drain from
+// a timed-out earlier stop can never resolve a later stop's waiter.
+let drainSeq = 0;
+let drainWaiter = null; // { id, resolve } | null
 
 // D21: fetch the worker's own source (SW-cache-served offline) and load it from
 // a Blob URL, so `new Worker(...)` never hits the network directly. A plain-URL
@@ -33,6 +38,7 @@ function loadWorker() {
     worker.onmessage = (e) => {
       const msg = e.data;
       if (msg && msg.type === 'writeError') { writeErrorCbs.forEach((cb) => cb(msg.message)); return; }
+      if (msg && msg.type === 'drained') { if (drainWaiter && drainWaiter.id === msg.drainId) { const w = drainWaiter; drainWaiter = null; w.resolve(); } return; }
       const p = pending.get(msg.id);
       if (!p) return;
       pending.delete(msg.id);
@@ -80,6 +86,22 @@ export async function bindAudioPort(port) {
 export async function relayAppend(stemNum, bytes) {
   const worker = await loadWorker();
   worker.postMessage({ op: 'append', stem: stemNum, bytes }, [bytes]);
+}
+
+// Drain barrier (sample-perfect tails): register a one-shot waiter for the worker's
+// {type:'drained'} ack and return its drainId, which the caller stamps onto the {op:'flush'}
+// it sends the worklet. stop() awaits `promise` (under its own timeout) before finalizing,
+// so the take is finalized only after the final flush chunk has been written.
+export function awaitDrain() {
+  const id = ++drainSeq;
+  const promise = new Promise((resolve) => { drainWaiter = { id, resolve }; });
+  return { id, promise };
+}
+// Fallback (port transfer failed): relay the worklet's end-of-stream marker onto the
+// control channel, so it stays FIFO-ordered behind the relayed appends.
+export async function relayDrain(drainId) {
+  const worker = await loadWorker();
+  worker.postMessage({ op: 'drain', drainId });
 }
 
 // ---- manifest ----

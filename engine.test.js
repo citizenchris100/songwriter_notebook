@@ -1010,6 +1010,48 @@ ok('decayPeak fall rate matches FALL_DB_PER_SEC', Math.abs(decayPeak(1.0, 0, 100
     ok('in-order finalize reports the data bytes', w.outbound.some((m) => m && m.id === 2 && m.dataBytes && m.dataBytes.stem1 === 4));
     ok('in-order path emits no writeError', writeErrs(w).length === 0);
   }
+
+  // ---- DRAIN BARRIER (sample-perfect tails) ----
+  // A drain marker rides the SAME channel as the appends, so the worker processes it
+  // AFTER every append is written, then echoes {type:'drained', drainId}. stop() waits
+  // for that echo before finalizeTake, so the final flush chunk can never be dropped.
+  const drainedIn = (w) => w.outbound.filter((m) => m && m.type === 'drained');
+  // R1: drain over the bound AUDIO port -> drained echoed with its id.
+  {
+    const w = loadWorker(); const p = w.bindPort();
+    await w.control({ id: 1, op: 'openTake', dir: 'takes/s/', files: { stem1: 's-1-1.wav' }, header, sizeFields: SF });
+    w.portSend(p, { op: 'drain', drainId: 3 });
+    const d = drainedIn(w);
+    ok('drain over the audio port echoes {type:drained}', d.length === 1);
+    ok('drained echoes the drainId (audio port)', d[0] && d[0].drainId === 3);
+  }
+  // R2 + R2b: drain over the CONTROL channel (fallback relay) -> drained echoed with id.
+  {
+    const w = loadWorker();
+    await w.control({ id: 1, op: 'openTake', dir: 'takes/s/', files: { stem1: 's-1-1.wav' }, header, sizeFields: SF });
+    await w.control({ op: 'drain', drainId: 7 });
+    const d = drainedIn(w);
+    ok('drain over the control channel echoes drained with its id', d.length === 1 && d[0].drainId === 7);
+    ok('a relayed drain is not mistaken for an unknown op', !w.outbound.some((m) => m && m.error && /unknown op drain/.test(m.error)));
+  }
+  // R3 (crux): at the instant drained is emitted, every prior port-append is already written.
+  {
+    const w = loadWorker(); const p = w.bindPort();
+    await w.control({ id: 1, op: 'openTake', dir: 'takes/s/', files: { stem1: 's-1-1.wav' }, header, sizeFields: SF });
+    w.portSend(p, { op: 'append', stem: 1, bytes: chunk() });        // -> 48 bytes on disk
+    w.portSend(p, { op: 'drain', drainId: 1 });
+    ok('drain trails the append: file is 48 bytes AND drained emitted', w.store['takes/s/s-1-1.wav'].length === 48 && drainedIn(w).length === 1);
+  }
+  // R4: drain is a barrier SIGNAL, not a finalize — the take stays open for more writes.
+  {
+    const w = loadWorker(); const p = w.bindPort();
+    await w.control({ id: 1, op: 'openTake', dir: 'takes/s/', files: { stem1: 's-1-1.wav' }, header, sizeFields: SF });
+    w.portSend(p, { op: 'append', stem: 1, bytes: chunk() });
+    w.portSend(p, { op: 'drain', drainId: 1 });
+    w.portSend(p, { op: 'append', stem: 1, bytes: chunk() });        // still accepted -> 52 bytes
+    ok('drain does not finalize: a later append still writes', w.store['takes/s/s-1-1.wav'].length === 52);
+    ok('drain emits no writeError', writeErrs(w).length === 0);
+  }
 }
 
 // ============================================================================
@@ -1028,6 +1070,81 @@ ok('decayPeak fall rate matches FALL_DB_PER_SEC', Math.abs(decayPeak(1.0, 0, 100
   ok('teardown severs the capture source', aeSrc.includes('captureSource.disconnect()'));
   const mainSrc = readFileSync(here('./js/main.js'), 'utf8');
   ok('onStopTake clears deckRecording even if stop() throws', /finally\s*{\s*if \(deckRecording\)\s*{\s*deckRecording = false/.test(mainSrc));
+
+  // ---- drain-barrier wiring (sample-perfect tails) — browser-only paths node can't run ----
+  ok('worklet posts a drain barrier on flush', /postMessage\(\s*\{\s*op:\s*['"]drain['"]/.test(capSrc));
+  ok('measure flush stays drainless', /if \(this\.measure\) \{\s*this\.postMeasureChunk\(\)/.test(capSrc));
+  ok('worker emits the drained ack', /type:\s*['"]drained['"]/.test(owSrc));
+  ok('worker handles a drain op', owSrc.includes("msg.op === 'drain'"));
+  ok('stop awaits drain BEFORE finalize', aeSrc.indexOf('awaitDrain') > 0 && aeSrc.indexOf('awaitDrain') < aeSrc.indexOf('finalizeTakeFiles'));
+  ok('drain wait is bounded by a timeout', aeSrc.includes('setTimeout(resolve, 500)') && /drained\.then/.test(aeSrc));
+  ok('fallback relays the drain marker', aeSrc.includes('relayDrain'));
+  const tsSrc = readFileSync(here('./js/tape/takeStore.js'), 'utf8');
+  ok('takeStore exposes awaitDrain + relayDrain', tsSrc.includes('export function awaitDrain') && tsSrc.includes('export async function relayDrain'));
+  ok('takeStore demuxes the drained ack (id-matched)', /type === 'drained'/.test(tsSrc) && tsSrc.includes('drainWaiter.id === msg.drainId'));
+}
+
+// ============================================================================
+// 24. Capture worklet emits the drain barrier on flush (sample-perfect tails).
+//     captureProcessor.js is an AudioWorkletProcessor (browser-only); load the REAL
+//     source in a vm sandbox mocking AudioWorkletProcessor / registerProcessor /
+//     sampleRate / currentFrame. On flush it must post its final {op:'append'} then a
+//     {op:'drain', drainId} over the SAME port the appends use (workerPort if
+//     transferred, else the node port), UNCONDITIONALLY (a cursor-0 stop must still
+//     drain, else stop()'s awaitDrain eats the full timeout) — but NEVER in measure mode.
+// ============================================================================
+{
+  const CAP_SRC = readFileSync(here('./js/tape/captureProcessor.js'), 'utf8');
+  const mkPort = () => { const posted = []; return { posted, postMessage(m) { posted.push(m); }, onmessage: null }; };
+  function loadWorklet(opts) {
+    let Captured = null;
+    const sandbox = {
+      sampleRate: 48000, currentFrame: 0,
+      Float32Array, Int16Array, Uint8Array, ArrayBuffer, DataView,
+      AudioWorkletProcessor: class { constructor() { this.port = mkPort(); } },
+      registerProcessor: (name, cls) => { Captured = cls; },
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(CAP_SRC, sandbox, { filename: 'captureProcessor.js' });
+    return new Captured({ processorOptions: opts });
+  }
+  const flush = (proc, drainId) => proc.port.onmessage({ data: { op: 'flush', drainId } });
+  const fill = (proc, n) => proc.process([[new Float32Array(n)]]); // n<8192 -> cursor=n, no auto-flush
+  const opsOf = (posted) => posted.filter((m) => m && m.op).map((m) => m.op);
+
+  // R5 (port path): final append THEN drain over the transferred worker port, in order.
+  {
+    const proc = loadWorklet({ channelCount: 1, slots: [1], beginFrame: 0 });
+    const wp = mkPort(); proc.port.onmessage({ data: { port: wp } }); // transfer the worker port
+    fill(proc, 100);
+    flush(proc, 5);
+    ok('flush posts [append, drain] over the worker port in order', opsOf(wp.posted).join(',') === 'append,drain');
+    ok('drain over the worker port carries the drainId', (wp.posted.find((m) => m.op === 'drain') || {}).drainId === 5);
+    ok('flushed ack still goes on the node port', proc.port.posted.some((m) => m && m.flushed === true));
+  }
+  // R6 (fallback path): no worker port -> append, drain, flushed all on the node port, in order.
+  {
+    const proc = loadWorklet({ channelCount: 1, slots: [1], beginFrame: 0 });
+    fill(proc, 100);
+    flush(proc, 9);
+    const seq = proc.port.posted.filter((m) => m && (m.op || m.flushed)).map((m) => m.op || 'flushed').join(',');
+    ok('fallback posts append,drain,flushed on the node port in order', seq === 'append,drain,flushed');
+  }
+  // R7 (measure guard): measure flush emits a measure chunk + flushed, NEVER a drain.
+  {
+    const proc = loadWorklet({ channelCount: 1, measure: true });
+    flush(proc, 1);
+    ok('measure flush emits no drain', !proc.port.posted.some((m) => m && m.op === 'drain'));
+    ok('measure flush still acks flushed', proc.port.posted.some((m) => m && m.flushed === true));
+  }
+  // R8 (F1 — unconditional): a cursor-0 stop STILL drains (else awaitDrain hangs the timeout).
+  {
+    const proc = loadWorklet({ channelCount: 1, slots: [1], beginFrame: 0 });
+    const wp = mkPort(); proc.port.onmessage({ data: { port: wp } });
+    flush(proc, 2); // no fill -> cursor 0 -> no append, but a drain must still fire
+    ok('cursor-0 flush still posts a drain', wp.posted.some((m) => m && m.op === 'drain'));
+    ok('cursor-0 flush posts no append', !wp.posted.some((m) => m && m.op === 'append'));
+  }
 }
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');

@@ -68,8 +68,17 @@ class CaptureProcessor extends AudioWorkletProcessor {
       if (data.port) { this.workerPort = data.port; return; }
       if (data.op === 'begin' && typeof data.beginFrame === 'number') { this.beginFrame = data.beginFrame; return; }
       if (data.op === 'flush') {
-        if (this.measure) this.postMeasureChunk();
-        else if (this.cursor > 0) this.flushChunk(this.cursor);
+        if (this.measure) {
+          this.postMeasureChunk();
+        } else {
+          if (this.cursor > 0) this.flushChunk(this.cursor);
+          // Drain barrier (sample-perfect tails): post an end-of-stream marker on the
+          // SAME port the appends use (workerPort in the D33 path, else this.port for the
+          // main-thread relay), AFTER the final chunk and UNCONDITIONALLY — a cursor-0
+          // Stop must still drain, else the main thread's awaitDrain waits out its whole
+          // timeout. Never in measure mode (calibration has no take and no worker port).
+          (this.workerPort || this.port).postMessage({ op: 'drain', drainId: data.drainId });
+        }
         this.closed = true;                       // stop capturing (process() self-removes next quantum)
         this.port.postMessage({ flushed: true });
         return;
