@@ -11,7 +11,7 @@ import { integratedLoudness } from './lufs.js';
 import { limit } from './limiter.js';
 import {
   STEM_KEYS, MAX_TRACKS, stemFileName, mixFileName, compressorParams, bounceGainDb,
-  EQ_BANDS, LIMITER_CEILING_DB, defaultStemSettings,
+  EQ_BANDS, LIMITER_CEILING_DB, defaultStemSettings, playbackCacheStale,
 } from './takeModel.js';
 import { detectClickSample, rttSeconds, summarizeTrials } from './latency.js';
 import { makeClick } from './click.js';
@@ -111,7 +111,11 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   let wakeLock = null;
   let recording = false;
   let recordMeta = null;      // { slug, take, sampleRate, slotKeys, overdub, cleanup }
-  let playChains = null;      // { slug, take, sumBus, stems: { stem1: {buffer, chain, activeSource}|null, ... } }
+  let playChains = null;      // { slug, take, epoch, sumBus, stems: { stem1: {buffer, chain, activeSource}|null, ... } }
+  let recordEpoch = 0;        // monotonic; bumped on every in-place audio write (a record pass truncating/
+                              // overwriting a take's WAVs, or a ping-pong bounce overwriting the dst WAV) so
+                              // play()/replay() drop the decoded-buffer cache when a take's audio changes
+                              // under a FIXED take number (retake, overdub, bounce). Content fields can't tell.
   let monitorGraph = null;    // overdub backing playback during a pass: { sumBus, sources: [] }
   let clickEngine = null;     // the record-only metronome (count-in + click), null when off
 
@@ -332,6 +336,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     const files = {};
     for (const key of slotKeys) files[key] = stemFileName(slug, take, key);
     await takeStore.openTakeFiles('takes/' + slug + '/', files, header, SIZE_FIELDS);
+    recordEpoch++; // this take's WAV(s) were just truncated/overwritten — invalidate any cached playback buffers
 
     // A silent sink so the worklet is reliably pulled even though its own
     // output is never actually monitored (D5 — hardware-monitor-only).
@@ -488,7 +493,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
       const tap = makeTap(audioCtx); chain.output.connect(tap); // per-track playback meter (D34)
       stems[key] = { buffer, chain, tap, activeSource: null };
     }
-    playChains = { slug, take: take.take, sumBus, masterTap, stems };
+    playChains = { slug, take: take.take, epoch: recordEpoch, sumBus, masterTap, stems };
   }
 
   function disposePlayback() {
@@ -509,7 +514,8 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   }
 
   async function play(take, slug) {
-    if (!playChains || playChains.slug !== slug || playChains.take !== take.take) await loadTake(take, slug);
+    const want = { slug, take: take.take, epoch: recordEpoch };
+    if (playbackCacheStale(playChains, want)) await loadTake(take, slug);
     stopPlaySources();
     const audioCtx = ctx;
     const startAt = audioCtx.currentTime + 0.1; // all stems start together -> sample-locked
@@ -536,7 +542,8 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   }
 
   async function replay(take, slug) {
-    if (playChains && playChains.slug === slug && playChains.take === take.take) stopPlaySources();
+    const want = { slug, take: take.take, epoch: recordEpoch };
+    if (!playbackCacheStale(playChains, want)) stopPlaySources();
     return play(take, slug);
   }
 
@@ -621,6 +628,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     if (!mono) return { ok: false, error: 'nothing to bounce' };
     limit([mono], BOUNCE_RATE, LIMITER_CEILING_DB);
     await takeStore.writeFile('takes/' + slug + '/' + dst.file, encodeMonoWav(mono));
+    recordEpoch++; // dst WAV overwritten in place under the same take number — invalidate cached playback buffers
     return { ok: true, srcKey, dstKey, durationSec };
   }
 
@@ -719,5 +727,5 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     if (ctx) { try { ctx.close(); } catch { /* already closed */ } ctx = null; masterBus = null; }
   }
 
-  return { probe, record, stop, play, replay, stopPlay, bounce, bounceTracks, applySettings, setMasterVol, calibrateLatency, dispose };
+  return { probe, record, stop, play, replay, stopPlay, invalidatePlayback: disposePlayback, bounce, bounceTracks, applySettings, setMasterVol, calibrateLatency, dispose };
 }

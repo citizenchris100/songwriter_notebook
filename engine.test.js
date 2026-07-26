@@ -31,7 +31,7 @@ import {
   makeTake, appendTake, nextTakeNumber, appendPassTracks, finalizePass, finalizeRecoveredPass,
   discardTake, discardGroup, bounceTrackToTrack, markBounced, setStemSettings, mostRecentKeptTake,
   nextGroup, lastGroupSlotKeys, freeSlotKeys, filledSlotKeys, maxSlotDuration, takeHasAudio,
-  slotHasAudio, defaultRouting, stemFileName, mixFileName, tapeDeckRef,
+  slotHasAudio, defaultRouting, stemFileName, mixFileName, tapeDeckRef, playbackCacheStale,
   defaultStemSettings, clampStemSettings, compressorParams, bounceGainDb,
   LUFS_TARGET, LUFS_FLOOR, BOUNCE_GAIN_DB_MIN, BOUNCE_GAIN_DB_MAX, LIMITER_CEILING_DB,
   STEM_KEYS, MAX_TRACKS, TAKE_STATUS,
@@ -710,6 +710,31 @@ const v1Mono = { schemaVersion: 1, slug: 's', takes: [{ take: 1, status: 'active
 const mm = normalizeManifest(v1Mono).takes[0];
 ok('mono v1 migrates stem1 only', mm.stems.stem1.file === 's_1_stem1.wav' && mm.stems.stem1.group === 1 && mm.stems.stem2 === null);
 
+// ---- playbackCacheStale: the retake / in-place-overwrite cache-invalidation predicate ----
+// audioEngine caches a take's DECODED playback buffers keyed on a small descriptor. A
+// "retake" re-records the SAME take number into the SAME OPFS WAV, and a ping-pong bounce
+// overwrites the dst WAV in place — both under an unchanged (slug, take). Only an engine-local
+// monotonic recordEpoch distinguishes the new audio; content fields are unreliable (group
+// resets to 1 on a single-pass retake, durationSec can collide). This pure predicate is the
+// single reload decision play()/replay() consult: it MUST report stale on an epoch bump under
+// a fixed (slug, take), or the deck replays the first cut forever.
+ok('cache is fresh when slug+take+epoch all match',
+   playbackCacheStale({ slug: 's', take: 1, epoch: 0 }, { slug: 's', take: 1, epoch: 0 }) === false);
+ok('cache is stale on a null (never-loaded) cache',
+   playbackCacheStale(null, { slug: 's', take: 1, epoch: 0 }) === true);
+ok('cache is stale when the slug differs',
+   playbackCacheStale({ slug: 's', take: 1, epoch: 0 }, { slug: 't', take: 1, epoch: 0 }) === true);
+ok('cache is stale when the take number differs',
+   playbackCacheStale({ slug: 's', take: 1, epoch: 0 }, { slug: 's', take: 2, epoch: 0 }) === true);
+// THE RED-PROVING VECTOR — same slug, same take number, bumped epoch (a retake overwrote the
+// take's WAV in place). A take-number-only cache returns false ("fresh") here and replays the
+// first recording; the fix makes it true. This one line IS the reported bug.
+ok('cache is stale when only the record epoch bumped (retake in place)',
+   playbackCacheStale({ slug: 's', take: 1, epoch: 0 }, { slug: 's', take: 1, epoch: 1 }) === true);
+// Second manifestation: a ping-pong bounce overwrites dst under the same take number.
+ok('cache is stale after an in-place bounce bumps the epoch',
+   playbackCacheStale({ slug: 's', take: 3, epoch: 4 }, { slug: 's', take: 3, epoch: 5 }) === true);
+
 // ============================================================================
 // 15. Tape deck (pure) — wav.js
 // ============================================================================
@@ -1082,6 +1107,39 @@ ok('decayPeak fall rate matches FALL_DB_PER_SEC', Math.abs(decayPeak(1.0, 0, 100
   const tsSrc = readFileSync(here('./js/tape/takeStore.js'), 'utf8');
   ok('takeStore exposes awaitDrain + relayDrain', tsSrc.includes('export function awaitDrain') && tsSrc.includes('export async function relayDrain'));
   ok('takeStore demuxes the drained ack (id-matched)', /type === 'drained'/.test(tsSrc) && tsSrc.includes('drainWaiter.id === msg.drainId'));
+
+  // ---- retake / in-place-overwrite playback-cache invalidation (recordEpoch) ----
+  //   A retake re-records the SAME take number over the SAME WAV, and a ping-pong bounce
+  //   overwrites the dst WAV in place — both under an unchanged (slug, take). A monotonic
+  //   engine-local recordEpoch, bumped on every in-place audio write, is the only reliable
+  //   invalidator. Section 14 proves the DECISION (playbackCacheStale); these prove the deck
+  //   actually feeds the epoch through it. Browser-only paths node can't execute.
+  ok('audioEngine imports playbackCacheStale from the pure model',
+     /import\s*\{[^}]*playbackCacheStale[^}]*\}\s*from\s*'\.\/takeModel\.js'/.test(aeSrc));
+  ok('engine declares a monotonic recordEpoch counter', /let\s+recordEpoch\s*=\s*0/.test(aeSrc));
+  ok('loadTake stamps the epoch onto playChains', /playChains\s*=\s*\{[^}]*epoch:\s*recordEpoch/.test(aeSrc));
+  ok('play/replay consult playbackCacheStale with the live epoch',
+     aeSrc.includes('epoch: recordEpoch') && (aeSrc.match(/playbackCacheStale\(/g) || []).length >= 2);
+  {
+    const s = aeSrc.indexOf('async function record('), e = aeSrc.indexOf('async function stop(');
+    ok('record() bumps recordEpoch when it opens the take files',
+       s > 0 && e > s && aeSrc.slice(s, e).includes('recordEpoch++'));
+  }
+  {
+    const s = aeSrc.indexOf('async function bounceTracks('), e = aeSrc.indexOf('async function calibrateLatency(');
+    ok('bounceTracks() bumps recordEpoch on the in-place dst overwrite',
+       s > 0 && e > s && aeSrc.slice(s, e).includes('recordEpoch++'));
+  }
+
+  // ---- Finding B: deleting the currently-loaded take must DISPOSE (not just stop) playback,
+  //   else its decoded buffers + graph nodes linger past the delete. Lifecycle wiring, no pure seam. ----
+  ok('engine exposes invalidatePlayback on its public API',
+     /return\s*\{[^}]*\binvalidatePlayback\b/.test(aeSrc));
+  {
+    const s = mainSrc.indexOf('onDeleteTake:'), e = mainSrc.indexOf('onSelectTake:');
+    ok('onDeleteTake invalidates playback when the loaded take is deleted',
+       s > 0 && e > s && mainSrc.slice(s, e).includes('invalidatePlayback'));
+  }
 }
 
 // ============================================================================

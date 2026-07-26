@@ -108,6 +108,20 @@ export function tapeDeckRef(slug) {
   return { path: 'takes/' + slug + '/' };
 }
 
+// ---- playback cache invalidation (audioEngine.js D34 playback graph) ----
+
+// audioEngine caches a take's DECODED playback buffers in a small descriptor and reuses
+// them until this predicate reports the cache stale. A retake re-records the SAME take
+// number over the SAME WAV, and a ping-pong bounce overwrites the dst WAV in place — both
+// under an unchanged (slug, take), so a slug+take key can't see the new audio. The impure
+// engine bumps a monotonic `epoch` on every in-place audio write and stamps it on the
+// loaded descriptor; content fields are NOT reliable invalidators (group resets to 1 on a
+// single-pass retake, durationSec can collide). This is the single reload decision that
+// play()/replay() consult.
+export function playbackCacheStale(loaded, want) {
+  return !loaded || loaded.slug !== want.slug || loaded.take !== want.take || loaded.epoch !== want.epoch;
+}
+
 // ---- slot helpers (a track slot is null | { file, group, durationSec, ...settings }) ----
 
 // A slot holds audio iff it is non-null with a non-null file. (An armed slot has a

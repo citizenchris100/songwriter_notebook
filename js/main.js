@@ -1412,7 +1412,7 @@ const handlers = {
       await takeStore.writeManifest(manifestPath(a.id), deckManifest);
       takeStore.deleteTakeAudio(a.id, takeNo).catch(() => {});
       if (currentTake === takeNo) {
-        if (tapeDeck) tapeDeck.stopPlay();
+        if (tapeDeck) tapeDeck.invalidatePlayback(); // drop the deleted take's decoded buffers + graph, not just stop its sources
         const kept = takeModel.mostRecentKeptTake(deckManifest);
         currentTake = kept ? kept.take : null;
       }
