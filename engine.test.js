@@ -8,6 +8,7 @@
 // spelling; everything else matches the original (see generators/alternatives.js).
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
 import { deriveOutput } from './js/derive.js';
 import { scaleOf } from './js/theory/scale.js';
 import { noteName } from './js/theory/pitch.js';
@@ -934,6 +935,99 @@ ok('decayPeak fall rate matches FALL_DB_PER_SEC', Math.abs(decayPeak(1.0, 0, 100
   ok('clipState releases after the hold', !c3.clipped && c3.until === 0);
   ok('clipState stays clear below threshold', !clipState(null, 0.5, 0).clipped);
   ok('a peak exactly at threshold clips', clipState(null, CLIP_THRESHOLD, 0).clipped);
+}
+
+// ============================================================================
+// 22. OPFS worker append/finalize ordering (the tape-deck "stuck after recording"
+//     regression). opfsWorker.js is browser-only (self/navigator/OPFS), so we run
+//     the REAL source in a vm sandbox with an in-memory OPFS and the two message
+//     channels the worker actually has: the transferred audio port (appends) and
+//     the control channel (openTake/finalizeTake). Appends and finalize race across
+//     those two unordered ports; a chunk that lands after finalize must be a benign
+//     no-op, NOT a writeError — the writeError is what banner-storms the deck and
+//     leaves it "crashed until a hard refresh".
+{
+  const WORKER_SRC = readFileSync(here('./js/tape/opfsWorker.js'), 'utf8');
+  const makeSyncHandle = (store, key) => ({
+    truncate(n) { store[key] = store[key].slice(0, n); },
+    write(buf, opts) {
+      const at = (opts && opts.at) || 0;
+      const bytes = new Uint8Array(buf.buffer ? buf.buffer : buf, buf.byteOffset || 0, buf.byteLength);
+      if (store[key].length < at + bytes.length) { const g = new Uint8Array(at + bytes.length); g.set(store[key]); store[key] = g; }
+      store[key].set(bytes, at); return bytes.length;
+    },
+    read(buf, opts) { const at = (opts && opts.at) || 0; const out = new Uint8Array(buf.buffer); out.set(store[key].subarray(at, at + out.length)); return out.length; },
+    getSize() { return store[key].length; }, flush() {}, close() {},
+  });
+  const makeDir = (store, prefix = '') => ({
+    async getDirectoryHandle(name) { return makeDir(store, prefix + name + '/'); },
+    async getFileHandle(name) { const k = prefix + name; if (!(k in store)) store[k] = new Uint8Array(0); return { async createSyncAccessHandle() { return makeSyncHandle(store, k); } }; },
+    async removeEntry() {},
+  });
+  function loadWorker() {
+    const store = {}, outbound = [];
+    const self = { onmessage: null, postMessage: (m) => outbound.push(m) };
+    const sandbox = { self, navigator: { storage: { getDirectory: async () => makeDir(store) } }, setInterval: () => 0, clearInterval: () => {}, DataView, ArrayBuffer, Uint8Array, FileSystemFileHandle: function () {}, console };
+    sandbox.FileSystemFileHandle.prototype.createSyncAccessHandle = function () {};
+    vm.createContext(sandbox);
+    vm.runInContext(WORKER_SRC, sandbox, { filename: 'opfsWorker.js' });
+    const tick = () => new Promise((r) => setImmediate(r));
+    return {
+      store, outbound,
+      async control(msg) { self.onmessage({ data: msg }); await tick(); },
+      bindPort() { const port = { onmessage: null }; self.onmessage({ data: { op: 'bindPort', port } }); return port; },
+      portSend(port, msg) { port.onmessage({ data: msg }); },
+    };
+  }
+  const header = new Uint8Array(44).buffer;
+  const SF = [{ offset: 4, bias: 36 }, { offset: 40, bias: 0 }];
+  const chunk = () => new Uint8Array([1, 2, 3, 4]).buffer;
+  const writeErrs = (w) => w.outbound.filter((m) => m && m.type === 'writeError');
+
+  // A straggler append that lands after finalizeTake (the cross-port race) is benign.
+  {
+    const w = loadWorker(); const p = w.bindPort();
+    await w.control({ id: 1, op: 'openTake', dir: 'takes/s/', files: { stem1: 's-1-1.wav' }, header, sizeFields: SF });
+    w.portSend(p, { op: 'append', stem: 1, bytes: chunk() });
+    await w.control({ id: 2, op: 'finalizeTake' });
+    w.portSend(p, { op: 'append', stem: 1, bytes: chunk() });      // stray, post-finalize
+    ok('post-finalize append is a benign no-op (no writeError)', writeErrs(w).length === 0);
+  }
+  // An append that arrives before openTake set the state is also benign (start race).
+  {
+    const w = loadWorker(); const p = w.bindPort();
+    w.portSend(p, { op: 'append', stem: 1, bytes: chunk() });      // before openTake
+    await w.control({ id: 1, op: 'openTake', dir: 'takes/s/', files: { stem1: 's-1-1.wav' }, header, sizeFields: SF });
+    ok('pre-openTake append is a benign no-op (no writeError)', writeErrs(w).length === 0);
+  }
+  // The intended in-order path still WRITES the audio (fix didn't silence real writes).
+  {
+    const w = loadWorker(); const p = w.bindPort();
+    await w.control({ id: 1, op: 'openTake', dir: 'takes/s/', files: { stem1: 's-1-1.wav' }, header, sizeFields: SF });
+    w.portSend(p, { op: 'append', stem: 1, bytes: chunk() });
+    const res = await w.control({ id: 2, op: 'finalizeTake' });
+    ok('in-order append is written (44 header + 4 data)', w.store['takes/s/s-1-1.wav'].length === 48);
+    ok('in-order finalize reports the data bytes', w.outbound.some((m) => m && m.id === 2 && m.dataBytes && m.dataBytes.stem1 === 4));
+    ok('in-order path emits no writeError', writeErrs(w).length === 0);
+  }
+}
+
+// ============================================================================
+// 23. Fix tripwires — the impure capture/stop layer the node test can't execute.
+//     String-level guards so a refactor can't silently revert the "stuck after
+//     recording" fixes (all four verified live in Chrome).
+// ============================================================================
+{
+  const capSrc = readFileSync(here('./js/tape/captureProcessor.js'), 'utf8');
+  ok('worklet quiesces on flush (this.closed=true)', capSrc.includes('this.closed = true'));
+  ok('worklet self-removes from the graph when closed', /if\s*\(this\.closed\)\s*return false/.test(capSrc));
+  const owSrc = readFileSync(here('./js/tape/opfsWorker.js'), 'utf8');
+  ok('worker no longer errors on a null-state append', !owSrc.includes("append received with no take open"));
+  const aeSrc = readFileSync(here('./js/tape/audioEngine.js'), 'utf8');
+  ok('stop() guards finalize so teardown/onStatus always run', /catch\s*{[^}]*}\s*\n\s*teardownCaptureGraph\(\)/.test(aeSrc) || aeSrc.includes('fall through so we still tear down'));
+  ok('teardown severs the capture source', aeSrc.includes('captureSource.disconnect()'));
+  const mainSrc = readFileSync(here('./js/main.js'), 'utf8');
+  ok('onStopTake clears deckRecording even if stop() throws', /finally\s*{\s*if \(deckRecording\)\s*{\s*deckRecording = false/.test(mainSrc));
 }
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');

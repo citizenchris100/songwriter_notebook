@@ -90,7 +90,14 @@ async function openTake(msg) {
 // positional channel index. Errors push an async {type:'writeError'} rather than
 // reply — there is no request id.
 function handleAppend(stemNum, bytes) {
-  if (!openTakeState) { postWriteError('append received with no take open'); return; }
+  // No open take: a straggler chunk that raced past finalizeTake (the worklet's final
+  // flush chunk travels the transferred audio port while finalizeTake travels the
+  // control channel — two ports into one worker with no cross-order guarantee), or a
+  // chunk that arrived before openTake landed. Its tail is intentionally beyond the
+  // finalized length, so DROP it silently — it is not a storage error. (A genuine
+  // openTake failure surfaces as openTake's own rejection on the control channel, not
+  // here.) Real per-write I/O errors are still reported from the try/catch below.
+  if (!openTakeState) return;
   const s = openTakeState.stems['stem' + stemNum];
   if (!s) { postWriteError('append to unopened stem' + stemNum); return; }
   try {

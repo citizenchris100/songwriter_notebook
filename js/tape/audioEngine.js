@@ -105,6 +105,8 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
                               // calibration wires around it, so it can't affect exports or loopback.
   let masterVol = 1;          // 0..1.5, applied to masterBus; survives ctx (re)creation
   let workletNode = null;
+  let captureSource = null;   // MediaStreamAudioSourceNode feeding the worklet (severed on teardown)
+  let captureSink = null;     // silent gain that pulls the worklet (severed on teardown)
   let mediaStream = null;
   let wakeLock = null;
   let recording = false;
@@ -317,6 +319,17 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
       if (msg.op === 'append' && !portTransferOk) takeStore.relayAppend(msg.stem, msg.bytes);
     };
 
+    // Open this pass's stem files BEFORE the capture graph is connected, so the
+    // worker's openTakeState is set before any audio can flow. A click-off first pass
+    // has beginFrame 0 and records from the instant source->node connects; opening the
+    // files afterward left a window where the first chunks reached the worker with no
+    // take open. (Click-on/overdub keep the gate shut until 'begin', so they were never
+    // exposed, but opening first is correct for every path.)
+    const header = wavHeader(1, audioCtx.sampleRate, 0);
+    const files = {};
+    for (const key of slotKeys) files[key] = stemFileName(slug, take, key);
+    await takeStore.openTakeFiles('takes/' + slug + '/', files, header, SIZE_FIELDS);
+
     // A silent sink so the worklet is reliably pulled even though its own
     // output is never actually monitored (D5 — hardware-monitor-only).
     const sink = audioCtx.createGain();
@@ -324,11 +337,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     source.connect(node);
     node.connect(sink);
     sink.connect(audioCtx.destination);
-
-    const header = wavHeader(1, audioCtx.sampleRate, 0);
-    const files = {};
-    for (const key of slotKeys) files[key] = stemFileName(slug, take, key);
-    await takeStore.openTakeFiles('takes/' + slug + '/', files, header, SIZE_FIELDS);
+    captureSource = source; captureSink = sink; // kept so teardownCaptureGraph can sever the whole path
 
     // Everything is wired; NOW pick a common t=0 in the near future. If a click is on,
     // run a 2-bar count-in from there and treat its first recorded downbeat as the
@@ -416,7 +425,15 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
       });
     }
 
-    const dataBytes = await takeStore.finalizeTakeFiles();
+    // finalize -> teardown -> report is a strict sequence, but the deck UI is fully
+    // gated on the caller's `deckRecording`, which only clears when onStatus('stopped')
+    // runs at the end of this function. So teardown and the onStatus report MUST run
+    // even if finalize ever rejects — otherwise a single failed finalize would strand
+    // the deck (every control disabled, only a refresh recovers). Guard accordingly.
+    let dataBytes = {};
+    try {
+      dataBytes = await takeStore.finalizeTakeFiles();
+    } catch { /* finalize failed — fall through so we still tear down + report */ }
     teardownCaptureGraph();
     if (wakeLock) { try { await wakeLock.release(); } catch { /* already released */ } wakeLock = null; }
 
@@ -436,7 +453,13 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     stopClick();
     stopMonitor();
     if (mediaStream) { mediaStream.getTracks().forEach((t) => t.stop()); mediaStream = null; }
+    // Sever the whole capture path. The worklet self-removes on its flush (process()
+    // returns false once closed); disconnecting the source and sink too guarantees it
+    // is out of the render graph even on a teardown that skipped the flush (an abrupt
+    // interruption/dispose), so it can never keep posting meters or appends.
+    if (captureSource) { try { captureSource.disconnect(); } catch { /* already disconnected */ } captureSource = null; }
     if (workletNode) { try { workletNode.disconnect(); } catch { /* already disconnected */ } workletNode = null; }
+    if (captureSink) { try { captureSink.disconnect(); } catch { /* already disconnected */ } captureSink = null; }
   }
 
   // ---- playback (lazy-loads the take if it isn't already the loaded one) ----

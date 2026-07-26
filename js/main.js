@@ -1370,7 +1370,13 @@ const handlers = {
 
     onStopTake: async () => {
       if (!tapeDeck || !deckRecording) return;
-      await tapeDeck.stop(); // resolves after onStatus('stopped',...) has already finalized the manifest
+      // stop() resolves after onStatus('stopped',...) has already finalized the manifest
+      // and cleared deckRecording. The finally is a last-ditch guarantee: if stop() ever
+      // rejects, still clear the flag and re-render so the deck can't strand nav-locked
+      // (every control is gated on deckRecording — the whole reason a stuck stop reads as
+      // "the app crashed, hard-refresh to recover").
+      try { await tapeDeck.stop(); }
+      finally { if (deckRecording) { deckRecording = false; deckRecordingSlotKeys = []; deckRecordingGroup = null; render(); } }
     },
 
     // Retake (rescoped): re-record ONLY the last recorded group — free its slots,

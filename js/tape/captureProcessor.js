@@ -39,6 +39,14 @@ class CaptureProcessor extends AudioWorkletProcessor {
     this.beginFrame = opts.beginFrame || 0;
     this.buffers = Array.from({ length: channelCount }, () => new Float32Array(CHUNK_FRAMES));
     this.cursor = 0;
+    // Set true by {op:'flush'} on Stop. Once closed, process() returns FALSE so the
+    // browser removes this processor from the render graph — the ONLY reliable way to
+    // make it stop. workletNode.disconnect() alone does NOT halt a processor that
+    // returns true (it keeps being pulled while a live input source is connected), so
+    // without this the worklet outlives the take: it keeps posting meter/clock ticks
+    // (the "glitchy counter") and keeps flushing chunks into the already-finalized
+    // take (the repeating "append received with no take open" storm).
+    this.closed = false;
     this.totalFrames = 0;
     this.peaks = new Array(channelCount).fill(0);
     this.workerPort = null;
@@ -60,9 +68,11 @@ class CaptureProcessor extends AudioWorkletProcessor {
       if (data.port) { this.workerPort = data.port; return; }
       if (data.op === 'begin' && typeof data.beginFrame === 'number') { this.beginFrame = data.beginFrame; return; }
       if (data.op === 'flush') {
-        if (this.measure) { this.postMeasureChunk(); this.port.postMessage({ flushed: true }); return; }
-        if (this.cursor > 0) this.flushChunk(this.cursor);
+        if (this.measure) this.postMeasureChunk();
+        else if (this.cursor > 0) this.flushChunk(this.cursor);
+        this.closed = true;                       // stop capturing (process() self-removes next quantum)
         this.port.postMessage({ flushed: true });
+        return;
       }
     };
   }
@@ -97,6 +107,7 @@ class CaptureProcessor extends AudioWorkletProcessor {
   }
 
   process(inputs) {
+    if (this.closed) return false; // flushed on Stop: leave the graph so we never post stray appends/meters again
     const input = inputs[0];
     if (!input || !input.length || !input[0] || !input[0].length) return true; // no signal yet — stay alive
     const frames = input[0].length;
