@@ -371,7 +371,10 @@ function calPanel(box, deck, handlers) {
   const lat = deck.monitorLatency || { ms: 0, source: 'none', spreadMs: null };
   const desc = lat.source === 'measured'
     ? 'Overdub sync: ' + lat.ms + ' ms measured' + (lat.spreadMs != null ? ' (±' + lat.spreadMs + ' ms)' : '')
-    : lat.source === 'manual' ? 'Overdub sync: ' + lat.ms + ' ms (manual)' : 'Overdub sync: none — playback + capture only';
+    : lat.source === 'manual' ? 'Overdub sync: ' + lat.ms + ' ms (manual)'
+    : (lat.estimateMs > 0
+        ? 'Overdub sync: ~' + lat.estimateMs + ' ms (auto-estimated from your device — Calibrate for exact)'
+        : 'Overdub sync: none — playback + capture only');
   box.appendChild(h('div', 'subtitle', desc));
   const row = h('div', 'row routerow');
   row.appendChild(h('span', 'lbl', 'Latency (ms)'));

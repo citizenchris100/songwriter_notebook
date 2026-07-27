@@ -43,6 +43,7 @@ import { limit } from './js/tape/limiter.js';
 import {
   detectClickSample, rttSeconds, median, summarizeTrials, isPlausibleRtt,
   PLAUSIBLE_RTT_MIN, PLAUSIBLE_RTT_MAX,
+  estimateMonitorLatencySec, resolveMonitorLatencySec,
 } from './js/tape/latency.js';
 import {
   TIME_SIGS, SUBS, MIN_BPM, MAX_BPM, computeLevels, accentGroups,
@@ -934,6 +935,45 @@ ok('summarizeTrials filters implausible values before the quorum', !summarizeTri
 ok('summarizeTrials fails on all-silent trials', !summarizeTrials([null, null, null]).ok);
 
 // ============================================================================
+// 17c. Overdub latency AUTO-ESTIMATE (uncalibrated) — pure resolve/estimate math.
+//   Proves the fix for the "recorded audio lags the drums" bug: when the user has NOT
+//   calibrated, the compensation must come from the live AudioContext (+ track) latency,
+//   not default to 0. estimateMonitorLatencySec models RTL = output + input + one comp
+//   lookahead (symmetric input fallback); resolveMonitorLatencySec keeps a measured/manual
+//   value authoritative and otherwise falls back to the estimate.
+// ============================================================================
+// Uncalibrated + a real output latency -> a positive, plausible compensation.
+const est = estimateMonitorLatencySec({ outputLatency: 0.012, baseLatency: 0.006, inputLatency: 0.012 });
+ok('estimate is positive when the context reports output latency', est > 0);
+ok('estimate stays within the plausible round-trip band', isPlausibleRtt(est));
+ok('estimate = output + input + comp lookahead', Math.abs(est - (0.012 + 0.006 + 0.012)) < 1e-9);
+// Monotonic non-decreasing in outputLatency.
+ok('estimate grows with outputLatency',
+   estimateMonitorLatencySec({ outputLatency: 0.020 }) > estimateMonitorLatencySec({ outputLatency: 0.010 }));
+// Missing/implausible input latency -> symmetric fallback (2*out + comp).
+ok('absent input latency falls back to symmetric (2*out + comp)',
+   Math.abs(estimateMonitorLatencySec({ outputLatency: 0.010 }) - (0.020 + 0.006)) < 1e-9);
+// baseLatency is only a floor fallback when outputLatency is unusable.
+ok('baseLatency is the fallback when outputLatency is 0',
+   estimateMonitorLatencySec({ outputLatency: 0, baseLatency: 0.006 }) > 0);
+// No usable data at all -> 0 (record uncompensated; never guess a full default -> no early pull).
+eq('no latency data -> 0', estimateMonitorLatencySec({}), 0);
+eq('zero everything -> 0', estimateMonitorLatencySec({ outputLatency: 0, baseLatency: 0 }), 0);
+// A large-but-usable pair whose SUM exceeds the band is clamped to the max.
+eq('the estimate is clamped to the plausible max',
+   estimateMonitorLatencySec({ outputLatency: 0.3, inputLatency: 0.3 }), PLAUSIBLE_RTT_MAX);
+// resolve: a measured (loopback) or manual value is authoritative, returned verbatim.
+eq('resolve returns the measured value unchanged',
+   resolveMonitorLatencySec({ source: 'measured', storedSec: 0.031, outputLatency: 0.012 }), 0.031);
+eq('resolve returns the manual value unchanged (even 0)',
+   resolveMonitorLatencySec({ source: 'manual', storedSec: 0, outputLatency: 0.012 }), 0);
+// resolve: uncalibrated -> the live estimate; with no context data -> 0.
+ok('resolve falls back to the estimate when source is none',
+   resolveMonitorLatencySec({ source: 'none', storedSec: 0, outputLatency: 0.012, inputLatency: 0.012 }) > 0);
+eq('resolve is 0 when uncalibrated AND no context data',
+   resolveMonitorLatencySec({ source: 'none', storedSec: 0 }), 0);
+
+// ============================================================================
 // 18. Tape deck — sw.js caches every new module (tape/… asset-list assertion)
 // ============================================================================
 for (const f of ['tape/takeModel', 'tape/meterModel', 'tape/clickModel', 'tape/click', 'tape/wav', 'tape/lufs', 'tape/limiter', 'tape/latency', 'tape/audioEngine', 'tape/takeStore', 'tape/folderStore', 'tape/opfsWorker', 'tape/captureProcessor', 'tape/devices', 'tape/deckControls', 'tape/tapeView', 'tape/drumModel', 'tape/midiParse', 'tape/drumKits', 'tape/drumMachine', 'tape/drumPanel']) {
@@ -1216,6 +1256,25 @@ ok('decayPeak fall rate matches FALL_DB_PER_SEC', Math.abs(decayPeak(1.0, 0, 100
     ok('onDeleteTake invalidates playback when the loaded take is deleted',
        s > 0 && e > s && mainSrc.slice(s, e).includes('invalidatePlayback'));
   }
+
+  // ---- Overdub latency auto-estimate (uncalibrated) — resolve/estimate wiring (browser-only path) ----
+  const latSrc = readFileSync(here('./js/tape/latency.js'), 'utf8');
+  ok('latency.js exports the estimate + resolve helpers',
+     /export function estimateMonitorLatencySec/.test(latSrc) && /export function resolveMonitorLatencySec/.test(latSrc));
+  ok('the estimate is clamped to the plausible band + carries a comp-lookahead constant',
+     latSrc.includes('PLAUSIBLE_RTT_MAX') && latSrc.includes('COMP_LOOKAHEAD_SEC'));
+  {
+    const s = aeSrc.indexOf('async function record('), e = aeSrc.indexOf('async function stop(');
+    ok('record() resolves the gate shift via resolveMonitorLatencySec (not a bare monitorLatencySec||0)',
+       s > 0 && e > s && aeSrc.slice(s, e).includes('resolveMonitorLatencySec') &&
+       !/const shift = monitorLatencySec \|\| 0/.test(aeSrc.slice(s, e)));
+  }
+  ok('record() feeds the live context + track latency into the resolver',
+     /outputLatency:\s*audioCtx\.outputLatency/.test(aeSrc) && /inputLatency:\s*settings\.latency/.test(aeSrc));
+  ok('main.js passes the latency SOURCE to record()', mainSrc.includes('monitorLatencySource'));
+  ok('audioEngine exposes getContextLatency on its public API', /return\s*\{[^}]*\bgetContextLatency\b/.test(aeSrc));
+  ok('the live estimate is never persisted (writeLatency only for measured/manual)',
+     !/writeLatency\([^)]*source:\s*['"](none|estimate)['"]/.test(mainSrc));
 }
 
 // ============================================================================
@@ -1240,7 +1299,9 @@ ok('decayPeak fall rate matches FALL_DB_PER_SEC', Math.abs(decayPeak(1.0, 0, 100
     };
     vm.createContext(sandbox);
     vm.runInContext(CAP_SRC, sandbox, { filename: 'captureProcessor.js' });
-    return new Captured({ processorOptions: opts });
+    const proc = new Captured({ processorOptions: opts });
+    proc._sandbox = sandbox; // lets a test drive the AudioContext sample clock (currentFrame) across process() calls
+    return proc;
   }
   const flush = (proc, drainId) => proc.port.onmessage({ data: { op: 'flush', drainId } });
   const fill = (proc, n) => proc.process([[new Float32Array(n)]]); // n<8192 -> cursor=n, no auto-flush
@@ -1278,6 +1339,55 @@ ok('decayPeak fall rate matches FALL_DB_PER_SEC', Math.abs(decayPeak(1.0, 0, 100
     flush(proc, 2); // no fill -> cursor 0 -> no append, but a drain must still fire
     ok('cursor-0 flush still posts a drain', wp.posted.some((m) => m && m.op === 'drain'));
     ok('cursor-0 flush posts no append', !wp.posted.some((m) => m && m.op === 'append'));
+  }
+
+  // R9 (record/playback ALIGNMENT — proves the drum-vs-DI lag AND its fix). Drive the REAL
+  // capture gate with an advancing sample clock and one "downbeat" spike that arrives in the
+  // input a full round-trip (RTL) after the drum downbeat (musicStart), i.e. exactly where an
+  // on-the-beat DI note lands (heard-late + captured-late). The spike's offset in the recorded
+  // stem is (marker - beginFrame) = (RTL - shift): with shift 0 (uncalibrated, the bug) it sits
+  // RTL late; with shift = the auto-estimate (the fix) it lands on the downbeat. RTL is derived
+  // from resolveMonitorLatencySec, so the assertion is tied to the real estimator.
+  {
+    const drive = (proc, total, sampleAt, Q = 128) => {
+      for (let off = 0; off < total; off += Q) {
+        const n = Math.min(Q, total - off);
+        const blk = new Float32Array(n);
+        for (let i = 0; i < n; i++) blk[i] = sampleAt(off + i);
+        proc._sandbox.currentFrame = off;      // absolute context frame of this block's sample 0
+        proc.process([[blk]]);
+      }
+    };
+    const reconstructStem = (proc, slot) => {
+      const parts = proc.port.posted.filter((m) => m && m.op === 'append' && m.stem === slot);
+      let len = 0; for (const p of parts) len += p.bytes.byteLength / 2;
+      const out = new Float32Array(len); let o = 0;
+      for (const p of parts) { const i16 = new Int16Array(p.bytes); for (let i = 0; i < i16.length; i++) out[o++] = i16[i] / 0x8000; }
+      return out;
+    };
+    const argmax = (a) => { let mi = 0, mv = -1; for (let i = 0; i < a.length; i++) { const v = a[i] < 0 ? -a[i] : a[i]; if (v > mv) { mv = v; mi = i; } } return mi; };
+
+    const sr = 48000;
+    const shiftSec = resolveMonitorLatencySec({ source: 'none', outputLatency: 0.012, baseLatency: 0.006, inputLatency: 0.012 });
+    const RTL = Math.round(shiftSec * sr);
+    ok('a real uncalibrated round-trip estimate is nonzero', RTL > 0);
+    const musicStart = 24000;               // the drum downbeat frame
+    const marker = musicStart + RTL;        // where the on-the-beat DI note actually lands
+    const total = marker + 4000;
+    const spike = (f) => (f === marker ? 1 : 0);
+
+    { // BUG: uncompensated gate (shift 0) -> the note is baked RTL late in the stem.
+      const proc = loadWorklet({ channelCount: 1, slots: [1], beginFrame: musicStart });
+      drive(proc, total, spike); flush(proc, 1);
+      ok('uncompensated overdub lags by the full round trip (proves the bug)',
+         Math.abs(argmax(reconstructStem(proc, 1)) - RTL) <= 1);
+    }
+    { // FIX: gate opened at musicStart + estimate -> the note lands on the downbeat (~0).
+      const proc = loadWorklet({ channelCount: 1, slots: [1], beginFrame: musicStart + RTL });
+      drive(proc, total, spike); flush(proc, 1);
+      ok('round-trip-compensated overdub aligns the downbeat to ~0 (proves the fix)',
+         argmax(reconstructStem(proc, 1)) <= 1);
+    }
   }
 }
 

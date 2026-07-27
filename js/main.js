@@ -31,6 +31,7 @@ import * as takeStore from './tape/takeStore.js';
 import * as folderStore from './tape/folderStore.js';
 import { SIZE_FIELDS } from './tape/wav.js';
 import { makeTapeDeck } from './tape/audioEngine.js';
+import { estimateMonitorLatencySec } from './tape/latency.js';
 import { mountApp } from './ui.js';
 
 const rootEl = document.getElementById('app');
@@ -236,6 +237,14 @@ function tapeDeckViewModel(active) {
   // The number shown in the LED counter window.
   const counterTakeNo = loadedTake ? loadedTake.take : (pendingNewTake ? takeModel.nextTakeNumber(deckManifest) : (currentTake || null));
 
+  // Uncalibrated: surface the live auto-estimate (from the AudioContext output latency) so the CAL
+  // panel shows what compensation the next record will apply; measured/manual keep their stored ms.
+  // Never persisted — recomputed each render from the live context (no context yet -> 0 -> "none").
+  const rawLatency = readLatency(deckSelectedInputId);
+  const monitorLatency = rawLatency.source === 'none'
+    ? { ...rawLatency, estimateMs: Math.round(estimateMonitorLatencySec(tapeDeck ? tapeDeck.getContextLatency() : {}) * 1000) }
+    : rawLatency;
+
   return {
     songId: active ? active.id : null,
     path: active ? takeModel.tapeDeckRef(active.id).path : '',
@@ -257,7 +266,7 @@ function tapeDeckViewModel(active) {
     status: deckStatus,
     spaceWarning: deckSpaceWarning,
     calibrating: deckCalibrating,
-    monitorLatency: readLatency(deckSelectedInputId), // { ms, source:'measured'|'manual'|'none', spreadMs }
+    monitorLatency, // { ms, source:'measured'|'manual'|'none', spreadMs, estimateMs? (when uncalibrated) }
     hasHistory: takes.length > 0,
     filledSlotKeys,
     freeSlotKeys,
@@ -722,13 +731,14 @@ async function download(filename, obj) {
 
 const manifestPath = (slug) => takeModel.tapeDeckRef(slug).path + 'manifest.json';
 
-// Overdub round-trip latency (ms) — the delay the app plays a backing track out and
-// hears it back in. Used to time-align an overdub (the capture gate's offset). It is
-// MEASURED per input device by the in-app loopback calibration (js/tape/audioEngine
-// calibrateLatency), never read from AudioContext.outputLatency (unreliable / absent
-// on iPadOS < 18.4). 0 (uncalibrated) = no compensation (pure playback + capture,
-// deterministic but possibly a touch late). Stored per device (the correction is per
-// input/output/host combo and must be re-measured on a device change).
+// Overdub round-trip latency (ms) — the delay the app plays a backing track (drums/overdub) out
+// and captures the DI back in. Used to time-align the capture gate's offset. A per-device value
+// MEASURED by the in-app loopback calibration (js/tape/audioEngine calibrateLatency), or typed in
+// manually, is stored here (source 'measured'/'manual') and used verbatim. UNCALIBRATED (source
+// 'none') no longer means 0/no-compensation — record() now AUTO-ESTIMATES the round-trip from the
+// live AudioContext output latency + the input track's reported latency (resolveMonitorLatencySec),
+// so a first take against the drums lands in the pocket without a manual calibration. The estimate
+// is live/per-session and never stored (only measured/manual are persisted, per input device).
 const LATENCY_KEY = 'sn_tape_latency';
 const latencyKey = (deviceId) => LATENCY_KEY + '_' + (deviceId || 'default');
 function readLatency(deviceId) {
@@ -1049,6 +1059,7 @@ async function armRecording() {
       deviceId: deckSelectedInputId,
       routing,
       monitorLatencySec: getMonitorLatencySec(),
+      monitorLatencySource: readLatency(deckSelectedInputId).source, // 'measured'|'manual'|'none' — 'none' -> record() auto-estimates
       existingTracks,
       clickConfig: clickCfg,
       drumConfig: drumCfg,

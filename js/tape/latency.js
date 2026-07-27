@@ -23,6 +23,39 @@ export function isPlausibleRtt(sec) {
   return isNum(sec) && sec >= PLAUSIBLE_RTT_MIN && sec <= PLAUSIBLE_RTT_MAX;
 }
 
+// The DynamicsCompressor's fixed lookahead (~6 ms), present on the monitored drum/overdub
+// backing bus during record (it adds to how late the performer hears the beat). Counted ONCE —
+// the backing passes through exactly one compressor before the output.
+export const COMP_LOOKAHEAD_SEC = 0.006;
+
+// A latency figure is usable only if finite, POSITIVE, and below the plausible-round-trip ceiling
+// — so an undefined / 0 / absurd device report degrades to a fallback instead of corrupting the sum.
+const usableLatency = (x) => isNum(x) && x > 0 && x < PLAUSIBLE_RTT_MAX;
+
+// Best-effort round trip from the LIVE context, for an UNCALIBRATED overdub / drum-backed take.
+// `outputLatency` (AudioContext.outputLatency — the OS+device output path) is the drums-to-ears
+// proxy; `baseLatency` is only a floor fallback when outputLatency is unusable. `inputLatency`
+// (MediaTrackSettings.latency, often absent/coarse) is the DI-to-worklet proxy; when unusable we
+// assume input ≈ output (matched USB buffering) — this symmetric term is the dominant residual
+// uncertainty. Plus one compressor lookahead. Returns 0 when there is NO usable data, so a
+// data-less context records uncompensated (deterministic) rather than guessing a full default and
+// risking pulling the take EARLY. Clamped to the plausible round-trip band.
+export function estimateMonitorLatencySec({ outputLatency, baseLatency, inputLatency } = {}) {
+  const out = usableLatency(outputLatency) ? outputLatency : (usableLatency(baseLatency) ? baseLatency : 0);
+  if (out <= 0) return 0;                                        // no usable output-path latency -> no compensation
+  const inp = usableLatency(inputLatency) ? inputLatency : out; // symmetric fallback (the weakest term)
+  const rtt = out + COMP_LOOKAHEAD_SEC + inp;
+  return Math.max(PLAUSIBLE_RTT_MIN, Math.min(PLAUSIBLE_RTT_MAX, rtt));
+}
+
+// The single capture-gate-offset resolution point. A measured (loopback) or manual value is
+// AUTHORITATIVE and returned verbatim (the user's own number wins, even 0); otherwise fall back
+// to the live estimate; otherwise 0. Called by audioEngine.record() with the live ctx + track.
+export function resolveMonitorLatencySec({ source, storedSec, outputLatency, baseLatency, inputLatency } = {}) {
+  if ((source === 'measured' || source === 'manual') && isNum(storedSec)) return storedSec;
+  return estimateMonitorLatencySec({ outputLatency, baseLatency, inputLatency });
+}
+
 // A low-percentile of |samples| — a robust noise-floor estimate (the buffer is
 // mostly silence, so the median absolute value tracks the floor, not the click).
 function percentileAbs(samples, p) {

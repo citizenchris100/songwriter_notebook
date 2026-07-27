@@ -14,7 +14,7 @@ import {
   STEM_KEYS, MAX_TRACKS, stemFileName, mixFileName, compressorParams, bounceGainDb,
   EQ_BANDS, LIMITER_CEILING_DB, defaultStemSettings, playbackCacheStale,
 } from './takeModel.js';
-import { detectClickSample, rttSeconds, summarizeTrials } from './latency.js';
+import { detectClickSample, rttSeconds, summarizeTrials, resolveMonitorLatencySec } from './latency.js';
 import { makeClick } from './click.js';
 import { makeDrumMachine, renderDrumsOffline } from './drumMachine.js';
 import { loadKit, loadEffect } from './drumKits.js';
@@ -272,8 +272,11 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   // not arm (that channel is captured for its input meter but written to no file).
   // capture = min(device channels, routing length). existingTracks: [{ key, meta }] of
   // the take's already-recorded slots to monitor (empty for a first pass).
-  // monitorLatencySec: the measured round-trip to align the overdub (0 disables the gate).
-  async function record({ slug, deviceId, routing, monitorLatencySec = 0, existingTracks = [], clickConfig = null, drumConfig = null, folderHandle = null, onPassOpen }) {
+  // monitorLatencySec/monitorLatencySource: the stored calibration (seconds) and its provenance
+  // ('measured'|'manual'|'none'). A measured/manual value aligns the overdub verbatim; when
+  // uncalibrated ('none') the gate offset is AUTO-ESTIMATED from the live context + input track
+  // (resolveMonitorLatencySec) instead of defaulting to 0 — see the shift computation below.
+  async function record({ slug, deviceId, routing, monitorLatencySec = 0, monitorLatencySource = 'none', existingTracks = [], clickConfig = null, drumConfig = null, folderHandle = null, onPassOpen }) {
     const acquired = await devices.acquireForRecording(deviceId);
     if (!acquired.ok) { onStatus && onStatus({ type: 'blocked' }); return { ok: false, denied: true }; }
     mediaStream = acquired.stream;
@@ -410,10 +413,19 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
       }
 
       if (overdub) startMonitorFromBuffers(monitorItems, musicStart);
-      // Compensate the capture gate by the measured monitor round-trip so the mic's sample 0
-      // aligns with the count-in downbeat + backing at t=0 on later playback (uncalibrated =>
-      // monitorLatencySec 0 => no shift). Drums/count-in are monitor-only and never captured.
-      const shift = monitorLatencySec || 0;
+      // Compensate the capture gate by the monitor round-trip so the DI's sample 0 aligns with the
+      // count-in downbeat + backing at t=0 on later playback. A measured/manual calibration is used
+      // verbatim; UNCALIBRATED, the round-trip is AUTO-ESTIMATED from the live context output
+      // latency + the input track's reported latency + the comp lookahead (never a bare 0, which
+      // left every uncalibrated take lagging the drums by the full round-trip). Monitor-only
+      // sources (drums/count-in) are heard but never captured.
+      const shift = resolveMonitorLatencySec({
+        source: monitorLatencySource,
+        storedSec: monitorLatencySec,
+        outputLatency: audioCtx.outputLatency,
+        baseLatency: audioCtx.baseLatency,
+        inputLatency: settings.latency, // MediaTrackSettings.latency (seconds), may be undefined
+      });
       const beginFrame = Math.round((musicStart + shift) * audioCtx.sampleRate);
       node.port.postMessage({ op: 'begin', beginFrame });
     }
@@ -799,6 +811,12 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     return { ok: summary.ok, rttSec: summary.medianSec, spreadMs: summary.spreadMs, reason: summary.reason };
   }
 
+  // The live AudioContext latency figures, so the CAL panel can DISPLAY the uncalibrated
+  // auto-estimate (nulls before a context exists). Never persisted — recomputed each render.
+  function getContextLatency() {
+    return ctx ? { outputLatency: ctx.outputLatency, baseLatency: ctx.baseLatency } : { outputLatency: null, baseLatency: null };
+  }
+
   function dispose() {
     if (recording) stop('interrupted');
     stopMeterLoop();
@@ -810,5 +828,5 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     if (ctx) { try { ctx.close(); } catch { /* already closed */ } ctx = null; masterBus = null; }
   }
 
-  return { probe, record, stop, play, replay, stopPlay, invalidatePlayback: disposePlayback, renderMaster, bounce, bounceTracks, applySettings, setMasterVol, calibrateLatency, dispose };
+  return { probe, record, stop, play, replay, stopPlay, invalidatePlayback: disposePlayback, renderMaster, bounce, bounceTracks, applySettings, setMasterVol, calibrateLatency, getContextLatency, dispose };
 }
