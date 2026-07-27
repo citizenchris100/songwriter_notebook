@@ -5,6 +5,7 @@
 // D21 fetch->Blob rule. One controller, one AudioContext, per deck mount.
 // Browser-only — never imported by the node engine test.
 import * as takeStore from './takeStore.js';
+import * as folderStore from './folderStore.js';
 import * as devices from './devices.js';
 import { wavHeader, floatToInt16, interleave, parseWav, SIZE_FIELDS } from './wav.js';
 import { integratedLoudness } from './lufs.js';
@@ -79,8 +80,20 @@ function applyChainSettings(chain, settings) {
   chain.makeup.gain.setTargetAtTime(Math.pow(10, cp.makeupDb / 20), now, RAMP);
 }
 
-async function loadStemBuffer(ctx, slug, stemMeta) {
-  const bytes = await takeStore.readFile('takes/' + slug + '/' + stemMeta.file);
+// The one decode entry point, location-aware: a slot marked loc:'folder' reads from
+// the song's on-disk folder via folderStore (needs the granted, permitted dir handle);
+// any other slot reads from OPFS via takeStore. A folder slot with no usable handle
+// throws FOLDER_UNAVAILABLE so the caller can surface "grant folder access" — never a
+// silent fallback to OPFS, whose copy was deleted on Save.
+async function loadStemBuffer(ctx, slug, stemMeta, folderHandle) {
+  const rel = 'takes/' + slug + '/' + stemMeta.file;
+  let bytes;
+  if (stemMeta.loc === 'folder') {
+    if (!folderHandle) throw Object.assign(new Error('saved audio needs folder access'), { code: 'FOLDER_UNAVAILABLE' });
+    bytes = await folderStore.readFile(folderHandle, rel);
+  } else {
+    bytes = await takeStore.readFile(rel);
+  }
   const parsed = parseWav(bytes);
   const buffer = ctx.createBuffer(1, parsed.samples[0].length, parsed.rate);
   buffer.copyToChannel(parsed.samples[0], 0);
@@ -260,7 +273,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   // capture = min(device channels, routing length). existingTracks: [{ key, meta }] of
   // the take's already-recorded slots to monitor (empty for a first pass).
   // monitorLatencySec: the measured round-trip to align the overdub (0 disables the gate).
-  async function record({ slug, deviceId, routing, monitorLatencySec = 0, existingTracks = [], clickConfig = null, drumConfig = null, onPassOpen }) {
+  async function record({ slug, deviceId, routing, monitorLatencySec = 0, existingTracks = [], clickConfig = null, drumConfig = null, folderHandle = null, onPassOpen }) {
     const acquired = await devices.acquireForRecording(deviceId);
     if (!acquired.ok) { onStatus && onStatus({ type: 'blocked' }); return { ok: false, denied: true }; }
     mediaStream = acquired.stream;
@@ -297,7 +310,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     // is always in the future no matter how long the OPFS reads / sample decodes take.
     const monitorItems = [];
     if (overdub) {
-      for (const t of existingTracks) monitorItems.push({ key: t.key, meta: t.meta, buffer: await loadStemBuffer(audioCtx, slug, t.meta) });
+      for (const t of existingTracks) monitorItems.push({ key: t.key, meta: t.meta, buffer: await loadStemBuffer(audioCtx, slug, t.meta, folderHandle) });
     }
     let kitBuffers = null, drumIr = null;
     if (drumsEnabled) { kitBuffers = await loadKit(audioCtx, drumConfig.kit); drumIr = await loadEffect(audioCtx, drumConfig.effect); }
@@ -500,7 +513,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   }
 
   // ---- playback (lazy-loads the take if it isn't already the loaded one) ----
-  async function loadTake(take, slug) {
+  async function loadTake(take, slug, folderHandle) {
     disposePlayback();
     const audioCtx = await ensureContext();
     const sumBus = audioCtx.createGain();
@@ -512,7 +525,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     for (const key of STEM_KEYS) {
       const stemMeta = take.stems && take.stems[key];
       if (!stemMeta || !stemMeta.file) { stems[key] = null; continue; }
-      const buffer = await loadStemBuffer(audioCtx, slug, stemMeta);
+      const buffer = await loadStemBuffer(audioCtx, slug, stemMeta, folderHandle);
       const chain = buildEffectChain(audioCtx, stemMeta);
       chain.output.connect(sumBus);
       const tap = makeTap(audioCtx); chain.output.connect(tap); // per-track playback meter (D34)
@@ -553,9 +566,9 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     maybeStopMeterLoop();
   }
 
-  async function play(take, slug) {
+  async function play(take, slug, folderHandle) {
     const want = { slug, take: take.take, epoch: recordEpoch };
-    if (playbackCacheStale(playChains, want)) await loadTake(take, slug);
+    if (playbackCacheStale(playChains, want)) await loadTake(take, slug, folderHandle);
     stopPlaySources();
     const audioCtx = ctx;
     const startAt = audioCtx.currentTime + 0.1; // all stems start together -> sample-locked
@@ -585,10 +598,10 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     return any;
   }
 
-  async function replay(take, slug) {
+  async function replay(take, slug, folderHandle) {
     const want = { slug, take: take.take, epoch: recordEpoch };
     if (!playbackCacheStale(playChains, want)) stopPlaySources();
-    return play(take, slug);
+    return play(take, slug, folderHandle);
   }
 
   function stopPlay() { stopPlaySources(); }
@@ -605,7 +618,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   // into ONE mono channel at 48 kHz — the shared render used by both the master
   // bounce and the per-track ping-pong bounce. Returns a Float32Array (mono) or
   // null if the take has no audio. Mono forever: no stereo/panning anywhere.
-  async function renderMonoMix(keys, take, slug, opts = {}) {
+  async function renderMonoMix(keys, take, slug, opts = {}, folderHandle = null) {
     const durationSec = maxKeyDuration(keys, take);
     const includeDrums = !!(opts.drums && take.drums && take.drums.enabled && durationSec > 0);
     const pad = includeDrums ? 0.5 : 0.05; // a late drum hit (crash) can ring past durationSec; comp tail otherwise
@@ -618,7 +631,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     for (const key of keys) {
       const stemMeta = take.stems && take.stems[key];
       if (!stemMeta || !stemMeta.file) continue;
-      const buffer = await loadStemBuffer(offlineCtx, slug, stemMeta);
+      const buffer = await loadStemBuffer(offlineCtx, slug, stemMeta, folderHandle);
       const chain = buildEffectChain(offlineCtx, stemMeta);
       chain.output.connect(sumBus);
       const source = offlineCtx.createBufferSource();
@@ -660,16 +673,27 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
 
   // ---- master bounce (AC-13/14): sum ALL tracks -> one mono _mix.wav with the
   // fixed LUFS-target + brick-wall-limiter mastering ----
-  async function bounce(take, slug, opts = {}) {
-    const { mono } = await renderMonoMix(STEM_KEYS, take, slug, { drums: !!opts.includeDrums });
+  // Render + master a take to one mono WAV WITHOUT persisting it — the shared core of
+  // both MIX (bounce, which then writes it) and EXPORT (onExportDeck, which shares/
+  // downloads the bytes). Returns { ok, bytes, lufs } so the two paths cannot diverge.
+  async function renderMaster(take, slug, opts = {}, folderHandle = null) {
+    const { mono } = await renderMonoMix(STEM_KEYS, take, slug, { drums: !!opts.includeDrums }, folderHandle);
     if (!mono) return { ok: false, error: 'take has no tracks to bounce' };
     const measured = integratedLoudness([mono], BOUNCE_RATE);
     const gainDb = bounceGainDb(measured);
     if (gainDb !== 0) { const g = Math.pow(10, gainDb / 20); for (let i = 0; i < mono.length; i++) mono[i] *= g; }
     limit([mono], BOUNCE_RATE, LIMITER_CEILING_DB);
+    return { ok: true, bytes: encodeMonoWav(mono), lufs: measured === -Infinity ? null : measured };
+  }
+
+  // ---- master bounce (AC-13/14): render + persist the mastered mix to OPFS. The
+  // caller records the bounce in the manifest with loc:'opfs' (a re-Save migrates it). ----
+  async function bounce(take, slug, opts = {}, folderHandle = null) {
+    const r = await renderMaster(take, slug, opts, folderHandle);
+    if (!r.ok) return r;
     const filename = mixFileName(slug, take.take);
-    await takeStore.writeFile('takes/' + slug + '/' + filename, encodeMonoWav(mono));
-    return { ok: true, file: filename, lufs: measured === -Infinity ? null : measured };
+    await takeStore.writeFile('takes/' + slug + '/' + filename, r.bytes);
+    return { ok: true, file: filename, lufs: r.lufs };
   }
 
   // ---- ping-pong bounce: sum ONE source track + the destination track (both
@@ -677,11 +701,11 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   // normalization (an internal sub-mix — normalizing would corrupt inter-track
   // balance); a brick-wall limiter guards the two-track sum from clipping. The
   // caller updates the manifest (free src, reset dst to neutral) + deletes the src. ----
-  async function bounceTracks(take, srcKey, dstKey, slug) {
+  async function bounceTracks(take, srcKey, dstKey, slug, folderHandle = null) {
     const src = take.stems && take.stems[srcKey];
     const dst = take.stems && take.stems[dstKey];
     if (!src || !src.file || !dst || !dst.file) return { ok: false, error: 'both tracks must have audio' };
-    const { mono, durationSec } = await renderMonoMix([srcKey, dstKey], take, slug);
+    const { mono, durationSec } = await renderMonoMix([srcKey, dstKey], take, slug, {}, folderHandle);
     if (!mono) return { ok: false, error: 'nothing to bounce' };
     limit([mono], BOUNCE_RATE, LIMITER_CEILING_DB);
     await takeStore.writeFile('takes/' + slug + '/' + dst.file, encodeMonoWav(mono));
@@ -786,5 +810,5 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     if (ctx) { try { ctx.close(); } catch { /* already closed */ } ctx = null; masterBus = null; }
   }
 
-  return { probe, record, stop, play, replay, stopPlay, invalidatePlayback: disposePlayback, bounce, bounceTracks, applySettings, setMasterVol, calibrateLatency, dispose };
+  return { probe, record, stop, play, replay, stopPlay, invalidatePlayback: disposePlayback, renderMaster, bounce, bounceTracks, applySettings, setMasterVol, calibrateLatency, dispose };
 }

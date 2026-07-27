@@ -2,12 +2,13 @@
 
 **Specification & Implementation Plan (build-ready)**
 
-> Status: **revision 4 — implemented; the deck now wears a portastudio face.** The body below (§1–§9)
-> is the original revision-2 2-track spec, preserved as the design record; the **Revision 3** and
-> **Revision 4** changelogs immediately below supersede it wherever they conflict (rev 3: 4 tracks not
-> 2, mono not stereo, multi-pass fill, overdub monitoring, ping-pong bounce, group-scoped retake; rev
-> 4: portastudio channel strips, playback/monitor metering, master monitor gain, per-strip arming).
-> Read the changelogs first.
+> Status: **revision 5 — implemented; take audio now persists to the song's real on-disk folder.** The
+> body below (§1–§9) is the original revision-2 2-track spec, preserved as the design record; the
+> **Revision 3**, **Revision 4**, and **Revision 5** changelogs immediately below supersede it wherever
+> they conflict (rev 3: 4 tracks not 2, mono not stereo, multi-pass fill, overdub monitoring, ping-pong
+> bounce, group-scoped retake; rev 4: portastudio channel strips, playback/monitor metering, master
+> monitor gain, per-strip arming; rev 5: OPFS-scratch→song-folder Save persistence, per-slot `loc`,
+> Save/Export/Rename/Delete row, drum-MIDI archival — desktop Chrome only). Read the changelogs first.
 
 **Revision 2 changelog (2026-07-11).** Adversarial review against the real codebase produced these
 changes, all user-arbitrated: (1) worklet/worker scripts are loaded via `fetch → Blob URL` because
@@ -156,6 +157,77 @@ fader/LED-meter/counter widgets), `js/tape/meterModel.js` (pure meter math), rew
 7. **New pure module `meterModel.js` (new decision D37):** `CLIP_THRESHOLD`, `METER_SEGMENTS`,
    dB-spaced `peakToSegments`/`peakToLit`, `decayPeak` ballistics, and the `clipState` latch — all
    node-tested, so the LED math is verified independent of the audio graph.
+
+---
+
+## Revision 5 changelog (durable folder persistence; supersedes §3.5 and §5.2/§5.3, amends D1/D3/D30, where they conflict)
+
+At the user's direction the deck gained a **Save** that moves take audio out of evictable OPFS into the
+song's real on-disk **folder**, beside its `.json`, so takes are durable and travel with the song.
+**Desktop Chrome only** (File System Access API — the iOS gap is the very reason D1 chose OPFS; OPFS stays
+the realtime capture path everywhere). New file `js/tape/folderStore.js`; `sw.js` `CACHE` → `sn-v34`;
+`node engine.test.js` green (730 checks). The changes:
+
+1. **Two-tier storage (amends D1).** OPFS is no longer the final store — it is the realtime capture
+   **scratch** (`tape/takeStore.js` → `opfsWorker.js` via `createSyncAccessHandle`, unchanged, the only
+   glitch-free streaming-write path). On **Save**, take audio migrates OPFS → `<folder>/takes/<id>/` and
+   imported drum MIDI → `<folder>/midi/<id>/`, next to `<id>.json`. Layout is **id-namespaced** so one
+   granted folder safely holds many songs. Reads are location-aware; recording and every bounce/ping-pong
+   write stay OPFS-only (worker-only sync handles, D20), so folder I/O never sits in the realtime path.
+
+2. **Per-SLOT `loc:'opfs'|'folder'` (new decision D38), never per-take.** A Saved take can still be
+   overdubbed / retaken / ping-ponged / master-bounced, each writing a fresh OPFS WAV under it — so one
+   take mixes folder + opfs slots, and a per-take flag would misroute a read (data loss). `loc` is additive
+   on each stem slot and on `bounce`; **manifest `schemaVersion` stays 2** (defaulted exactly as `click`/
+   `drums` were added — `validateStem` widened, no bump). "Fully saved" is derived (`takeIsSaved`), not
+   stored; `pendingOpfsSlotKeys` drives migration and the SAVE-badge count.
+
+3. **The Save migration (new decision D39), crash-safe.** Order: for each take, write each OPFS-only slot
+   (+ its OPFS bounce) into the folder and **verify byte length**, flip its `loc`; then write the **folder
+   manifest first**, then the OPFS working manifest; **only then** delete the OPFS temps. An interruption
+   (crash / tab-close / permission revoke / quota) leaves harmless duplicates, never a hole — the take
+   stays OPFS-playable and a re-Save is idempotent (`pendingOpfsSlotKeys` shrinks monotonically). A
+   `deckSaving` flag is mutually exclusive with record/bounce. The folder is granted once via
+   `showDirectoryPicker({startIn: <the .json handle>})` and remembered in the existing `fileHandles`
+   IndexedDB store under a **`::dir`** companion key (like `::md` — no schema bump). Record and Save first
+   ensure the song has a saved `.json` (`ensureSongJsonSaved`); if not, the Save flow runs first.
+
+4. **Folder = last-Saved snapshot; only Save mutates it (amends D30).** In-session delete / retake /
+   ping-pong touch OPFS only; Save reconciles the folder — migrate pending, rewrite the folder manifest,
+   and **GC folder orphans** (list `takes/<id>/`, delete anything the just-written manifest no longer
+   references). On deck open, if the OPFS working manifest is gone (evicted) but the folder copy exists,
+   **rebuild the OPFS index from the folder** — D30's "rebuild, never wipe", extended: the durable folder
+   copy is the recovery source; genuinely-unsaved takes are honestly reported unrecoverable.
+
+5. **Song-management row in the deck (new decision D40): Save / Export / Rename / Delete.** **Export** =
+   `renderMaster`, a non-persisting mastered mono WAV of the current take (split out of `bounce()` so
+   Export ≠ MIX; MIX still writes the take's `_mix.wav`). **Rename** = the song's display name only
+   (on-disk artifacts stay id-named, matching "rename keeps id"). **Delete** = this song's `<id>`-scoped
+   artifacts only — `folderStore.deleteSongArtifacts` is hard-scoped to `<id>.json` + `takes/<id>/` +
+   `midi/<id>/` (+ OPFS temp), never a sibling in a shared folder nor the folder root. **Amends D3:** takes
+   still never enter the `.json` bundle, but now have a durable on-disk home (not only Share/Export).
+
+6. **Drum-MIDI archival (new decision D41).** `onImportDrumMidi` previously parsed the SMF to a step
+   pattern and **discarded the bytes**; it now also keeps the raw `.mid` (OPFS temp `midi/<id>/`) and
+   records its name in `drums.source.midiFile` (the field `clampDrumConfig` already round-tripped but
+   nothing wrote). Save copies referenced MIDIs into the folder. The **derived pattern still drives
+   playback** — the `.mid` is never re-read; it is kept only so the song's source travels with it.
+
+7. **New/changed code.** New pure `takeModel.js` helpers (all node-tested): `slotLoc`,
+   `pendingOpfsSlotKeys`, `takeIsSaved`, `migrateTakeSlots`, `revertSlotToOpfs`, `midiRef`,
+   `referencedMidiFiles`, `setDrumMidiFile`, plus `loc` in `makeSlot`/`normalizeStem`/`normalizeBounce`/
+   `validateStem`. New impure main-thread `js/tape/folderStore.js` — a File System Access facade over a
+   per-song dir handle (`writeFile`/`readFile`/`fileSize`/`fileExists`/`listDir`/`deleteFile`/
+   `deleteSongArtifacts`/`ensurePermission`) with structural traversal guards. `audioEngine.js` splits
+   `renderMaster` out of `bounce` and makes `loadStemBuffer` branch on `stemMeta.loc`; `takeStore.js` gains
+   `deletePath`/`deleteSongMidi`; `main.js` gains the folder-handle plumbing, `onSaveDeck`/`onExportDeck`/
+   `onRenameSongDeck`/`onDeleteDeck`, and the rebuild-from-folder path; `tapeView.js` gains the
+   song-management row.
+
+**Platform (amends D1's reach):** the folder tier is **desktop Chrome only** — iOS Safari has no File
+System Access API (the reason D1 chose OPFS), so on a non-FSA browser the deck stays OPFS-only and Save is
+unavailable. iOS keeps OPFS + `persist()` + per-file Share as before. **Still not a general DAW:** no
+timeline editing, no per-clip trimming, no plugin concept, no panning; take audio never enters the bundle.
 
 ---
 

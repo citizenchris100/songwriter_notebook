@@ -146,6 +146,14 @@ export async function deleteTakeAudio(slug, take) {
 export async function deleteSongTakes(slug) {
   await call('deleteDir', { dir: 'takes/' + slug });
 }
+// Delete the song's OPFS MIDI-temp dir (imported .mid scratch, copied to the folder on Save).
+export async function deleteSongMidi(slug) {
+  await call('deleteDir', { dir: 'midi/' + slug });
+}
+// Delete one arbitrary OPFS path (idempotent; a copied MIDI temp after Save). Best-effort.
+export async function deletePath(path) {
+  await call('deleteFiles', { paths: [path] });
+}
 
 // Delete just the named slot WAVs of one take (a ping-pong bounce frees its source
 // slot; a group-discard frees the last pass's slots) — the take's other tracks and

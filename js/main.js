@@ -28,6 +28,7 @@ import * as meterModel from './tape/meterModel.js';
 import { clampClickConfig, defaultClickConfig } from './tape/clickModel.js';
 import { clampDrumConfig, defaultDrumConfig, toggleCell, setBars, smfToPattern } from './tape/drumModel.js';
 import * as takeStore from './tape/takeStore.js';
+import * as folderStore from './tape/folderStore.js';
 import { SIZE_FIELDS } from './tape/wav.js';
 import { makeTapeDeck } from './tape/audioEngine.js';
 import { mountApp } from './ui.js';
@@ -87,6 +88,9 @@ let deckUnsupported = false;   // OPFS/createSyncAccessHandle unsupported (§2 �
 let deckRecording = false;
 let deckArming = false;        // synchronous re-entrancy guard for the Record button's async setup window
 let deckBouncing = false;
+let deckSaving = false;        // a Save (OPFS -> song folder migration) is in flight; mutually exclusive with record/bounce
+let deckHasJsonHandle = false; // cached (sync for the view-model): the active song has a retained .json handle
+let deckHasFolderHandle = false; // cached: the active song has a granted folder (::dir) handle
 let deckOpenSeq = 0;           // bumped on every onOpenTapeDeck call; a stale in-flight open detects itself via this
 let deckPendingNewTake = false; // a "+ New take" container awaiting its first pass (materialized lazily at Record)
 let deckArmed = [];             // [{ slotKey, inputIndex }] — REC-armed strips for the next pass (normalized each render)
@@ -131,6 +135,9 @@ function resetTapeDeckUi() {
   deckRecording = false;
   deckArming = false;
   deckBouncing = false;
+  deckSaving = false;
+  deckHasJsonHandle = false;
+  deckHasFolderHandle = false;
   deckCalibrating = false;
   deckPendingNewTake = false;
   deckArmed = [];
@@ -271,7 +278,13 @@ function tapeDeckViewModel(active) {
     masterVol: readMasterVol(),
     panelOpen: deckPanelOpen,
     logOpen: deckLogOpen,
-    canRecord: armed.length >= 1 && !deckBlocked && !deckUnsupported && !deckRecording && !deckBouncing,
+    canRecord: armed.length >= 1 && !deckBlocked && !deckUnsupported && !deckRecording && !deckBouncing && !deckSaving,
+    // Folder persistence (Save/Export/Rename/Delete row): how many takes still have
+    // OPFS-only audio to migrate, and whether a .json / folder handle already exists.
+    takesPendingSave: takes.filter((t) => t.status !== 'discarded' && takeModel.takeHasAudio(t) && !takeModel.takeIsSaved(t)).length,
+    saving: deckSaving,
+    folderGranted: deckHasFolderHandle,
+    jsonSaved: deckHasJsonHandle,
   };
 }
 
@@ -620,6 +633,85 @@ async function rememberHandle(songId, handle) {
   try { await audioStore.putFileHandle(songId, handle); } catch {}
 }
 
+// ---- per-song FOLDER (directory) handle: the real on-disk folder Save persists take
+// audio + MIDI into, next to the song's .json. Stored in the SAME IndexedDB handle store
+// under a '::dir' companion key (like '::md'), so no schema bump. Desktop-Chrome only. ----
+const dirKey = (songId) => songId + '::dir';
+
+// A permitted directory handle for a song, or null: session/IDB lookup (handleForSong),
+// then ensure readwrite permission (a silent query when already granted; one prompt per
+// session otherwise — must be on a user gesture). null on no-handle / decline / stale.
+async function folderHandleForSong(songId) {
+  const dir = await handleForSong(dirKey(songId));
+  if (!dir) return null;
+  return (await folderStore.ensurePermission(dir)) ? dir : null;
+}
+
+// Acquire (once) the song's folder via showDirectoryPicker, defaulting to the song's .json
+// folder (startIn), and remember it. Returns the handle or null (cancel / unsupported).
+// Must be called under a user gesture (Save).
+async function ensureFolderGrant(songId) {
+  const existing = await folderHandleForSong(songId);
+  if (existing) return existing;
+  if (typeof window === 'undefined' || !window.showDirectoryPicker) return null;
+  try {
+    const startIn = await handleForSong(songId); // the .json handle → picker opens in its folder
+    const opts = { id: 'sn-song-folder', mode: 'readwrite' };
+    if (startIn) opts.startIn = startIn;
+    const dir = await window.showDirectoryPicker(opts);
+    if (!(await folderStore.ensurePermission(dir))) return null;
+    await rememberHandle(dirKey(songId), dir);
+    return dir;
+  } catch { return null; } // AbortError (cancel) or blocked
+}
+
+// Does a take reference any file that now lives in the folder (so a read/delete needs the
+// dir handle)? Lets opfs-only takes stay frictionless (no handle fetch, no permission prompt).
+function takeHasFolderFile(take) {
+  const stems = (take && take.stems) || {};
+  if (takeModel.STEM_KEYS.some((k) => stems[k] && stems[k].file && stems[k].loc === 'folder')) return true;
+  return !!(take && take.bounce && take.bounce.file && take.bounce.loc === 'folder');
+}
+
+// Sanitize an imported MIDI filename to a safe basename (no dirs, no path chars) — the name
+// stored in the drum config (source.midiFile) and used for the OPFS temp + folder copy.
+function safeMidiName(name) {
+  const base = String(name || 'import.mid').split(/[\\/]/).pop() || 'import.mid';
+  const clean = base.replace(/[^A-Za-z0-9._-]/g, '_');
+  return clean && clean !== '.' && clean !== '..' ? clean : 'import.mid';
+}
+
+// Turn a failed folder/OPFS read into a clear, actionable deck status (never a silent miss).
+function surfaceReadError(e) {
+  const message = (e && e.code === 'FOLDER_UNAVAILABLE')
+    ? 'Grant folder access to play saved takes (Save re-links if the folder moved).'
+    : (e && e.name === 'NotFoundError')
+      ? 'Saved audio not found — the song folder may have moved. Re-Save to relink.'
+      : 'Could not read the take audio.';
+  deckStatus = { type: 'error', message };
+  render();
+}
+
+// Play/replay a take, resolving the folder handle first (a folder-located slot needs it) and
+// surfacing a clear status if the audio can't be read rather than half-loading.
+async function playTake(take, slug, isReplay) {
+  const fh = takeHasFolderFile(take) ? await folderHandleForSong(slug) : null;
+  try {
+    const deck = ensureTapeDeck();
+    return await (isReplay ? deck.replay(take, slug, fh) : deck.play(take, slug, fh));
+  } catch (e) { surfaceReadError(e); return false; }
+}
+
+// Recording requires the song to have a saved .json (a home for its folder). If it has no
+// retained handle, run the Save flow (prompts) and re-check. Returns whether one now exists.
+async function ensureSongJsonSaved() {
+  const a = activeSong();
+  if (!a || !a.id) return false;
+  if (await handleForSong(a.id)) return true;
+  await handlers.onSaveSongFile();
+  return !!(await handleForSong(a.id));
+}
+
 // Convenience for a synchronously-built payload (feels): the object is already in hand, so
 // opening the picker first keeps the click gesture intact.
 async function download(filename, obj) {
@@ -897,11 +989,19 @@ async function refreshSpaceWarning() {
 // leaving a window for a fast double-tap to arm two passes off the same stale
 // manifest snapshot.
 async function armRecording() {
-  if (deckArming || deckRecording) return;
+  if (deckArming || deckRecording || deckSaving) return;
   const a = activeSong();
   if (!a || !a.id || !deckManifest) return;
   deckArming = true;
   deckStatus = null;
+  // A recording needs a saved .json to live beside (its folder is granted at Save). If the
+  // song has no .json yet, prompt to save it first — then proceed (decision 5).
+  if (!(await ensureSongJsonSaved())) {
+    deckArming = false;
+    deckStatus = { type: 'warn', message: 'Save the song first — a recording needs a saved .json to live beside.' };
+    render();
+    return;
+  }
   const slug = a.id;
   const path = manifestPath(slug);
   await refreshSpaceWarning(); // §5.8: "before each record", not just on deck open / after the last take
@@ -923,6 +1023,16 @@ async function armRecording() {
   // The take's already-recorded tracks play as backing while overdubbing (empty for
   // a first pass); latency-aligned via the measured monitor round-trip.
   const existingTracks = (baseTake ? takeModel.filledSlotKeys(baseTake) : []).map((k) => ({ key: k, meta: baseTake.stems[k] }));
+  // Overdub backing may include tracks already Saved to the folder — resolve (and require)
+  // the folder handle when any backing track is folder-located, so it can be monitored.
+  const needsFolder = existingTracks.some((t) => t.meta && t.meta.loc === 'folder');
+  const folderHandle = needsFolder ? await folderHandleForSong(slug) : null;
+  if (needsFolder && !folderHandle) {
+    deckArming = false;
+    deckStatus = { type: 'error', message: 'Grant folder access to overdub onto a saved take.' };
+    render();
+    return;
+  }
   // The metronome config for this pass: the new-take draft for a first pass, else the
   // take's locked config (overdubs share the take's tempo). Drives the count-in + click
   // AND is stamped onto the take at creation.
@@ -942,6 +1052,7 @@ async function armRecording() {
       existingTracks,
       clickConfig: clickCfg,
       drumConfig: drumCfg,
+      folderHandle,
       onPassOpen: async (capture, sampleRate) => {
         // Resolve this pass's destination slots from the routing (skip null/discard
         // channels, dedup, cap at the real captured channel count, only into free slots).
@@ -1180,7 +1291,7 @@ const handlers = {
       if (gone && gone.sketches && gone.sketches.length) audioStore.deleteMany(gone.sketches.map((sk) => sk.id)).catch(() => {});
       // §5.7: also GC its OPFS take directory (no boot-time GC, D30 — deletion is
       // the one place a song's takes get removed, immediately, with confirm).
-      if (gone && gone.tapeDeck) takeStore.deleteSongTakes(gone.id).catch(() => {});
+      if (gone && gone.tapeDeck) { takeStore.deleteSongTakes(gone.id).catch(() => {}); takeStore.deleteSongMidi(gone.id).catch(() => {}); }
     },
 
     // Save the current song's .json. Linked + File System Access → overwrite in place,
@@ -1309,13 +1420,31 @@ const handlers = {
       await ensurePersist();
       if (stale()) return;
       const path = manifestPath(a.id);
-      let manifest;
+      let manifest = null;
+      let rebuilt = false;
       try {
         const raw = await takeStore.readManifest(path);
         const v = takeModel.validateManifest(raw);
         if (!v.ok) { manifest = takeModel.createManifest(a.id); if (!stale()) { deckStatus = { type: 'error', message: 'This song’s take history looked corrupted and could not be loaded.' }; } }
         else manifest = takeModel.normalizeManifest(raw);
-      } catch { manifest = takeModel.createManifest(a.id); }
+      } catch {
+        manifest = null; // OPFS working manifest unreadable (evicted / never written) — try the folder copy below
+      }
+      if (stale()) return;
+      // Rebuild-from-folder (D30: rebuild, never wipe): if OPFS had no usable manifest but the
+      // durable folder copy exists, restore the working index from it. Needs folder permission.
+      if (!manifest) {
+        const dir = await folderHandleForSong(a.id);
+        if (dir) {
+          try {
+            const bytes = await folderStore.readFile(dir, path);
+            const raw = JSON.parse(new TextDecoder().decode(new Uint8Array(bytes)));
+            if (takeModel.validateManifest(raw).ok) { manifest = takeModel.normalizeManifest(raw); rebuilt = true; }
+          } catch { /* no usable folder copy */ }
+        }
+        if (stale()) return;
+        if (!manifest) manifest = takeModel.createManifest(a.id);
+      }
       if (stale()) return;
 
       // Crash recovery (§5.3): finalize any pass a prior session left mid-record
@@ -1354,6 +1483,14 @@ const handlers = {
       deckDrumBar = 0;
       const kept = takeModel.mostRecentKeptTake(manifest);
       currentTake = kept ? kept.take : null;
+
+      deckHasJsonHandle = !!(await handleForSong(a.id));
+      deckHasFolderHandle = !!(await handleForSong(dirKey(a.id)));
+      if (stale()) return;
+      if (rebuilt) {
+        const n = manifest.takes.filter((t) => t.status === 'active' && takeModel.takeHasAudio(t)).length;
+        deckStatus = { type: 'warn', message: 'Restored ' + n + ' saved take' + (n === 1 ? '' : 's') + ' from the song folder; any unsaved takes could not be recovered.' };
+      }
 
       await refreshSpaceWarning();
       if (stale()) return;
@@ -1464,7 +1601,13 @@ const handlers = {
         const r = smfToPattern(bytes);
         deckDrumBar = 0;
         deckStatus = { type: 'info', message: r.mappedCount + ' notes mapped to ' + r.pattern.bars + ' bar' + (r.pattern.bars === 1 ? '' : 's') + ', ' + r.discarded.length + ' unmapped (no matching voice).' };
-        commitDrums(mergeDrums(currentDrumBase(), { enabled: true, pattern: r.pattern, source: { type: 'midi' } }));
+        // Keep the raw .mid so it travels with the song (decision 4): stash it in an OPFS temp
+        // now (survives reload) and record its name on the drum config; Save copies it into the
+        // folder's midi/<id>/. The derived pattern still drives playback — the .mid is never re-read.
+        const a = activeSong();
+        const name = safeMidiName(file.name);
+        if (a && a.id) { try { await takeStore.writeFile(takeModel.midiRef(a.id) + name, bytes.buffer); } catch { /* temp write failed; the pattern still loads */ } }
+        commitDrums(mergeDrums(currentDrumBase(), { enabled: true, pattern: r.pattern, source: { type: 'midi', midiFile: name } }));
       } catch {
         deckStatus = { type: 'error', message: 'Could not read that MIDI file — is it a Standard MIDI File?' };
         render();
@@ -1487,7 +1630,7 @@ const handlers = {
     // take's earlier groups playing as backing).
     onDiscardLastGroup: async () => {
       const a = activeSong();
-      if (!a || !deckManifest || currentTake == null || deckRecording) return;
+      if (!a || !deckManifest || currentTake == null || deckRecording || deckSaving) return;
       const take = deckManifest.takes.find((t) => t.take === currentTake);
       if (!take) return;
       const keys = takeModel.lastGroupSlotKeys(take);
@@ -1510,7 +1653,7 @@ const handlers = {
       // takeNo would no longer match anything). Simplest safe rule: no
       // deletes while any bounce is in flight (tapeView also disables the
       // buttons — this is the defense-in-depth backstop).
-      if (!a || !deckManifest || deckBouncing) return;
+      if (!a || !deckManifest || deckBouncing || deckSaving) return;
       deckManifest = takeModel.discardTake(deckManifest, takeNo);
       await takeStore.writeManifest(manifestPath(a.id), deckManifest);
       takeStore.deleteTakeAudio(a.id, takeNo).catch(() => {});
@@ -1597,13 +1740,17 @@ const handlers = {
 
     onBounceTake: async (opts) => {
       const a = activeSong();
-      if (!a || !deckManifest || currentTake == null || !tapeDeck || deckBouncing) return;
+      if (!a || !deckManifest || currentTake == null || !tapeDeck || deckBouncing || deckSaving) return;
       const take = deckManifest.takes.find((t) => t.take === currentTake);
       if (!take) return;
       const takeNo = take.take;              // snapshot — `currentTake` can change while this await is in flight
       deckBouncing = true;
       render();
-      const result = await tapeDeck.bounce(take, a.id, { includeDrums: !!(opts && opts.includeDrums) });
+      let result;
+      try {
+        const fh = takeHasFolderFile(take) ? await folderHandleForSong(a.id) : null; // saved stems read from the folder
+        result = await tapeDeck.bounce(take, a.id, { includeDrums: !!(opts && opts.includeDrums) }, fh);
+      } catch (e) { deckBouncing = false; surfaceReadError(e); return; }
       deckBouncing = false;
       if (!result.ok) { deckStatus = { type: 'error', message: 'Bounce failed: ' + result.error }; render(); return; }
       // The take may have been discarded/deleted while the bounce was running
@@ -1612,7 +1759,8 @@ const handlers = {
       // bounce record, and don't leave an orphaned _mix.wav unexplained.
       const stillActive = deckManifest.takes.find((t) => t.take === takeNo && t.status === 'active');
       if (!stillActive) { takeStore.deleteTakeAudio(a.id, takeNo).catch(() => {}); render(); return; }
-      deckManifest = takeModel.markBounced(deckManifest, takeNo, { file: result.file, bouncedAt: nowISO(), lufs: result.lufs });
+      // The mix was written to OPFS (loc:'opfs'); a re-Save migrates it into the folder.
+      deckManifest = takeModel.markBounced(deckManifest, takeNo, { file: result.file, bouncedAt: nowISO(), lufs: result.lufs, loc: 'opfs' });
       await takeStore.writeManifest(manifestPath(a.id), deckManifest);
       await refreshSpaceWarning();
       render();
@@ -1623,7 +1771,7 @@ const handlers = {
     // the master bounce + delete so no two operations touch the same take's files.
     onBounceStemToTrack: async (srcKey, dstKey) => {
       const a = activeSong();
-      if (!a || !deckManifest || currentTake == null || !tapeDeck || deckBouncing || deckRecording || srcKey === dstKey) return;
+      if (!a || !deckManifest || currentTake == null || !tapeDeck || deckBouncing || deckRecording || deckSaving || srcKey === dstKey) return;
       const take = deckManifest.takes.find((t) => t.take === currentTake);
       const src = take && take.stems[srcKey];
       const dst = take && take.stems[dstKey];
@@ -1632,7 +1780,11 @@ const handlers = {
       tapeDeck.stopPlay();
       deckBouncing = true;
       render();
-      const result = await tapeDeck.bounceTracks(take, srcKey, dstKey, a.id);
+      let result;
+      try {
+        const fh = takeHasFolderFile(take) ? await folderHandleForSong(a.id) : null; // saved src/dst read from the folder
+        result = await tapeDeck.bounceTracks(take, srcKey, dstKey, a.id, fh);
+      } catch (e) { deckBouncing = false; surfaceReadError(e); return; }
       deckBouncing = false;
       if (!result.ok) { deckStatus = { type: 'error', message: 'Bounce failed: ' + result.error }; render(); return; }
       // Don't touch a take that got deleted mid-bounce (the delete guard blocks this,
@@ -1656,20 +1808,154 @@ const handlers = {
       if (!a || !deckManifest || tn == null) return;
       const take = deckManifest.takes.find((t) => t.take === tn);
       if (!take) return;
-      const fileRef = which === 'bounce' ? (take.bounce && take.bounce.file) : (take.stems[which] && take.stems[which].file);
+      const slot = which === 'bounce' ? take.bounce : take.stems[which];
+      const fileRef = slot && slot.file;
       if (!fileRef) return;
+      const rel = takeModel.tapeDeckRef(a.id).path + fileRef;
       let bytes;
-      try { bytes = await takeStore.readFile(takeModel.tapeDeckRef(a.id).path + fileRef); }
-      catch { deckStatus = { type: 'error', message: 'Could not read that file.' }; render(); return; }
+      try {
+        if (slot.loc === 'folder') {
+          const fh = await folderHandleForSong(a.id);
+          if (!fh) throw Object.assign(new Error('folder access'), { code: 'FOLDER_UNAVAILABLE' });
+          bytes = await folderStore.readFile(fh, rel);
+        } else {
+          bytes = await takeStore.readFile(rel);
+        }
+      } catch (e) { surfaceReadError(e); return; }
       await shareOrDownloadBlob(new Blob([bytes], { type: 'audio/wav' }), fileRef, 'audio/wav');
     },
 
     // Ephemeral playback — no persisted state, so these go straight to the
     // controller rather than through a manifest-mutating handler (sketches
     // precedent: compare onLoadSketchBlob / makeSketchPlayer).
-    onPlayTake: (take, slug) => ensureTapeDeck().play(take, slug),
-    onReplayTake: (take, slug) => ensureTapeDeck().replay(take, slug),
+    onPlayTake: (take, slug) => playTake(take, slug, false),
+    onReplayTake: (take, slug) => playTake(take, slug, true),
     onStopPlayTake: () => { if (tapeDeck) tapeDeck.stopPlay(); },
+
+    // ---- song-management row (Save / Export / Rename / Delete), available in the deck ----
+
+    // The consolidated Save: migrate this song's OPFS take audio + imported MIDI into the
+    // song's on-disk folder (beside its .json), then reconcile the folder to match. One
+    // gesture — grants the folder the first time (picker opens at the .json), silent after.
+    // Crash-safe order (folder writes+verify → folder manifest → OPFS manifest → delete OPFS
+    // temps) so an interruption leaves duplicates, never a hole (the take stays OPFS-safe).
+    onSaveDeck: async () => {
+      const a = activeSong();
+      if (!a || !a.id || !deckManifest || deckRecording || deckBouncing || deckSaving) return;
+      deckSaving = true;
+      deckStatus = null;
+      render();
+      try {
+        if (!(await ensureSongJsonSaved())) { deckStatus = { type: 'warn', message: 'Save the song’s .json first, then Save takes.' }; return; }
+        const dir = await ensureFolderGrant(a.id);
+        if (!dir) { deckStatus = { type: 'warn', message: 'Pick the song’s folder to save its takes into it.' }; return; }
+        deckHasJsonHandle = true;
+        deckHasFolderHandle = true;
+        const slug = a.id;
+        const dp = takeModel.tapeDeckRef(slug).path; // 'takes/<slug>/'
+        let next = deckManifest;
+        let migrated = 0;
+
+        // 1. Migrate every non-discarded take's OPFS-only slots (+ its OPFS bounce), verifying each.
+        for (const take of deckManifest.takes) {
+          if (take.status === 'discarded') continue;
+          const pending = takeModel.pendingOpfsSlotKeys(take);
+          for (const key of pending) {
+            const rel = dp + take.stems[key].file;
+            const bytes = await takeStore.readFile(rel);
+            await folderStore.writeFile(dir, rel, bytes);
+            if ((await folderStore.fileSize(dir, rel)) !== bytes.byteLength) throw new Error('verify failed: ' + take.stems[key].file);
+          }
+          const bouncePending = !!(take.bounce && take.bounce.file && take.bounce.loc !== 'folder');
+          if (bouncePending) {
+            const rel = dp + take.bounce.file;
+            const bytes = await takeStore.readFile(rel);
+            await folderStore.writeFile(dir, rel, bytes);
+            if ((await folderStore.fileSize(dir, rel)) !== bytes.byteLength) throw new Error('verify failed: ' + take.bounce.file);
+          }
+          if (pending.length || bouncePending) { next = takeModel.migrateTakeSlots(next, take.take, pending, { bounce: bouncePending }); migrated += pending.length + (bouncePending ? 1 : 0); }
+        }
+
+        // 2. Copy each referenced imported MIDI from its OPFS temp into the folder, then drop the temp.
+        for (const name of takeModel.referencedMidiFiles(next)) {
+          const rel = takeModel.midiRef(slug) + name;
+          let bytes;
+          try { bytes = await takeStore.readFile(rel); } catch { continue; } // temp already copied on a prior Save
+          await folderStore.writeFile(dir, rel, bytes);
+          takeStore.deletePath(rel).catch(() => {});
+        }
+
+        // 3. Commit: folder manifest FIRST (the durable rebuild source), then the OPFS working index.
+        await folderStore.writeFile(dir, manifestPath(slug), JSON.stringify(next, null, 2));
+        await takeStore.writeManifest(manifestPath(slug), next);
+        deckManifest = next;
+
+        // 4. Only now delete OPFS temps for every take now fully in the folder (targets all
+        //    folder-located takes, self-healing stray temps from a prior interrupted Save).
+        for (const take of deckManifest.takes) {
+          if (take.status === 'discarded' || !takeModel.takeIsSaved(take)) continue;
+          takeStore.deleteTakeAudio(slug, take.take).catch(() => {});
+        }
+
+        // 5. GC folder orphans: any WAV under takes/<slug>/ the just-written manifest no longer
+        //    references (a deleted take, a freed/ping-ponged slot, an old bounce) — keeps the
+        //    folder a consistent snapshot of exactly what Save wrote.
+        try {
+          const referenced = new Set(['manifest.json']);
+          for (const t of next.takes) {
+            for (const k of takeModel.STEM_KEYS) { const s = t.stems[k]; if (s && s.file) referenced.add(s.file); }
+            if (t.bounce && t.bounce.file) referenced.add(t.bounce.file);
+          }
+          for (const name of await folderStore.listDir(dir, dp)) { if (!referenced.has(name)) folderStore.deleteFile(dir, dp + name).catch(() => {}); }
+        } catch { /* listing unsupported — orphans are inert, cleaned on song delete */ }
+
+        deckStatus = { type: 'info', message: migrated ? ('Saved ' + migrated + ' file' + (migrated === 1 ? '' : 's') + ' to the song folder.') : 'Everything is already saved to the folder.' };
+        await refreshSpaceWarning();
+      } catch (e) {
+        deckStatus = { type: 'error', message: 'Save failed (' + ((e && e.message) || 'folder write error') + '). Your takes are still safe on this device — try Save again.' };
+      } finally {
+        deckSaving = false;
+        render();
+      }
+    },
+
+    // Export = render the CURRENT take to one mastered mono WAV and share/download it, WITHOUT
+    // persisting it (distinct from MIX, which saves the take's _mix.wav, and per-stem SHARE).
+    onExportDeck: async (opts) => {
+      const a = activeSong();
+      if (!a || !deckManifest || currentTake == null || !tapeDeck || deckBouncing || deckRecording || deckSaving) return;
+      const take = deckManifest.takes.find((t) => t.take === currentTake);
+      if (!take || !takeModel.takeHasAudio(take)) { deckStatus = { type: 'warn', message: 'Load a take with audio to export.' }; render(); return; }
+      let r;
+      try {
+        const fh = takeHasFolderFile(take) ? await folderHandleForSong(a.id) : null;
+        r = await tapeDeck.renderMaster(take, a.id, { includeDrums: !!(opts && opts.includeDrums) }, fh);
+      } catch (e) { surfaceReadError(e); return; }
+      if (!r.ok) { deckStatus = { type: 'error', message: 'Export failed: ' + r.error }; render(); return; }
+      await shareOrDownloadBlob(new Blob([r.bytes], { type: 'audio/wav' }), a.id + '_take' + take.take + '_master.wav', 'audio/wav');
+    },
+
+    // Rename the whole song from inside the deck — display name only; on-disk artifacts stay
+    // id-named (matching the existing rename-keeps-id behavior). Delegates to onRenameSong.
+    onRenameSongDeck: (name) => handlers.onRenameSong(name),
+
+    // Delete the whole song from the deck: remove ONLY this song's id-scoped on-disk artifacts
+    // (its <id>.json, takes/<id>/, midi/<id>/) plus OPFS temp, then the song itself. Never
+    // touches other files in a shared folder. Inline-confirmed by the view.
+    onDeleteDeck: async () => {
+      const a = activeSong();
+      if (!a || !a.id || deckRecording || deckBouncing || deckSaving) return;
+      const songId = a.id;
+      const jsonHandle = await handleForSong(songId);
+      const dir = await folderHandleForSong(songId);
+      if (dir) {
+        try { await folderStore.deleteSongArtifacts(dir, songId); } catch { /* best-effort */ }
+        if (jsonHandle && jsonHandle.name) folderStore.deleteFile(dir, jsonHandle.name).catch(() => {}); // the actual .json (its picked name)
+      }
+      fileHandles.delete(dirKey(songId));
+      audioStore.deleteFileHandle(dirKey(songId)).catch(() => {});
+      handlers.onDeleteSong(songId); // drops the song + .json/.md handles + OPFS takes/midi + resets the deck UI
+    },
 
     // tapeView calls this once per render with the freshly-built timer/meter/
     // play-status DOM refs (the makeSketchPlayer.setStatus idiom, generalized —

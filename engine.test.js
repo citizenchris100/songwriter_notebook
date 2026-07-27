@@ -31,7 +31,8 @@ import {
   makeTake, appendTake, nextTakeNumber, appendPassTracks, finalizePass, finalizeRecoveredPass,
   discardTake, discardGroup, bounceTrackToTrack, markBounced, setStemSettings, mostRecentKeptTake,
   nextGroup, lastGroupSlotKeys, freeSlotKeys, filledSlotKeys, maxSlotDuration, takeHasAudio,
-  slotHasAudio, defaultRouting, stemFileName, mixFileName, tapeDeckRef, playbackCacheStale,
+  slotHasAudio, slotLoc, defaultRouting, stemFileName, mixFileName, tapeDeckRef, playbackCacheStale,
+  pendingOpfsSlotKeys, takeIsSaved, migrateTakeSlots, revertSlotToOpfs, midiRef, referencedMidiFiles, setDrumMidiFile,
   defaultStemSettings, clampStemSettings, compressorParams, bounceGainDb,
   LUFS_TARGET, LUFS_FLOOR, BOUNCE_GAIN_DB_MIN, BOUNCE_GAIN_DB_MAX, LIMITER_CEILING_DB,
   STEM_KEYS, MAX_TRACKS, TAKE_STATUS,
@@ -710,12 +711,73 @@ ok('migration sets per-slot durationSec from the take duration', mt.stems.stem1.
 ok('migration opens stem3/stem4 as free slots', mt.stems.stem3 === null && mt.stems.stem4 === null);
 ok('migration preserves the effect settings', mt.stems.stem1.eq.bass === 3 && mt.stems.stem1.comp === 0.2 && mt.stems.stem2.vol === 0.8);
 ok('migration drops the legacy channels field', !('channels' in mt));
+ok('migration marks migrated slots loc opfs', mt.stems.stem1.loc === 'opfs' && mt.stems.stem2.loc === 'opfs');
+ok('migration marks the migrated bounce loc opfs', mt.bounce.loc === 'opfs');
 ok('migration is idempotent (re-normalize is stable)', JSON.stringify(normalizeManifest(migrated)) === JSON.stringify(migrated));
 eq('a migrated 2-track take opens as a partial 4-track take', freeSlotKeys(mt).join(','), 'stem3,stem4');
 // A mono v1 take -> stem1 only, stem2 stays null.
 const v1Mono = { schemaVersion: 1, slug: 's', takes: [{ take: 1, status: 'active', recovered: false, createdAt: 'T', durationSec: 6, sampleRate: 48000, channels: 1, stems: { stem1: { file: 's_1_stem1.wav', vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0 }, stem2: null }, bounce: null }] };
 const mm = normalizeManifest(v1Mono).takes[0];
 ok('mono v1 migrates stem1 only', mm.stems.stem1.file === 's_1_stem1.wav' && mm.stems.stem1.group === 1 && mm.stems.stem2 === null);
+
+// ---- takeModel: folder-persistence loc model + Save-migration helpers ----
+let locMan = appendTake(createManifest('blue-eyes'), makeTake({ take: 1, sampleRate: 48000 }, 'T'));
+locMan = appendPassTracks(locMan, 1, ['stem1', 'stem2'], 1);
+locMan = finalizePass(locMan, 1, { stem1: 10, stem2: 8 });
+let locT = locMan.takes[0];
+eq('a fresh recorded slot defaults loc opfs', slotLoc(locT.stems.stem1), 'opfs');
+eq('pendingOpfsSlotKeys lists all fresh slots', pendingOpfsSlotKeys(locT).join(','), 'stem1,stem2');
+ok('a fresh take is not yet saved', !takeIsSaved(locT));
+
+locMan = migrateTakeSlots(locMan, 1, ['stem1'], {});
+locT = locMan.takes[0];
+eq('migrateTakeSlots flips only the named slot', slotLoc(locT.stems.stem1), 'folder');
+eq('migrateTakeSlots leaves the others opfs', slotLoc(locT.stems.stem2), 'opfs');
+eq('pendingOpfsSlotKeys shrinks after a partial migrate', pendingOpfsSlotKeys(locT).join(','), 'stem2');
+ok('a partially-migrated take is still not saved', !takeIsSaved(locT));
+
+locMan = migrateTakeSlots(locMan, 1, ['stem2'], {});
+locT = locMan.takes[0];
+ok('a take with all filled slots in the folder is saved', takeIsSaved(locT));
+eq('no slots pending once saved', pendingOpfsSlotKeys(locT).length, 0);
+
+// An overdub after Save lands as a fresh OPFS temp — the per-file split the whole design turns on.
+locMan = appendPassTracks(locMan, 1, ['stem3'], nextGroup(locMan.takes[0]));
+locMan = finalizePass(locMan, 1, { stem3: 9 });
+locT = locMan.takes[0];
+eq('an overdub after save is opfs while saved slots stay folder', slotLoc(locT.stems.stem3) + '/' + slotLoc(locT.stems.stem1), 'opfs/folder');
+ok('an overdub makes the take unsaved again', !takeIsSaved(locT));
+eq('only the overdub is pending', pendingOpfsSlotKeys(locT).join(','), 'stem3');
+
+// A settings edit must NOT change a slot's location.
+eq('setStemSettings preserves loc folder', slotLoc(setStemSettings(locMan, 1, 'stem1', { vol: 0.5 }).takes[0].stems.stem1), 'folder');
+// revertSlotToOpfs flips a saved slot back (defensive; used after an in-place OPFS overwrite).
+eq('revertSlotToOpfs flips folder back to opfs', slotLoc(revertSlotToOpfs(locMan, 1, ['stem1'], {}).takes[0].stems.stem1), 'opfs');
+
+// Bounce loc: a fresh master bounce is opfs; migrate with {bounce:true} flips it.
+let bMan = markBounced(locMan, 1, { file: mixFileName('blue-eyes', 1), bouncedAt: 'TB', lufs: -14, loc: 'opfs' });
+eq('a fresh bounce is opfs', bMan.takes[0].bounce.loc, 'opfs');
+bMan = migrateTakeSlots(bMan, 1, pendingOpfsSlotKeys(bMan.takes[0]), { bounce: true });
+eq('migrate with {bounce:true} flips the bounce to folder', bMan.takes[0].bounce.loc, 'folder');
+
+// normalize: default absent loc -> opfs, preserve folder, clamp garbage -> opfs.
+const mkStem = (loc) => ({ file: 'x_1_stem1.wav', group: 1, durationSec: 5, ...(loc ? { loc } : {}), vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0 });
+const mkTake = (loc, bounceLoc) => ({ take: 1, status: 'active', createdAt: 'T', durationSec: 5, sampleRate: 48000, stems: { stem1: mkStem(loc), stem2: null, stem3: null, stem4: null }, bounce: bounceLoc ? { file: 'x_1_mix.wav', bouncedAt: 'T', lufs: -14, loc: bounceLoc } : null });
+eq('normalizeStem defaults absent loc to opfs', normalizeTake(mkTake(null)).stems.stem1.loc, 'opfs');
+eq('normalizeStem preserves loc folder', normalizeTake(mkTake('folder')).stems.stem1.loc, 'folder');
+eq('normalizeStem clamps a garbage loc to opfs', normalizeTake(mkTake('bogus')).stems.stem1.loc, 'opfs');
+ok('validateManifest rejects a bad slot loc', !validateManifest({ slug: 'x', takes: [mkTake('nope')] }).ok);
+ok('validateManifest accepts loc folder + bounce loc opfs', validateManifest({ slug: 'x', takes: [mkTake('folder', 'opfs')] }).ok);
+
+// ---- takeModel: MIDI archival helpers ----
+eq('midiRef path', midiRef('blue-eyes'), 'midi/blue-eyes/');
+let midiMan = appendTake(createManifest('s'), makeTake({ take: 1, sampleRate: 48000, drums: { enabled: true, source: { type: 'midi' } } }, 'T'));
+eq('referencedMidiFiles is empty before a filename is set', referencedMidiFiles(midiMan).size, 0);
+midiMan = setDrumMidiFile(midiMan, 1, 'groove.mid');
+eq('setDrumMidiFile records the filename', midiMan.takes[0].drums.source.midiFile, 'groove.mid');
+eq('setDrumMidiFile keeps source.type midi', midiMan.takes[0].drums.source.type, 'midi');
+eq('referencedMidiFiles collects the referenced name', [...referencedMidiFiles(midiMan)].join(','), 'groove.mid');
+eq('referencedMidiFiles ignores grid-source takes', referencedMidiFiles(appendTake(createManifest('s'), makeTake({ take: 1, sampleRate: 48000 }, 'T'))).size, 0);
 
 // ---- playbackCacheStale: the retake / in-place-overwrite cache-invalidation predicate ----
 // audioEngine caches a take's DECODED playback buffers keyed on a small descriptor. A
@@ -874,7 +936,7 @@ ok('summarizeTrials fails on all-silent trials', !summarizeTrials([null, null, n
 // ============================================================================
 // 18. Tape deck — sw.js caches every new module (tape/… asset-list assertion)
 // ============================================================================
-for (const f of ['tape/takeModel', 'tape/meterModel', 'tape/clickModel', 'tape/click', 'tape/wav', 'tape/lufs', 'tape/limiter', 'tape/latency', 'tape/audioEngine', 'tape/takeStore', 'tape/opfsWorker', 'tape/captureProcessor', 'tape/devices', 'tape/deckControls', 'tape/tapeView', 'tape/drumModel', 'tape/midiParse', 'tape/drumKits', 'tape/drumMachine', 'tape/drumPanel']) {
+for (const f of ['tape/takeModel', 'tape/meterModel', 'tape/clickModel', 'tape/click', 'tape/wav', 'tape/lufs', 'tape/limiter', 'tape/latency', 'tape/audioEngine', 'tape/takeStore', 'tape/folderStore', 'tape/opfsWorker', 'tape/captureProcessor', 'tape/devices', 'tape/deckControls', 'tape/tapeView', 'tape/drumModel', 'tape/midiParse', 'tape/drumKits', 'tape/drumMachine', 'tape/drumPanel']) {
   ok('sw.js caches ' + f + '.js', sw.includes(`"./js/${f}.js"`));
 }
 

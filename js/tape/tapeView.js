@@ -88,6 +88,9 @@ export function buildDeckView(deck, handlers, songName) {
   // ---- function row + its inline confirm bars ----
   wrap.appendChild(functionRow(deck, handlers));
 
+  // ---- song-management row: Save / Export / Rename / Delete (the whole song, from the deck) ----
+  wrap.appendChild(songManageRow(deck, handlers, songName));
+
   // ---- flip-open panel (drums / cal / share) ----
   if (deck.panelOpen) wrap.appendChild(flipPanel(deck, handlers, meterSetters));
 
@@ -97,9 +100,73 @@ export function buildDeckView(deck, handlers, songName) {
   // ---- collapsible take log ----
   wrap.appendChild(takeLog(deck, { onSelectTake, onDeleteTake, onShareTake, onToggleTakeLog }));
 
-  wrap.appendChild(h('div', 'feel-empty tapenote', 'Takes live on this device — Share/Export any take you can’t lose.'));
+  wrap.appendChild(h('div', 'feel-empty tapenote', 'Save writes takes into the song’s folder on disk (durable). Until then they live only on this device — the SAVE badge counts unsaved takes. EXPORT renders the current take to a WAV.'));
 
   return { el: wrap, live };
+}
+
+// ---- song-management row (Save / Export / Rename / Delete) ----
+// Same fnbtn + inline-namebar idiom as functionRow, but acting on the whole SONG: Save
+// migrates OPFS take audio + MIDI into the song's folder; Export renders a master WAV;
+// Rename changes the display name; Delete removes the song + its on-disk artifacts.
+function songManageRow(deck, handlers, songName) {
+  const wrap = h('div', 'col');
+  const row = h('div', 'fnrow');
+  const busy = deck.recording || deck.bouncing || deck.saving;
+  const haveAudio = !!deck.loadedTake && deck.filledCount > 0;
+
+  const fn = (label, on, disabled, click) => {
+    const b = h('button', 'fnbtn' + (on ? ' on' : ''), label);
+    b.disabled = !!disabled;
+    b.addEventListener('click', click);
+    row.appendChild(b);
+    return b;
+  };
+
+  // SAVE — migrate OPFS take audio + MIDI into the song's folder. No confirm; the count of
+  // unsaved takes is shown in the label so the user knows what an eviction would cost.
+  const pending = deck.takesPendingSave || 0;
+  const saveLabel = deck.saving ? 'SAVING…' : (pending > 0 ? 'SAVE (' + pending + ')' : 'SAVE');
+  fn(saveLabel, pending > 0, busy || (pending === 0 && deck.folderGranted), () => handlers.onSaveDeck());
+
+  // EXPORT — render the loaded take to a mastered WAV (never persisted). Offer the drums
+  // opt-in exactly like MIX when the take has drums.
+  const hasDrums = !!(deck.loadedTake && deck.loadedTake.drums && deck.loadedTake.drums.enabled);
+  const expBar = h('div', 'namebar hidden');
+  if (hasDrums) {
+    const chk = h('input'); chk.type = 'checkbox'; chk.checked = true;
+    const lbl = h('label', 'savehint'); lbl.append(chk, ' Include drums in the master');
+    const go = h('button', 'btn mini primary', 'Export'); go.addEventListener('click', () => { expBar.classList.add('hidden'); handlers.onExportDeck({ includeDrums: chk.checked }); });
+    const cx = h('button', 'btn mini', 'Cancel'); cx.addEventListener('click', () => expBar.classList.add('hidden'));
+    expBar.append(lbl, go, cx);
+    fn('EXPORT', false, busy || !haveAudio, () => expBar.classList.remove('hidden'));
+  } else {
+    fn('EXPORT', false, busy || !haveAudio, () => handlers.onExportDeck());
+  }
+
+  // RENAME — a name input; commits the song's display name (id/on-disk names unchanged).
+  const renameBar = h('div', 'namebar hidden');
+  const nameIn = h('input', 'nameinput'); nameIn.type = 'text'; nameIn.value = songName || ''; nameIn.placeholder = 'Song name';
+  const renameOk = h('button', 'btn mini primary', 'Rename');
+  const renameCancel = h('button', 'btn mini', 'Cancel');
+  const doRename = () => { const v = nameIn.value.trim(); renameBar.classList.add('hidden'); if (v) handlers.onRenameSongDeck(v); };
+  renameOk.addEventListener('click', doRename);
+  nameIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') doRename(); });
+  renameCancel.addEventListener('click', () => renameBar.classList.add('hidden'));
+  renameBar.append(nameIn, renameOk, renameCancel);
+  fn('RENAME', false, busy, () => { nameIn.value = songName || ''; renameBar.classList.remove('hidden'); nameIn.focus(); });
+
+  // DELETE — danger confirm; removes the song + its <id>-scoped on-disk artifacts.
+  const delBar = h('div', 'namebar hidden');
+  const delOk = h('button', 'btn mini danger', 'Delete song');
+  const delCancel = h('button', 'btn mini', 'Cancel');
+  delBar.append(h('span', 'savehint', 'Delete this song and its saved take/MIDI files on disk? This cannot be undone.'), delOk, delCancel);
+  delOk.addEventListener('click', () => { delBar.classList.add('hidden'); handlers.onDeleteDeck(); });
+  delCancel.addEventListener('click', () => delBar.classList.add('hidden'));
+  fn('DELETE', false, busy, () => delBar.classList.remove('hidden'));
+
+  wrap.append(row, expBar, renameBar, delBar);
+  return wrap;
 }
 
 // ---- status strip ----

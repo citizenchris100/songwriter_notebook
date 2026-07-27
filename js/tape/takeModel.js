@@ -132,10 +132,16 @@ export function slotHasAudio(slot) {
   return !!(slot && slot.file);
 }
 
+// Where a filled slot's WAV physically lives: 'folder' once Saved to the song's
+// on-disk folder, else 'opfs' (the scratch/recording store). Absent/legacy → 'opfs'.
+export function slotLoc(slot) {
+  return slot && slot.loc === 'folder' ? 'folder' : 'opfs';
+}
+
 // A freshly-armed slot for a pass: file named for its key, stamped with the pass's
 // group, duration unknown (null) until the pass finalizes, neutral settings.
 function makeSlot(slug, take, stemKey, group) {
-  return { file: stemFileName(slug, take, stemKey), group, durationSec: null, ...defaultStemSettings() };
+  return { file: stemFileName(slug, take, stemKey), group, durationSec: null, loc: 'opfs', ...defaultStemSettings() };
 }
 
 export function filledSlotKeys(take) {
@@ -307,7 +313,7 @@ export function bounceTrackToTrack(manifest, takeNo, srcKey, dstKey, durationSec
   return mapTake(manifest, takeNo, (t) => {
     const dst = t.stems[dstKey];
     const stems = { ...t.stems };
-    stems[dstKey] = { file: dst.file, group: dst.group, durationSec, ...defaultStemSettings() };
+    stems[dstKey] = { file: dst.file, group: dst.group, durationSec, loc: 'opfs', ...defaultStemSettings() };
     stems[srcKey] = null;
     const take = { ...t, stems };
     take.durationSec = maxSlotDuration(take);
@@ -333,9 +339,80 @@ export function setStemSettings(manifest, takeNo, stemKey, patch) {
       ...t,
       stems: {
         ...t.stems,
-        [stemKey]: { file: current.file, group: current.group, durationSec: current.durationSec, ...merged },
+        [stemKey]: { file: current.file, group: current.group, durationSec: current.durationSec, loc: slotLoc(current), ...merged },
       },
     };
+  });
+}
+
+// ---- folder-persistence helpers (Save moves take audio OPFS -> the song folder) ----
+
+// Filled slots whose WAV is still only in OPFS (needs migrating on the next Save).
+export function pendingOpfsSlotKeys(take) {
+  const stems = (take && take.stems) || {};
+  return filledSlotKeys(take).filter((k) => slotLoc(stems[k]) === 'opfs');
+}
+
+// A take is fully persisted iff every filled slot AND its bounce (if any) is 'folder'.
+// An empty take (no audio, no bounce) is vacuously saved (nothing pending to migrate).
+export function takeIsSaved(take) {
+  const stems = (take && take.stems) || {};
+  const stemsSaved = filledSlotKeys(take).every((k) => slotLoc(stems[k]) === 'folder');
+  const b = take && take.bounce;
+  const bounceSaved = !(b && b.file) || b.loc === 'folder';
+  return stemsSaved && bounceSaved;
+}
+
+// Immutably mark the given filled slots (and, with {bounce:true}, the bounce) as
+// living in the song folder — called only after their bytes are verified on disc.
+export function migrateTakeSlots(manifest, takeNo, keys, opts) {
+  const markBounce = !!(opts && opts.bounce);
+  return mapTake(manifest, takeNo, (t) => {
+    const stems = { ...t.stems };
+    for (const key of keys) if (slotHasAudio(stems[key])) stems[key] = { ...stems[key], loc: 'folder' };
+    const bounce = markBounce && t.bounce && t.bounce.file ? { ...t.bounce, loc: 'folder' } : t.bounce;
+    return { ...t, stems, bounce };
+  });
+}
+
+// Inverse of migrateTakeSlots: mark slots (and optionally the bounce) back to 'opfs'
+// after an in-place OPFS overwrite of a previously-saved file. Defensive — the rebuild
+// transforms (bounceTrackToTrack, makeSlot, a fresh bounce record) already stamp fresh
+// OPFS writes as 'opfs', so this is only needed where a caller mutates in place.
+export function revertSlotToOpfs(manifest, takeNo, keys, opts) {
+  const markBounce = !!(opts && opts.bounce);
+  return mapTake(manifest, takeNo, (t) => {
+    const stems = { ...t.stems };
+    for (const key of keys) if (slotHasAudio(stems[key])) stems[key] = { ...stems[key], loc: 'opfs' };
+    const bounce = markBounce && t.bounce && t.bounce.file ? { ...t.bounce, loc: 'opfs' } : t.bounce;
+    return { ...t, stems, bounce };
+  });
+}
+
+// ---- drum MIDI archival (the imported .mid travels with the song) ----
+
+// The song's on-disk MIDI subdir (sibling of takes/<slug>/), id-namespaced.
+export function midiRef(slug) {
+  return 'midi/' + slug + '/';
+}
+
+// Every imported-MIDI filename referenced by any take's drum config — the set Save
+// copies into midi/<slug>/ (and Delete cleans up).
+export function referencedMidiFiles(manifest) {
+  const out = new Set();
+  for (const t of (manifest && manifest.takes) || []) {
+    const src = t && t.drums && t.drums.source;
+    if (src && src.type === 'midi' && typeof src.midiFile === 'string' && src.midiFile) out.add(src.midiFile);
+  }
+  return out;
+}
+
+// Record the archived MIDI filename on a take's drum config (keeps source.type 'midi').
+export function setDrumMidiFile(manifest, takeNo, name) {
+  return mapTake(manifest, takeNo, (t) => {
+    const drums = t.drums || defaultDrumConfig();
+    const source = { ...(drums.source || {}), type: 'midi', midiFile: name };
+    return { ...t, drums: clampDrumConfig({ ...drums, source }) };
   });
 }
 
@@ -355,6 +432,7 @@ function validateStem(s, at, errors) {
   if ('file' in s && s.file !== null && typeof s.file !== 'string') errors.push(at + ' stem file must be a string or null');
   if ('group' in s && !isNum(s.group)) errors.push(at + ' stem group must be a number');
   if ('durationSec' in s && s.durationSec !== null && !isNum(s.durationSec)) errors.push(at + ' stem durationSec must be a number or null');
+  if ('loc' in s && s.loc !== 'opfs' && s.loc !== 'folder') errors.push(at + ' stem loc must be "opfs" or "folder"');
   if (!isNum(s.vol)) errors.push(at + ' stem vol must be a number');
   if (!s.eq || typeof s.eq !== 'object') errors.push(at + ' stem eq must be an object');
   else for (const b of ['bass', 'mid', 'treble']) if (!isNum(s.eq[b])) errors.push(at + ' stem eq.' + b + ' must be a number');
@@ -379,6 +457,7 @@ export function validateTake(t) {
       if (typeof t.bounce.file !== 'string' && t.bounce.file !== null) errors.push('bounce file must be a string or null');
       if ('bouncedAt' in t.bounce && typeof t.bounce.bouncedAt !== 'string') errors.push('bounce bouncedAt must be a string');
       if ('lufs' in t.bounce && t.bounce.lufs !== null && !isNum(t.bounce.lufs)) errors.push('bounce lufs must be a number or null'); // normalizeBounce emits null for a silent mix — accept it (else reopen wipes the take history)
+      if ('loc' in t.bounce && t.bounce.loc !== 'opfs' && t.bounce.loc !== 'folder') errors.push('bounce loc must be "opfs" or "folder"');
     }
   }
   // `click` is an additive field: absent on legacy takes (accepted, defaulted on read).
@@ -405,13 +484,14 @@ function normalizeStem(s) {
     file: typeof s.file === 'string' ? s.file : null,
     group: isNum(s.group) ? s.group : 1,
     durationSec: isNum(s.durationSec) ? s.durationSec : null,
+    loc: s.loc === 'folder' ? 'folder' : 'opfs',
     ...clamped,
   };
 }
 
 function normalizeBounce(b) {
   return (b && typeof b === 'object')
-    ? { file: typeof b.file === 'string' ? b.file : null, bouncedAt: str(b.bouncedAt), lufs: isNum(b.lufs) ? b.lufs : null }
+    ? { file: typeof b.file === 'string' ? b.file : null, bouncedAt: str(b.bouncedAt), lufs: isNum(b.lufs) ? b.lufs : null, loc: b.loc === 'folder' ? 'folder' : 'opfs' }
     : null;
 }
 
@@ -440,7 +520,7 @@ export function normalizeTake(t) {
   if (isV1) {
     const migrate = (s) => {
       if (s === null || s === undefined) return null;
-      return { file: typeof s.file === 'string' ? s.file : null, group: 1, durationSec: dur, ...clampStemSettings(s) };
+      return { file: typeof s.file === 'string' ? s.file : null, group: 1, durationSec: dur, loc: 'opfs', ...clampStemSettings(s) };
     };
     stems = {
       stem1: migrate(t.stems && t.stems.stem1),
