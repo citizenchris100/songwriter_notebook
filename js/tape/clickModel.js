@@ -94,7 +94,7 @@ export function defaultAccentIndex(timeSigIndex) {
 // readClickDefault), kept deliberately separate so a legacy take with no `click`
 // normalizes to OFF (its first pass had no click) rather than silently gaining one.
 export function defaultClickConfig() {
-  return { enabled: false, bpm: 120, timeSigIndex: 2, subdivision: 1, accentIndex: 1 };
+  return { enabled: false, countIn: false, bpm: 120, timeSigIndex: 2, subdivision: 1, accentIndex: 1 };
 }
 
 // Clamp a partial click config into the full persisted shape. accentIndex is validated
@@ -111,6 +111,10 @@ export function clampClickConfig(c) {
     : defaultAccentIndex(timeSigIndex);
   return {
     enabled: !!src.enabled,
+    // The 2-bar count-in is its own flag now (the drum machine, not a click, is the take's
+    // backing). Absent (legacy) -> defaults to `enabled`, so a legacy click-on take keeps its
+    // count-in and a click-off take stays count-in-off — lossless either way.
+    countIn: src.countIn != null ? !!src.countIn : !!src.enabled,
     bpm: clampInt(src.bpm, MIN_BPM, MAX_BPM, 120),
     timeSigIndex,
     subdivision: clampInt(src.subdivision, 1, 4, 1),

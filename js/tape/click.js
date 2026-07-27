@@ -53,7 +53,11 @@ export function makeClick(audioCtx, destination) {
   // click. `musicStartTime` = startAt + countInSec is the ctx time of the first RECORDED
   // bar's downbeat; the caller aligns the capture gate to it. countInTicks is a whole
   // number of bars, so tick countInTicks lands on a downbeat (posInBar 0) with zero drift.
-  function start({ bpm, timeSigIndex, subdivision, accentIndex, startAt, countInBars = 2 }) {
+  // countInOnly (default false): schedule ONLY the count-in cue ticks, then stop — no
+  // recording click follows. Used when the drum machine (not a click) is the take's backing:
+  // the 2-bar count-in still cues the downbeat, then the drums take over. Default false keeps
+  // the original count-in -> recording-click behavior byte-identical.
+  function start({ bpm, timeSigIndex, subdivision, accentIndex, startAt, countInBars = 2, countInOnly = false }) {
     const beats = (TIME_SIGS[timeSigIndex] || TIME_SIGS[0]).beats;
     const sub = Math.max(1, Math.min(4, Math.round(subdivision) || 1));
     const levels = computeLevels(timeSigIndex, accentIndex);
@@ -70,6 +74,7 @@ export function makeClick(audioCtx, destination) {
     const schedule = () => {
       if (!running) return;
       while (nextTickTime < audioCtx.currentTime + SCHEDULE_AHEAD) {
+        if (countInOnly && tick >= countInTicks) { running = false; break; } // count-in done; drums take over
         const isCue = tick < countInTicks;              // count-in voice vs recording voice
         const posInBar = tick % ticksPerBar;            // continuous grid — cue + rec share phase
         const type = isCue ? 'triangle' : 'sine';
@@ -84,7 +89,7 @@ export function makeClick(audioCtx, destination) {
         nextTickTime += secPerTick;
         tick++;
       }
-      timer = setTimeout(schedule, LOOKAHEAD_MS);
+      if (running) timer = setTimeout(schedule, LOOKAHEAD_MS);
     };
     schedule();
     return { countInSec, musicStartTime };

@@ -347,6 +347,37 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
 .saved.tombstone { opacity: .5; cursor: default; }
 .tapenote { margin: 4px 0 0; text-align: center; }
 
+/* ===== Drum machine panel (the DRUMS flip-panel) ===== */
+.drumpanel { display: flex; flex-direction: column; gap: 10px; }
+.drumctrls { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: flex-end; }
+.drumctl { display: flex; flex-direction: column; gap: 3px; }
+.drumctl .lbl { margin: 0; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.drumrange { width: 120px; accent-color: var(--accent); }
+.drumrange.mini { width: 60px; }
+.drumbars { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.drumbars .lbl { margin: 0; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+.drumgridwrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.drumgrid { display: flex; flex-direction: column; gap: 4px; min-width: max-content; }
+.drumrow { display: flex; align-items: center; gap: 8px; }
+.drumvoice { width: 68px; flex: none; font-size: 10px; letter-spacing: .03em; color: var(--muted); text-align: right; }
+.drumcells { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; flex: 1 1 auto; min-width: 300px; }
+.drumcell {
+  height: 22px; min-width: 15px; border-radius: 4px; border: 1px solid var(--line);
+  background: var(--panel-2); cursor: pointer; padding: 0; touch-action: manipulation;
+}
+.drumcell.beat { border-left: 2px solid var(--muted); }
+.drumcell.on { background: var(--accent); border-color: var(--accent); opacity: calc(.42 + .58 * var(--v, 1)); }
+.drumcell:active { transform: translateY(1px); }
+.drumvp { display: flex; gap: 6px; flex: none; }
+.drumvpctl { display: flex; flex-direction: column; align-items: center; gap: 1px; }
+.drumvplbl { font-size: 8px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+
+.drummaster { display: flex; align-items: center; gap: 14px; border-top: 1px solid var(--line); padding-top: 8px; flex-wrap: wrap; }
+.drummaster .lbl { margin: 0; font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.drummaster .tsknobs { flex-direction: row; gap: 14px; }
+.drummaster .ledmeter { height: 52px; }
+
 @media (max-width: 430px) {
   .tsname, .knob-lbl { font-size: 8px; }
   .pkey { min-height: 48px; }

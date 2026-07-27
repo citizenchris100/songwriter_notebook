@@ -23,6 +23,7 @@
 // so this stays node-importable): the take's tempo/meter, set on its first pass and
 // reused by every overdub pass.
 import { clampClickConfig, defaultClickConfig } from './clickModel.js';
+import { clampDrumConfig, defaultDrumConfig } from './drumModel.js';
 
 const str = (x) => (typeof x === 'string' ? x : '');
 const isNum = (x) => typeof x === 'number' && isFinite(x);
@@ -199,6 +200,7 @@ export function makeTake(fields, now) {
     stems: { stem1: null, stem2: null, stem3: null, stem4: null },
     bounce: null,
     click: fields.click ? clampClickConfig(fields.click) : defaultClickConfig(),
+    drums: fields.drums ? clampDrumConfig(fields.drums) : defaultDrumConfig(),
   };
 }
 
@@ -387,6 +389,11 @@ export function validateTake(t) {
       for (const f of ['bpm', 'timeSigIndex', 'subdivision', 'accentIndex']) if (!isNum(t.click[f])) errors.push('click ' + f + ' must be a number');
     }
   }
+  // `drums` is an additive field: absent on legacy takes (accepted, defaulted on read).
+  if (t.drums !== null && t.drums !== undefined) {
+    if (typeof t.drums !== 'object' || Array.isArray(t.drums)) errors.push('take drums must be an object or null');
+    else if (typeof t.drums.enabled !== 'boolean') errors.push('drums enabled must be a boolean');
+  }
   return { ok: errors.length === 0, errors };
 }
 
@@ -412,6 +419,12 @@ function normalizeBounce(b) {
 // old take adds no click, matching its click-less first pass.
 function normalizeClick(c) {
   return (c && typeof c === 'object' && !Array.isArray(c)) ? clampClickConfig(c) : defaultClickConfig();
+}
+
+// A legacy take has no `drums`, so it normalizes to the DISABLED default — opening/overdubbing
+// an old take adds no drums, matching its drum-less recording.
+function normalizeDrums(d) {
+  return (d && typeof d === 'object' && !Array.isArray(d)) ? clampDrumConfig(d) : defaultDrumConfig();
 }
 
 export function normalizeTake(t) {
@@ -449,6 +462,7 @@ export function normalizeTake(t) {
     stems,
     bounce: normalizeBounce(t.bounce),
     click: normalizeClick(t.click),
+    drums: normalizeDrums(t.drums),
   };
 }
 

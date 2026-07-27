@@ -51,6 +51,13 @@ import {
   CLIP_THRESHOLD, METER_TOP_DB, METER_FLOOR_DB, FALL_DB_PER_SEC, CLIP_HOLD_MS,
   peakToSegments, peakToLit, decayPeak, clipState,
 } from './js/tape/meterModel.js';
+import {
+  STEPS_PER_BAR, SWING_MAX, VOICES, VOICE_IDS, KIT_IDS, EFFECT_IDS, voiceForNote,
+  stepSeconds, hitTime, cellOf, velocityFromMidi, quantizeTick, drumHitsUntil,
+  defaultDrumConfig, clampDrumConfig, validateDrumConfig, toggleCell, setCellVelocity, setBars,
+  smfToPattern,
+} from './js/tape/drumModel.js';
+import { readVarLen, parseSMF, notesFromSMF } from './js/tape/midiParse.js';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const readJSON = (p) => JSON.parse(readFileSync(here(p), 'utf8'));
@@ -867,7 +874,7 @@ ok('summarizeTrials fails on all-silent trials', !summarizeTrials([null, null, n
 // ============================================================================
 // 18. Tape deck — sw.js caches every new module (tape/… asset-list assertion)
 // ============================================================================
-for (const f of ['tape/takeModel', 'tape/meterModel', 'tape/clickModel', 'tape/click', 'tape/wav', 'tape/lufs', 'tape/limiter', 'tape/latency', 'tape/audioEngine', 'tape/takeStore', 'tape/opfsWorker', 'tape/captureProcessor', 'tape/devices', 'tape/deckControls', 'tape/tapeView']) {
+for (const f of ['tape/takeModel', 'tape/meterModel', 'tape/clickModel', 'tape/click', 'tape/wav', 'tape/lufs', 'tape/limiter', 'tape/latency', 'tape/audioEngine', 'tape/takeStore', 'tape/opfsWorker', 'tape/captureProcessor', 'tape/devices', 'tape/deckControls', 'tape/tapeView', 'tape/drumModel', 'tape/midiParse', 'tape/drumKits', 'tape/drumMachine', 'tape/drumPanel']) {
   ok('sw.js caches ' + f + '.js', sw.includes(`"./js/${f}.js"`));
 }
 
@@ -903,6 +910,13 @@ ok('clamp keeps enabled', cc.enabled === true);
 // A stranded accentIndex (too big for the selected meter) falls back to that meter's default.
 eq('out-of-range accent falls back to default', clampClickConfig({ timeSigIndex: 2, accentIndex: 9 }).accentIndex, defaultAccentIndex(2));
 eq('valid accent is kept', clampClickConfig({ timeSigIndex: 7, accentIndex: 4 }).accentIndex, 4);
+// The 2-bar count-in is a decoupled flag now (drums, not a click, back the take). Legacy
+// losslessness: an absent countIn defaults to `enabled`; an explicit value always wins.
+eq('defaultClickConfig count-in is off', defaultClickConfig().countIn, false);
+eq('legacy click-on defaults count-in on', clampClickConfig({ enabled: true }).countIn, true);
+eq('legacy click-off defaults count-in off', clampClickConfig({ enabled: false }).countIn, false);
+eq('explicit count-in overrides (on w/ click off)', clampClickConfig({ enabled: false, countIn: true }).countIn, true);
+eq('explicit count-in overrides (off w/ click on)', clampClickConfig({ enabled: true, countIn: false }).countIn, false);
 
 // ============================================================================
 // 20. Take schema carries the per-take click config (additive, defaulted on read)
@@ -1204,6 +1218,218 @@ ok('decayPeak fall rate matches FALL_DB_PER_SEC', Math.abs(decayPeak(1.0, 0, 100
     ok('cursor-0 flush posts no append', !wp.posted.some((m) => m && m.op === 'append'));
   }
 }
+
+// ============================================================================
+// 25. Drum machine model (voices/GM map, kit/effect enums, swing/step timing math,
+//     config clamp/validate, immutable pattern transforms) — all pure.
+// ============================================================================
+// Voice set + GM note map.
+eq('12 drum voices', VOICES.length, 12);
+eq('voice ids are unique', new Set(VOICE_IDS).size, 12);
+ok('every voice has at least one GM note', VOICES.every((v) => v.gm.length >= 1));
+eq('4 kits', KIT_IDS.length, 4);
+eq('12 effects (none + 8 IR + 3 biquad)', EFFECT_IDS.length, 12);
+eq('GM 36 -> kick', voiceForNote(36), 'kick');
+eq('GM 35 -> kick', voiceForNote(35), 'kick');
+eq('GM 38 -> snare', voiceForNote(38), 'snare');
+eq('GM 42 -> closedHat', voiceForNote(42), 'closedHat');
+eq('GM 46 -> openHat', voiceForNote(46), 'openHat');
+eq('GM 43 -> lowTom', voiceForNote(43), 'lowTom');
+eq('GM 50 -> highTom', voiceForNote(50), 'highTom');
+eq('GM 49 -> crash', voiceForNote(49), 'crash');
+eq('GM 57 -> crash', voiceForNote(57), 'crash');
+eq('GM 51 -> ride', voiceForNote(51), 'ride');
+eq('GM 39 -> clap', voiceForNote(39), 'clap');
+eq('GM 63 -> hiConga', voiceForNote(63), 'hiConga');
+eq('GM 64 -> loConga', voiceForNote(64), 'loConga');
+eq('unmapped GM 60 -> null', voiceForNote(60), null);
+eq('unmapped GM 100 -> null', voiceForNote(100), null);
+
+// Timing math: 16 equal divisions of the bar; swing delays odd steps; drift-free.
+eq('stepSeconds 4/4@120 is 0.125', stepSeconds(120, 2), 0.125);
+eq('hitTime(0) is 0', hitTime(0, 120, 2, 0), 0);
+eq('hitTime(4) straight is 0.5', hitTime(4, 120, 2, 0), 0.5);
+eq('hitTime(16) straight is a full bar (2s)', hitTime(16, 120, 2, 0), 2.0);
+eq('swing 0.5 delays step 1 to 0.1875', hitTime(1, 120, 2, 0.5), 0.1875);
+eq('swing 0.5 delays step 3 to 0.4375', hitTime(3, 120, 2, 0.5), 0.4375);
+eq('swing leaves even step 2 at 0.25', hitTime(2, 120, 2, 0.5), 0.25);
+ok('triplet swing 1/3 -> step1 at 1/6', Math.abs(hitTime(1, 120, 2, 1 / 3) - 1 / 6) < 1e-9);
+ok('swing clamps above SWING_MAX', hitTime(1, 120, 2, 9) === hitTime(1, 120, 2, SWING_MAX));
+// A full bar's swing cancels: hitTime(n+16) - hitTime(n) == barSeconds, any n/swing.
+ok('bar-length invariant (odd n, swung)', Math.abs((hitTime(17, 120, 2, 0.5) - hitTime(1, 120, 2, 0.5)) - 2.0) < 1e-9);
+ok('bar-length invariant (even n, swung)', Math.abs((hitTime(20, 120, 2, 0.5) - hitTime(4, 120, 2, 0.5)) - 2.0) < 1e-9);
+ok('swing is identical across the loop seam', Math.abs((hitTime(17, 120, 2, 0.5) - hitTime(16, 120, 2, 0.5)) - (hitTime(1, 120, 2, 0.5) - hitTime(0, 120, 2, 0.5))) < 1e-12);
+ok('stepSeconds*16 == barSeconds across meters', Math.abs(stepSeconds(120, 1) * 16 - barSeconds(120, 1)) < 1e-12);
+ok('BPM edge 300 stepSeconds', Math.abs(stepSeconds(300, 2) - 0.05) < 1e-12);
+ok('BPM edge 20 stepSeconds is finite/positive', stepSeconds(20, 2) > 0 && isFinite(stepSeconds(20, 2)));
+ok('non-4/4 bar wrap: 3/4 @120 bar is 1.5s', Math.abs(hitTime(16, 120, 1, 0) - 1.5) < 1e-12);
+// cellOf loops the pattern.
+{ const c0 = cellOf(0, 2), c16 = cellOf(16, 2), c32 = cellOf(32, 2), c17 = cellOf(17, 2);
+  ok('cellOf(0,2) is bar0 step0', c0.patternBar === 0 && c0.step === 0);
+  ok('cellOf(16,2) is bar1 step0', c16.patternBar === 1 && c16.step === 0);
+  ok('cellOf(32,2) wraps to bar0 step0', c32.patternBar === 0 && c32.step === 0);
+  ok('cellOf(17,2) is bar1 step1', c17.patternBar === 1 && c17.step === 1); }
+// Velocity + quantize.
+eq('velocityFromMidi(0) is 0', velocityFromMidi(0), 0);
+eq('velocityFromMidi(127) is 1', velocityFromMidi(127), 1);
+ok('velocityFromMidi(64) ~ 0.504', Math.abs(velocityFromMidi(64) - 0.5039) < 1e-3);
+eq('quantizeTick(0,480) is 0', quantizeTick(0, 480), 0);
+eq('quantizeTick(119,480) rounds to 1', quantizeTick(119, 480), 1);
+eq('quantizeTick(240,480) is 2', quantizeTick(240, 480), 2);
+eq('quantizeTick(605,480) rounds to 5', quantizeTick(605, 480), 5);
+
+// drumHitsUntil enumerates + loops the pattern deterministically.
+{
+  let cfg = defaultDrumConfig();
+  cfg = setCellVelocity(cfg, 'kick', 0, 1);
+  cfg = setCellVelocity(cfg, 'kick', 8, 1);
+  const h2 = drumHitsUntil(cfg, 120, 2, 2);
+  eq('drumHitsUntil one bar yields 2 kicks', h2.length, 2);
+  eq('first kick at t0', h2[0].timeSec, 0);
+  eq('second kick at t1.0 (step 8)', h2[1].timeSec, 1.0);
+  ok('hit carries the voice + velocity', h2[0].voice === 'kick' && h2[0].velocity === 1);
+  const h4 = drumHitsUntil(cfg, 120, 2, 4);
+  eq('drumHitsUntil loops: 4 kicks over 2 bars', h4.length, 4);
+}
+
+// Config lifecycle (mirrors clickModel: disabled baseline, clamp everything, idempotent).
+eq('defaultDrumConfig is disabled', defaultDrumConfig().enabled, false);
+eq('defaultDrumConfig kit is kit4', defaultDrumConfig().kit, 'kit4');
+eq('defaultDrumConfig is 1 bar', defaultDrumConfig().pattern.bars, 1);
+ok('default grid has all 12 voices at 16 steps', VOICE_IDS.every((id) => defaultDrumConfig().pattern.grid[id].length === 16));
+{
+  const cd = clampDrumConfig({ swing: 9, kit: 'x', effect: 'y', pattern: { bars: 2, grid: { kick: [2] } } });
+  eq('clamp swing to SWING_MAX', cd.swing, SWING_MAX);
+  eq('clamp unknown kit to kit4', cd.kit, 'kit4');
+  eq('clamp unknown effect to none', cd.effect, 'none');
+  eq('grid resized to bars*16', cd.pattern.grid.kick.length, 32);
+  eq('clamp cell velocity into 0..1', cd.pattern.grid.kick[0], 1);
+  eq('all 12 voices present after clamp', Object.keys(cd.pattern.grid).length, 12);
+  ok('clampDrumConfig is idempotent', JSON.stringify(clampDrumConfig(cd)) === JSON.stringify(cd));
+}
+ok('validateDrumConfig ok on default', validateDrumConfig(defaultDrumConfig()).ok);
+ok('validateDrumConfig rejects non-boolean enabled', !validateDrumConfig({ enabled: 'yes' }).ok);
+ok('validateDrumConfig rejects an unknown kit', !validateDrumConfig({ enabled: true, kit: 'nope' }).ok);
+
+// Immutable pattern transforms.
+{
+  const base = defaultDrumConfig();
+  const on = toggleCell(base, 'snare', 4);
+  ok('toggleCell sets a velocity > 0', on.pattern.grid.snare[4] > 0);
+  ok('toggleCell is immutable (new object)', on !== base && on.pattern.grid.snare !== base.pattern.grid.snare);
+  const off = toggleCell(on, 'snare', 4);
+  eq('toggleCell again clears the cell', off.pattern.grid.snare[4], 0);
+  const v = setCellVelocity(base, 'kick', 0, 1.5);
+  eq('setCellVelocity clamps to 1', v.pattern.grid.kick[0], 1);
+  eq('setCellVelocity clamps negatives to 0', setCellVelocity(base, 'kick', 0, -1).pattern.grid.kick[0], 0);
+  const grown = setBars(v, 3);
+  eq('setBars grows to bars*16', grown.pattern.grid.kick.length, 48);
+  eq('setBars grow preserves existing cells', grown.pattern.grid.kick[0], 1);
+  const shrunk = setBars(grown, 1);
+  eq('setBars shrinks back to 16', shrunk.pattern.grid.kick.length, 16);
+  eq('setBars shrink preserves bar-1 cells', shrunk.pattern.grid.kick[0], 1);
+}
+
+// ============================================================================
+// 26. MIDI import — the pure SMF parser (readVarLen / parseSMF / notesFromSMF) and
+//     smfToPattern (GM-map + quantize onto the grid, unmapped notes discarded).
+// ============================================================================
+// Byte-array builders for minimal hand-authored SMFs.
+const u32b = (n) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+const mThd = (format, ntrks, ppq) => [0x4d, 0x54, 0x68, 0x64, ...u32b(6), (format >> 8) & 255, format & 255, (ntrks >> 8) & 255, ntrks & 255, (ppq >> 8) & 255, ppq & 255];
+const mTrk = (data) => [0x4d, 0x54, 0x72, 0x6b, ...u32b(data.length), ...data];
+const smf = (format, ppq, tracks) => new Uint8Array([...mThd(format, tracks.length, ppq), ...tracks.flatMap(mTrk)]);
+
+// Variable-length quantity.
+eq('readVarLen 0x00 -> 0', readVarLen([0x00], 0).value, 0);
+eq('readVarLen 0x7f -> 127', readVarLen([0x7f], 0).value, 127);
+eq('readVarLen 0x81 0x00 -> 128', readVarLen([0x81, 0x00], 0).value, 128);
+eq('readVarLen advances next past the VLQ', readVarLen([0x81, 0x00], 0).next, 2);
+eq('readVarLen 0xff 0x7f -> 16383', readVarLen([0xff, 0x7f], 0).value, 16383);
+eq('readVarLen 0x81 0x80 0x00 -> 16384', readVarLen([0x81, 0x80, 0x00], 0).value, 16384);
+
+// Format-0 header + note extraction (kick@0, unmapped C@0, snare@240).
+{
+  const trk0 = [0x00, 0x90, 0x24, 0x64, 0x00, 0x90, 0x3c, 0x64, 0x81, 0x70, 0x90, 0x26, 0x5a, 0x00, 0xff, 0x2f, 0x00];
+  const file0 = smf(0, 480, [trk0]);
+  const h = parseSMF(file0);
+  eq('parseSMF format', h.format, 0);
+  eq('parseSMF ntrks', h.ntrks, 1);
+  eq('parseSMF ppq', h.ppq, 480);
+  const notes = notesFromSMF(file0);
+  eq('notesFromSMF returns 3 note-ons', notes.length, 3);
+  ok('kick @0 vel100 present', notes.some((n) => n.note === 36 && n.tick === 0 && n.velocity === 100));
+  ok('snare @240 vel90 present', notes.some((n) => n.note === 38 && n.tick === 240 && n.velocity === 90));
+
+  // smfToPattern maps + quantizes, discards the unmapped C.
+  const r = smfToPattern(file0);
+  eq('smfToPattern mapped 2 notes', r.mappedCount, 2);
+  eq('smfToPattern discarded the unmapped note', r.discarded.length, 1);
+  eq('discarded note is the middle C', r.discarded[0].note, 60);
+  eq('smfToPattern derives 1 bar', r.pattern.bars, 1);
+  ok('kick lands on step 0', r.pattern.grid.kick[0] > 0);
+  ok('snare quantized to step 2 (240/120)', r.pattern.grid.snare[2] > 0);
+  eq('snare not on step 0', r.pattern.grid.snare[0], 0);
+}
+// Running status: two note-ons share one 0x90 status byte.
+{
+  const trkRun = [0x00, 0x90, 0x24, 0x64, 0x00, 0x26, 0x5a, 0x00, 0xff, 0x2f, 0x00];
+  const notes = notesFromSMF(smf(0, 480, [trkRun]));
+  eq('running status parses both note-ons', notes.length, 2);
+  ok('running-status snare present', notes.some((n) => n.note === 38 && n.velocity === 90));
+}
+// Note-on velocity 0 is a note-off (dropped).
+{
+  const trkOff = [0x00, 0x90, 0x24, 0x64, 0x30, 0x90, 0x24, 0x00, 0x00, 0xff, 0x2f, 0x00];
+  eq('note-on vel 0 is dropped as a note-off', notesFromSMF(smf(0, 480, [trkOff])).length, 1);
+}
+// Meta (tempo + text) and EOT are skipped without derailing following notes.
+{
+  const trkMeta = [0x00, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20, 0x00, 0xff, 0x01, 0x02, 0x41, 0x42, 0x00, 0x90, 0x24, 0x64, 0x00, 0xff, 0x2f, 0x00];
+  const file = smf(0, 480, [trkMeta]);
+  const notes = notesFromSMF(file);
+  eq('note after meta events still parses', notes.length, 1);
+  eq('the surviving note is the kick', notes[0].note, 36);
+  ok('tempo meta is captured', parseSMF(file).tracks[0].some((e) => e.type === 'meta' && e.metaType === 0x51 && e.usPerQuarter === 500000));
+}
+// Format 1: notes merged across tracks by absolute tick.
+{
+  const t1a = [0x00, 0x90, 0x24, 0x64, 0x00, 0xff, 0x2f, 0x00];
+  const t1b = [0x40, 0x90, 0x26, 0x64, 0x00, 0xff, 0x2f, 0x00];
+  const notes = notesFromSMF(smf(1, 480, [t1a, t1b]));
+  eq('format-1 merges two tracks', notes.length, 2);
+  ok('merged notes sorted by tick', notes[0].tick === 0 && notes[1].tick === 64);
+}
+// Multi-bar import: a kick in bar 2 grows the pattern to 2 bars.
+{
+  const trkMulti = [0x00, 0x90, 0x24, 0x64, 0x8f, 0x00, 0x90, 0x24, 0x64, 0x00, 0xff, 0x2f, 0x00]; // kick@0, kick@1920
+  const r = smfToPattern(smf(0, 480, [trkMulti]));
+  eq('multi-bar import derives 2 bars', r.pattern.bars, 2);
+  eq('grid resized to 32 steps', r.pattern.grid.kick.length, 32);
+  ok('kick on bar-2 downbeat (step 16)', r.pattern.grid.kick[16] > 0);
+}
+// Errors: not a MIDI file, and SMPTE (frame-based) division.
+{
+  let threw = false; try { parseSMF(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])); } catch { threw = true; }
+  ok('parseSMF throws on a non-MThd header', threw);
+  let threw2 = false; try { parseSMF(new Uint8Array([0x4d, 0x54, 0x68, 0x64, 0, 0, 0, 6, 0, 0, 0, 1, 0xe0, 0x78])); } catch { threw2 = true; }
+  ok('parseSMF rejects SMPTE division', threw2);
+}
+
+// ============================================================================
+// 27. Take schema carries the per-take drums config (additive, defaulted on read).
+// ============================================================================
+const drumTake = makeTake({ take: 1, sampleRate: 48000, drums: { enabled: true, kit: 'jazz', swing: 0.5 } }, '2026-07-25T00:00:00Z');
+eq('makeTake stores drums enabled', drumTake.drums.enabled, true);
+eq('makeTake stores the drums kit', drumTake.drums.kit, 'jazz');
+eq('makeTake clamps drums swing', drumTake.drums.swing, 0.5);
+eq('makeTake without drums defaults to disabled', makeTake({ take: 2, sampleRate: 48000 }, 'x').drums.enabled, false);
+// A legacy take with NO drums field normalizes to the disabled default (no drums gained).
+const legacyDrums = normalizeTake({ take: 3, status: 'active', createdAt: 'x', sampleRate: 48000, stems: { stem1: null, stem2: null, stem3: null, stem4: null }, bounce: null });
+eq('legacy take normalizes drums to disabled', legacyDrums.drums.enabled, false);
+ok('legacy take drums has a kit', typeof legacyDrums.drums.kit === 'string');
+ok('validateTake ok with no drums', validateTake({ take: 4, status: 'active', createdAt: 'x', durationSec: null, sampleRate: 48000, stems: { stem1: null, stem2: null, stem3: null, stem4: null }, bounce: null }).ok);
+ok('validateTake rejects a bad drums', !validateTake({ take: 5, status: 'active', createdAt: 'x', durationSec: null, sampleRate: 48000, stems: { stem1: null, stem2: null, stem3: null, stem4: null }, bounce: null, drums: { enabled: 'yes' } }).ok);
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail ? 1 : 0);

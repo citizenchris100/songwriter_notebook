@@ -15,6 +15,8 @@ import {
 } from './takeModel.js';
 import { detectClickSample, rttSeconds, summarizeTrials } from './latency.js';
 import { makeClick } from './click.js';
+import { makeDrumMachine, renderDrumsOffline } from './drumMachine.js';
+import { loadKit, loadEffect } from './drumKits.js';
 import { CLIP_THRESHOLD } from './meterModel.js';
 
 const BOUNCE_RATE = 48000;
@@ -117,14 +119,24 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
                               // play()/replay() drop the decoded-buffer cache when a take's audio changes
                               // under a FIXED take number (retake, overdub, bounce). Content fields can't tell.
   let monitorGraph = null;    // overdub backing playback during a pass: { sumBus, sources: [] }
-  let clickEngine = null;     // the record-only metronome (count-in + click), null when off
+  let clickEngine = null;     // the record-only count-in cue, null when off
+  let drumMachine = null;     // the record-only drum BACKING (monitor bus), null when off. Playback
+                              // drums live on playChains.drum instead (their own graph/dest).
 
-  // Stop + tear down the metronome click. Idempotent; called on Stop AND every teardown
-  // path (interruption/dispose) so the click can never outlive a recording pass.
+  // Stop + tear down the metronome count-in. Idempotent; called on Stop AND every teardown
+  // path (interruption/dispose) so the cue can never outlive a recording pass.
   function stopClick() {
     if (!clickEngine) return;
     try { clickEngine.stop(); } catch { /* already stopped */ }
     clickEngine = null;
+  }
+
+  // Stop + tear down the record-time drum backing. Idempotent; same teardown discipline as
+  // stopClick — the drums must never outlive their recording pass.
+  function stopDrums() {
+    if (!drumMachine) return;
+    try { drumMachine.dispose(); } catch { /* already stopped */ }
+    drumMachine = null;
   }
 
   if (onWriteError) {
@@ -184,6 +196,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
         const s = playChains.stems[key];
         if (s && s.tap && s.activeSource) levels[key] = lv(tapPeak(s.tap));
       }
+      if (playChains.drum && playChains.drum.tap) levels.drum = lv(tapPeak(playChains.drum.tap)); // drum-bus meter
       const master = playChains.masterTap ? lv(tapPeak(playChains.masterTap)) : null;
       onLevels && onLevels({ source: 'playback', levels, master });
       if (playState) {
@@ -247,7 +260,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   // capture = min(device channels, routing length). existingTracks: [{ key, meta }] of
   // the take's already-recorded slots to monitor (empty for a first pass).
   // monitorLatencySec: the measured round-trip to align the overdub (0 disables the gate).
-  async function record({ slug, deviceId, routing, monitorLatencySec = 0, existingTracks = [], clickConfig = null, onPassOpen }) {
+  async function record({ slug, deviceId, routing, monitorLatencySec = 0, existingTracks = [], clickConfig = null, drumConfig = null, onPassOpen }) {
     const acquired = await devices.acquireForRecording(deviceId);
     if (!acquired.ok) { onStatus && onStatus({ type: 'blocked' }); return { ok: false, denied: true }; }
     mediaStream = acquired.stream;
@@ -274,14 +287,20 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
       ? passInfo.slotKeys.slice(0, capture)
       : channelKeys.filter(Boolean);
     const overdub = !!(existingTracks && existingTracks.length);
-    const clickEnabled = !!(clickConfig && clickConfig.enabled);
+    const countInEnabled = !!(clickConfig && clickConfig.countIn); // the 2-bar cue (decoupled from any click)
+    const drumsEnabled = !!(drumConfig && drumConfig.enabled);     // the drum machine is the take's backing now
+    const scheduled = overdub || countInEnabled || drumsEnabled;   // any of these needs a scheduled common t=0
+    const bpm = (clickConfig && clickConfig.bpm) || 120;
+    const timeSigIndex = (clickConfig && clickConfig.timeSigIndex != null) ? clickConfig.timeSigIndex : 2;
 
     // Pre-load the backing buffers BEFORE choosing startAt, so the scheduled start
-    // is always in the future no matter how long the OPFS reads take.
+    // is always in the future no matter how long the OPFS reads / sample decodes take.
     const monitorItems = [];
     if (overdub) {
       for (const t of existingTracks) monitorItems.push({ key: t.key, meta: t.meta, buffer: await loadStemBuffer(audioCtx, slug, t.meta) });
     }
+    let kitBuffers = null, drumIr = null;
+    if (drumsEnabled) { kitBuffers = await loadKit(audioCtx, drumConfig.kit); drumIr = await loadEffect(audioCtx, drumConfig.effect); }
 
     const source = audioCtx.createMediaStreamSource(mediaStream);
     const slotNums = channelKeys.map((k) => (k ? Number(String(k).slice(4)) : 0)); // 'stem3' -> 3, null -> 0 (discard)
@@ -289,10 +308,10 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
       numberOfInputs: 1, numberOfOutputs: 1,
       channelCount: capture, channelCountMode: 'explicit', channelInterpretation: 'discrete',
       // beginFrame Infinity keeps the gate shut until we send the real begin frame AFTER
-      // the count-in / backing playback is scheduled (below), so setup latency can never
-      // desync them. Needed for an overdub AND for a click-enabled first pass (its gate
-      // opens at the count-in's downbeat). A click-off first pass records from frame 0.
-      processorOptions: { channelCount: capture, slots: slotNums, beginFrame: (overdub || clickEnabled) ? Number.MAX_SAFE_INTEGER : 0 },
+      // the count-in / drum backing / overdub playback is scheduled (below), so setup
+      // latency can never desync them. Needed whenever anything is scheduled (overdub,
+      // count-in, or drums); a bare first pass (none enabled) records from frame 0.
+      processorOptions: { channelCount: capture, slots: slotNums, beginFrame: scheduled ? Number.MAX_SAFE_INTEGER : 0 },
     });
     workletNode = node;
 
@@ -352,31 +371,36 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     // musical t=0; the backing (overdub) starts at that downbeat and the capture gate
     // opens one round-trip later. Click-off keeps today's behavior exactly (a click-off
     // first pass took the beginFrame:0 immediate path above and skips this block).
-    if (overdub || clickEnabled) {
+    if (scheduled) {
       const startAt = audioCtx.currentTime + 0.15;
       let musicStart = startAt; // ctx time of the first RECORDED bar's downbeat
 
-      if (clickEnabled) {
-        clickEngine = makeClick(audioCtx, masterBus); // click follows the monitor fader (D35)
+      if (countInEnabled) {
+        // The 2-bar count-in CUE only (countInOnly) — the drums, not a recording click, are
+        // the take's backing. The cue establishes the downbeat, then stops.
+        clickEngine = makeClick(audioCtx, masterBus); // cue follows the monitor fader (D35)
         const info = clickEngine.start({
-          bpm: clickConfig.bpm,
-          timeSigIndex: clickConfig.timeSigIndex,
-          subdivision: clickConfig.subdivision,
-          accentIndex: clickConfig.accentIndex,
-          startAt,
-          countInBars: 2,
+          bpm, timeSigIndex,
+          subdivision: (clickConfig && clickConfig.subdivision) || 1,
+          accentIndex: (clickConfig && clickConfig.accentIndex) || 1,
+          startAt, countInBars: 2, countInOnly: true,
         });
         musicStart = info.musicStartTime;
       }
 
+      if (drumsEnabled) {
+        // Drum backing from the downbeat on the monitor bus — heard by the performer, NEVER
+        // captured (the worklet records only the mic source). Loops for the whole take.
+        drumMachine = makeDrumMachine({ ctx: audioCtx, dest: masterBus });
+        drumMachine.load({ config: drumConfig, buffers: kitBuffers, irBuffer: drumIr, bpm, timeSigIndex });
+        drumMachine.start(musicStart, Infinity);
+      }
+
       if (overdub) startMonitorFromBuffers(monitorItems, musicStart);
-      // A click-on first pass compensates by the SAME monitor round-trip as an overdub. The
-      // per-take click is a persistent grid and an overdub's click is locked on, so the
-      // performer follows the click on BOTH passes; shifting the gate identically means a
-      // click-following take lands the same on the first pass and every later overdub (no
-      // inter-track flam). Uncalibrated => monitorLatencySec 0 => no shift, as before. A
-      // click-off overdub keeps its existing shift; a click-off first pass never reaches here.
-      const shift = (overdub || clickEnabled) ? (monitorLatencySec || 0) : 0;
+      // Compensate the capture gate by the measured monitor round-trip so the mic's sample 0
+      // aligns with the count-in downbeat + backing at t=0 on later playback (uncalibrated =>
+      // monitorLatencySec 0 => no shift). Drums/count-in are monitor-only and never captured.
+      const shift = monitorLatencySec || 0;
       const beginFrame = Math.round((musicStart + shift) * audioCtx.sampleRate);
       node.port.postMessage({ op: 'begin', beginFrame });
     }
@@ -463,6 +487,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
 
   function teardownCaptureGraph() {
     stopClick();
+    stopDrums();
     stopMonitor();
     if (mediaStream) { mediaStream.getTracks().forEach((t) => t.stop()); mediaStream = null; }
     // Sever the whole capture path. The worklet self-removes on its flush (process()
@@ -493,12 +518,26 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
       const tap = makeTap(audioCtx); chain.output.connect(tap); // per-track playback meter (D34)
       stems[key] = { buffer, chain, tap, activeSource: null };
     }
-    playChains = { slug, take: take.take, epoch: recordEpoch, sumBus, masterTap, stems };
+    // Drum backing (if the take has drums): its own graph -> sumBus (so it follows the monitor
+    // fader + master meter with the stems). Started in play() off the SAME startAt as the stems.
+    let drum = null;
+    if (take.drums && take.drums.enabled) {
+      const kitBuffers = await loadKit(audioCtx, take.drums.kit);
+      const irBuffer = await loadEffect(audioCtx, take.drums.effect);
+      drum = makeDrumMachine({ ctx: audioCtx, dest: sumBus });
+      const dbpm = (take.click && take.click.bpm) || 120;
+      const dtsi = (take.click && take.click.timeSigIndex != null) ? take.click.timeSigIndex : 2;
+      drum.load({ config: take.drums, buffers: kitBuffers, irBuffer, bpm: dbpm, timeSigIndex: dtsi });
+    }
+    playChains = { slug, take: take.take, epoch: recordEpoch, sumBus, masterTap, stems, drum };
   }
 
   function disposePlayback() {
     stopPlaySources();
-    if (playChains) { try { playChains.sumBus.disconnect(); } catch { /* already disconnected */ } }
+    if (playChains) {
+      if (playChains.drum) { try { playChains.drum.dispose(); } catch { /* already disposed */ } }
+      try { playChains.sumBus.disconnect(); } catch { /* already disconnected */ }
+    }
     playChains = null;
   }
 
@@ -508,6 +547,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
         const s = playChains.stems[key];
         if (s && s.activeSource) { try { s.activeSource.onended = null; s.activeSource.stop(); } catch { /* already stopped */ } s.activeSource = null; }
       }
+      if (playChains.drum) { try { playChains.drum.stop(); } catch { /* already stopped */ } }
     }
     playState = null;
     maybeStopMeterLoop();
@@ -532,7 +572,11 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
       any = true;
       if (!primary) primary = source;
     }
-    if (any) { playState = { startAt, durationSec }; startMeterLoop(); }
+    if (any) {
+      playState = { startAt, durationSec };
+      startMeterLoop();
+      if (playChains.drum) playChains.drum.start(startAt, durationSec); // drums sample-locked to the stems (shared startAt)
+    }
     if (primary) primary.onended = () => {
       onClock && onClock({ mode: 'play', elapsedSec: durationSec, durationSec }); // land the counter on the exact end
       stopPlaySources();                                                          // clears activeSource/playState, stops the loop
@@ -561,9 +605,11 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   // into ONE mono channel at 48 kHz — the shared render used by both the master
   // bounce and the per-track ping-pong bounce. Returns a Float32Array (mono) or
   // null if the take has no audio. Mono forever: no stereo/panning anywhere.
-  async function renderMonoMix(keys, take, slug) {
+  async function renderMonoMix(keys, take, slug, opts = {}) {
     const durationSec = maxKeyDuration(keys, take);
-    const frames = Math.max(1, Math.ceil((durationSec + 0.05) * BOUNCE_RATE)); // +50ms pad for comp tail
+    const includeDrums = !!(opts.drums && take.drums && take.drums.enabled && durationSec > 0);
+    const pad = includeDrums ? 0.5 : 0.05; // a late drum hit (crash) can ring past durationSec; comp tail otherwise
+    const frames = Math.max(1, Math.ceil((durationSec + pad) * BOUNCE_RATE));
     const offlineCtx = new OfflineAudioContext(1, frames, BOUNCE_RATE);
     const sumBus = offlineCtx.createGain();
     sumBus.gain.value = 1;
@@ -579,6 +625,17 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
       source.buffer = buffer;
       source.connect(chain.input);
       source.start(0);
+      any = true;
+    }
+    // Drums printed into the mix (opt-in per bounce). Pre-scheduled deterministically into the
+    // SAME sumBus, so they sum + master exactly like a stem. Only the master bounce passes this;
+    // the ping-pong sub-mix (bounceTracks) never does.
+    if (includeDrums) {
+      const kitBuffers = await loadKit(offlineCtx, take.drums.kit);
+      const irBuffer = await loadEffect(offlineCtx, take.drums.effect);
+      const dbpm = (take.click && take.click.bpm) || 120;
+      const dtsi = (take.click && take.click.timeSigIndex != null) ? take.click.timeSigIndex : 2;
+      renderDrumsOffline(offlineCtx, sumBus, { config: take.drums, buffers: kitBuffers, irBuffer, bpm: dbpm, timeSigIndex: dtsi, startAt: 0, durationSec });
       any = true;
     }
     if (!any) return { mono: null, durationSec };
@@ -603,8 +660,8 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
 
   // ---- master bounce (AC-13/14): sum ALL tracks -> one mono _mix.wav with the
   // fixed LUFS-target + brick-wall-limiter mastering ----
-  async function bounce(take, slug) {
-    const { mono } = await renderMonoMix(STEM_KEYS, take, slug);
+  async function bounce(take, slug, opts = {}) {
+    const { mono } = await renderMonoMix(STEM_KEYS, take, slug, { drums: !!opts.includeDrums });
     if (!mono) return { ok: false, error: 'take has no tracks to bounce' };
     const measured = integratedLoudness([mono], BOUNCE_RATE);
     const gainDb = bounceGainDb(measured);
@@ -721,6 +778,8 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   function dispose() {
     if (recording) stop('interrupted');
     stopMeterLoop();
+    stopClick();
+    stopDrums();
     stopMonitor();
     disposePlayback();
     if (wakeLock) { try { wakeLock.release(); } catch { /* already released */ } wakeLock = null; }

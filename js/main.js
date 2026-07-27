@@ -26,6 +26,7 @@ import { chordFromRootAndQuality } from './theory/roman.js';
 import * as takeModel from './tape/takeModel.js';
 import * as meterModel from './tape/meterModel.js';
 import { clampClickConfig, defaultClickConfig } from './tape/clickModel.js';
+import { clampDrumConfig, defaultDrumConfig, toggleCell, setBars, smfToPattern } from './tape/drumModel.js';
 import * as takeStore from './tape/takeStore.js';
 import { SIZE_FIELDS } from './tape/wav.js';
 import { makeTapeDeck } from './tape/audioEngine.js';
@@ -89,7 +90,7 @@ let deckBouncing = false;
 let deckOpenSeq = 0;           // bumped on every onOpenTapeDeck call; a stale in-flight open detects itself via this
 let deckPendingNewTake = false; // a "+ New take" container awaiting its first pass (materialized lazily at Record)
 let deckArmed = [];             // [{ slotKey, inputIndex }] — REC-armed strips for the next pass (normalized each render)
-let deckPanelOpen = null;       // 'click' | 'cal' | 'share' | null — which flip-panel is open (UI-local, not persisted)
+let deckPanelOpen = null;       // 'drums' | 'cal' | 'share' | null — which flip-panel is open (UI-local, not persisted)
 let deckLogOpen = false;        // TAPE LOG <details> open state (UI-local; the <details> reflects it, no render on toggle)
 let deckRecordingSlotKeys = []; // the in-flight pass's destination slot keys (meter routing + finalize)
 let deckRecordingGroup = null;  // the in-flight pass's group number
@@ -98,6 +99,8 @@ let deckSelectedInputId = null;
 let deckSpaceWarning = false;
 let deckCalibrating = false;   // an overdub-latency calibration is in flight (clicks playing)
 let deckClickDraft = null;     // the editable metronome config for a NEW take (last-used default)
+let deckDrumDraft = null;      // the editable drum config for a NEW take (last-used default)
+let deckDrumBar = 0;           // which bar of a multi-bar drum pattern the grid is showing (UI-local)
 let stemSettingsDebounce = null;
 
 function recompute() {
@@ -138,6 +141,8 @@ function resetTapeDeckUi() {
   deckInputs = null;
   deckSelectedInputId = null;
   deckClickDraft = null;
+  deckDrumDraft = null;
+  deckDrumBar = 0;
   clearTimeout(stemSettingsDebounce);
 }
 
@@ -214,6 +219,12 @@ function tapeDeckViewModel(active) {
   const clickConfig = clickLocked
     ? ((loadedTake && loadedTake.click) || defaultClickConfig())
     : (deckClickDraft || readClickDefault());
+  // Drums lock with the take exactly like the click: editable draft for a new take, the take's
+  // own (locked) config once it has audio.
+  const drumLocked = clickLocked;
+  const drumConfig = drumLocked
+    ? ((loadedTake && loadedTake.drums) || defaultDrumConfig())
+    : (deckDrumDraft || readDrumDefault());
 
   // The number shown in the LED counter window.
   const counterTakeNo = loadedTake ? loadedTake.take : (pendingNewTake ? takeModel.nextTakeNumber(deckManifest) : (currentTake || null));
@@ -254,6 +265,9 @@ function tapeDeckViewModel(active) {
     showLoadedActions: !deckRecording && !!loadedTake,
     clickConfig,
     clickLocked,
+    drumConfig,
+    drumLocked,
+    drumBar: deckDrumBar,
     masterVol: readMasterVol(),
     panelOpen: deckPanelOpen,
     logOpen: deckLogOpen,
@@ -656,6 +670,18 @@ function writeClickDefault(cfg) {
   try { localStorage.setItem(CLICK_KEY, JSON.stringify(cfg)); } catch { /* ignore */ }
 }
 
+// The drum draft's last-used default, same pattern as the click. UI default is ENABLED (so the
+// panel opens ready to program/import) with an EMPTY pattern (silent until you add hits); the
+// schema default (defaultDrumConfig) stays disabled so a legacy take never gains drums on read.
+const DRUMS_KEY = 'sn_tape_drums';
+function readDrumDefault() {
+  try { const raw = localStorage.getItem(DRUMS_KEY); if (raw) return clampDrumConfig(JSON.parse(raw)); } catch { /* ignore */ }
+  return clampDrumConfig({ ...defaultDrumConfig(), enabled: true });
+}
+function writeDrumDefault(cfg) {
+  try { localStorage.setItem(DRUMS_KEY, JSON.stringify(cfg)); } catch { /* ignore */ }
+}
+
 // The master MONITOR volume (D35): an app-level monitor setting, NOT part of any take,
 // never in the manifest, never in the bounce. Persisted like the click default. 0..1.5,
 // default 1.0 (unity), clamped to match the per-track vol range.
@@ -857,6 +883,10 @@ async function armRecording() {
   // take's locked config (overdubs share the take's tempo). Drives the count-in + click
   // AND is stamped onto the take at creation.
   const clickCfg = isNew ? (deckClickDraft || readClickDefault()) : (baseTake && baseTake.click);
+  // The drum backing for this pass: the new-take draft for a first pass, else the take's locked
+  // drums (overdubs share the take's backing). Drives the record-time drum machine + is stamped
+  // onto the take at creation. bpm/meter come from the click config (shared tempo).
+  const drumCfg = isNew ? (deckDrumDraft || readDrumDefault()) : (baseTake && baseTake.drums);
 
   let started = false;
   try {
@@ -867,6 +897,7 @@ async function armRecording() {
       monitorLatencySec: getMonitorLatencySec(),
       existingTracks,
       clickConfig: clickCfg,
+      drumConfig: drumCfg,
       onPassOpen: async (capture, sampleRate) => {
         // Resolve this pass's destination slots from the routing (skip null/discard
         // channels, dedup, cap at the real captured channel count, only into free slots).
@@ -876,7 +907,7 @@ async function armRecording() {
         if (isNew) {
           takeNo = takeModel.nextTakeNumber(deckManifest);
           group = 1;
-          deckManifest = takeModel.appendTake(deckManifest, takeModel.makeTake({ take: takeNo, sampleRate, click: clickCfg }, nowISO()));
+          deckManifest = takeModel.appendTake(deckManifest, takeModel.makeTake({ take: takeNo, sampleRate, click: clickCfg, drums: drumCfg }, nowISO()));
         } else {
           takeNo = currentTake;
           group = takeModel.nextGroup(baseTake);
@@ -1275,6 +1306,8 @@ const handlers = {
 
       deckManifest = manifest;
       deckClickDraft = readClickDefault();
+      deckDrumDraft = readDrumDefault();
+      deckDrumBar = 0;
       const kept = takeModel.mostRecentKeptTake(manifest);
       currentTake = kept ? kept.take : null;
 
@@ -1307,6 +1340,8 @@ const handlers = {
       currentTake = null;
       deckArmed = [];          // nothing armed until the user taps a strip's REC
       deckClickDraft = readClickDefault();
+      deckDrumDraft = readDrumDefault();
+      deckDrumBar = 0;
       deckStatus = null;
       deckPanelOpen = null;
       render();
@@ -1365,6 +1400,55 @@ const handlers = {
       const next = clampClickConfig({ ...(deckClickDraft || readClickDefault()), ...patch });
       deckClickDraft = next;
       writeClickDefault(next);
+      render();
+    },
+
+    // Edit the new-take drum draft (enable/kit/effect/mix/swing/master/per-voice), persisted as
+    // the last-used default. Deep-merges the nested master/voices/pattern so a single-field patch
+    // doesn't wipe siblings; clampDrumConfig re-shapes the result.
+    onSetDrums: (patch) => {
+      const base = deckDrumDraft || readDrumDefault();
+      const next = clampDrumConfig({
+        ...base, ...patch,
+        master: { ...base.master, ...(patch.master || {}), eq: { ...base.master.eq, ...((patch.master && patch.master.eq) || {}) } },
+        voices: { ...base.voices, ...(patch.voices || {}) },
+        pattern: { ...base.pattern, ...(patch.pattern || {}) },
+      });
+      deckDrumDraft = next;
+      writeDrumDefault(next);
+      render();
+    },
+    // Toggle one grid cell on/off (immutable transform); persists to the draft.
+    onToggleDrumCell: (voiceId, globalStep) => {
+      const next = toggleCell(deckDrumDraft || readDrumDefault(), voiceId, globalStep);
+      deckDrumDraft = next;
+      writeDrumDefault(next);
+      render();
+    },
+    // Scroll the grid to another bar of a multi-bar pattern (UI-local).
+    onSetDrumBar: (n) => { deckDrumBar = Math.max(0, n | 0); render(); },
+    // Grow/shrink the pattern's bar count (preserves existing cells).
+    onSetDrumBars: (n) => {
+      const next = setBars(deckDrumDraft || readDrumDefault(), n);
+      deckDrumDraft = next;
+      writeDrumDefault(next);
+      if (deckDrumBar >= next.pattern.bars) deckDrumBar = next.pattern.bars - 1;
+      render();
+    },
+    // Import a Standard MIDI File -> quantize to the grid -> load as the draft pattern. Unmapped
+    // notes are discarded; the count is surfaced in the status strip.
+    onImportDrumMidi: async (file) => {
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const r = smfToPattern(bytes);
+        const base = deckDrumDraft || readDrumDefault();
+        deckDrumDraft = clampDrumConfig({ ...base, enabled: true, pattern: r.pattern, source: { type: 'midi' } });
+        writeDrumDefault(deckDrumDraft);
+        deckDrumBar = 0;
+        deckStatus = { type: 'info', message: r.mappedCount + ' notes mapped to ' + r.pattern.bars + ' bar' + (r.pattern.bars === 1 ? '' : 's') + ', ' + r.discarded.length + ' unmapped (no matching voice).' };
+      } catch {
+        deckStatus = { type: 'error', message: 'Could not read that MIDI file — is it a Standard MIDI File?' };
+      }
       render();
     },
 
@@ -1492,7 +1576,7 @@ const handlers = {
     onPreviewMasterVol: (v) => { if (tapeDeck) tapeDeck.setMasterVol(v); },
     onSetMasterVol: (v) => { writeMasterVol(v); if (tapeDeck) tapeDeck.setMasterVol(v); render(); },
 
-    onBounceTake: async () => {
+    onBounceTake: async (opts) => {
       const a = activeSong();
       if (!a || !deckManifest || currentTake == null || !tapeDeck || deckBouncing) return;
       const take = deckManifest.takes.find((t) => t.take === currentTake);
@@ -1500,7 +1584,7 @@ const handlers = {
       const takeNo = take.take;              // snapshot — `currentTake` can change while this await is in flight
       deckBouncing = true;
       render();
-      const result = await tapeDeck.bounce(take, a.id);
+      const result = await tapeDeck.bounce(take, a.id, { includeDrums: !!(opts && opts.includeDrums) });
       deckBouncing = false;
       if (!result.ok) { deckStatus = { type: 'error', message: 'Bounce failed: ' + result.error }; render(); return; }
       // The take may have been discarded/deleted while the bounce was running

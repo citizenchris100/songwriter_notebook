@@ -1,7 +1,7 @@
 // sw.js — offline cache. Same recipe as the metronome/fretboard siblings.
 // IMPORTANT: bump CACHE on any file change, and keep ASSETS listing EVERY shipped
 // file (cache-first means anything not listed is unavailable offline).
-const CACHE = "sn-v29";
+const CACHE = "sn-v30";
 
 const ASSETS = [
   "./",
@@ -37,6 +37,24 @@ const ASSETS = [
   "./js/tape/devices.js",
   "./js/tape/deckControls.js",
   "./js/tape/tapeView.js",
+  "./js/tape/drumModel.js",
+  "./js/tape/midiParse.js",
+  "./js/tape/drumKits.js",
+  "./js/tape/drumMachine.js",
+  "./js/tape/drumPanel.js",
+  // drum machine samples — CC-BY/CC0, see assets/drums/CREDITS.md
+  "./assets/drums/kits/kit4/kick.wav",
+  "./assets/drums/kits/kit4/snare.wav",
+  "./assets/drums/kits/kit4/closedHat.wav",
+  "./assets/drums/kits/kit4/openHat.wav",
+  "./assets/drums/kits/kit4/lowTom.wav",
+  "./assets/drums/kits/kit4/midTom.wav",
+  "./assets/drums/kits/kit4/highTom.wav",
+  "./assets/drums/kits/kit4/crash.wav",
+  "./assets/drums/kits/kit4/ride.wav",
+  "./assets/drums/kits/kit4/clap.wav",
+  "./assets/drums/kits/kit4/hiConga.wav",
+  "./assets/drums/kits/kit4/loConga.wav",
   "./js/theory/pitch.js",
   "./js/theory/spell.js",
   "./js/theory/scale.js",

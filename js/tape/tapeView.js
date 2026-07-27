@@ -16,8 +16,8 @@
 // driven by main.js's meter merge layer.
 import { h } from '../dom.js';
 import { STEM_KEYS } from './takeModel.js';
-import { TIME_SIGS, SUBS, countInSeconds } from './clickModel.js';
 import { buildKnob, buildFader, buildLedMeter, buildCounter } from './deckControls.js';
+import { buildDrumPanel } from './drumPanel.js';
 import { METER_SEGMENTS } from './meterModel.js';
 
 const STEM_LABELS = { stem1: 'Track 1', stem2: 'Track 2', stem3: 'Track 3', stem4: 'Track 4' };
@@ -88,8 +88,8 @@ export function buildDeckView(deck, handlers, songName) {
   // ---- function row + its inline confirm bars ----
   wrap.appendChild(functionRow(deck, handlers));
 
-  // ---- flip-open panel (click / cal / share) ----
-  if (deck.panelOpen) wrap.appendChild(flipPanel(deck, handlers));
+  // ---- flip-open panel (drums / cal / share) ----
+  if (deck.panelOpen) wrap.appendChild(flipPanel(deck, handlers, meterSetters));
 
   // ---- piano-key transport ----
   wrap.appendChild(transport(deck, { onArmRecordPass, onStopTake, onPlayTake, onReplayTake, onStopPlayTake, songId: deck.songId, setStat }));
@@ -269,63 +269,35 @@ function functionRow(deck, handlers) {
   }
   fn('RETAKE', false, busy || !(deck.lastGroupKeys && deck.lastGroupKeys.length), () => retakeBar.classList.remove('hidden'));
 
-  fn('MIX', false, busy || !haveAudio, () => handlers.onBounceTake());
-  fn('CLICK', deck.clickConfig && deck.clickConfig.enabled, deck.recording, () => handlers.onTogglePanel('click'));
+  // MIX — bounce to a mix WAV. If the loaded take has drums, an inline confirm offers to
+  // include them in the printed mix (per-bounce, default on); otherwise it bounces directly.
+  const hasDrums = !!(deck.loadedTake && deck.loadedTake.drums && deck.loadedTake.drums.enabled);
+  const mixBar = h('div', 'namebar hidden');
+  if (hasDrums) {
+    const chk = h('input'); chk.type = 'checkbox'; chk.checked = true;
+    const lbl = h('label', 'savehint'); lbl.append(chk, ' Include drums in the mix');
+    const go = h('button', 'btn mini primary', 'Bounce'); go.addEventListener('click', () => { mixBar.classList.add('hidden'); handlers.onBounceTake({ includeDrums: chk.checked }); });
+    const cx = h('button', 'btn mini', 'Cancel'); cx.addEventListener('click', () => mixBar.classList.add('hidden'));
+    mixBar.append(lbl, go, cx);
+    fn('MIX', false, busy || !haveAudio, () => mixBar.classList.remove('hidden'));
+  } else {
+    fn('MIX', false, busy || !haveAudio, () => handlers.onBounceTake());
+  }
+  fn('DRUMS', deck.drumConfig && deck.drumConfig.enabled, deck.recording, () => handlers.onTogglePanel('drums'));
   fn('CAL', deck.panelOpen === 'cal', deck.recording, () => handlers.onTogglePanel('cal'));
   fn('SHARE', deck.panelOpen === 'share', !haveAudio && !(deck.loadedTake && deck.loadedTake.bounce), () => handlers.onTogglePanel('share'));
 
-  wrap.append(row, newBar, retakeBar);
+  wrap.append(row, newBar, retakeBar, mixBar);
   return wrap;
 }
 
 // ---- flip-open panel ----
-function flipPanel(deck, handlers) {
+function flipPanel(deck, handlers, meterSetters) {
   const box = h('div', 'card grow tapepanel');
-  if (deck.panelOpen === 'click') clickPanel(box, deck, handlers);
+  if (deck.panelOpen === 'drums') buildDrumPanel(box, deck, handlers, meterSetters);
   else if (deck.panelOpen === 'cal') calPanel(box, deck, handlers);
   else if (deck.panelOpen === 'share') sharePanel(box, deck, handlers);
   return box;
-}
-
-function clickPanel(box, deck, handlers) {
-  const cfg = deck.clickConfig || { enabled: false, bpm: 120, timeSigIndex: 2, subdivision: 1, accentIndex: 1 };
-  const sig = TIME_SIGS[cfg.timeSigIndex] || TIME_SIGS[2];
-  if (deck.clickLocked) {
-    const summary = cfg.enabled
-      ? 'Click: ' + cfg.bpm + ' BPM · ' + sig.label + ' · ' + ((SUBS[cfg.subdivision - 1] || SUBS[0]).name) + ' · ' + (sig.accents[cfg.accentIndex] || 'On')
-      : 'Click: off';
-    box.appendChild(h('div', 'subtitle', summary + ' — locked to this take'));
-    return;
-  }
-  box.appendChild(h('div', 'subtitle', 'Metronome'));
-  const toggle = h('button', 'btn mini' + (cfg.enabled ? ' primary' : ''), cfg.enabled ? 'Click: On' : 'Click: Off');
-  toggle.addEventListener('click', () => handlers.onSetClick({ enabled: !cfg.enabled }));
-  box.appendChild(rowOf(toggle));
-  if (cfg.enabled) {
-    const numRow = (label, cfgKey, min, max, val) => {
-      const row = h('div', 'row routerow');
-      row.appendChild(h('span', 'lbl', label));
-      const inp = h('input', 'nameinput'); inp.type = 'number'; inp.min = String(min); inp.max = String(max); inp.step = '1'; inp.value = String(val); inp.style.maxWidth = '6rem';
-      inp.addEventListener('change', () => handlers.onSetClick({ [cfgKey]: Number(inp.value) }));
-      row.appendChild(inp);
-      return row;
-    };
-    const selRow = (label, options, value, cfgKey) => {
-      const row = h('div', 'row routerow');
-      row.appendChild(h('span', 'lbl', label));
-      const sel = h('select');
-      options.forEach(([v, text]) => { const o = h('option', null, text); o.value = String(v); sel.appendChild(o); });
-      sel.value = String(value);
-      sel.addEventListener('change', () => handlers.onSetClick({ [cfgKey]: Number(sel.value) }));
-      row.appendChild(sel);
-      return row;
-    };
-    box.appendChild(numRow('BPM', 'bpm', 20, 300, cfg.bpm));
-    box.appendChild(selRow('Time sig', TIME_SIGS.map((m, i) => [i, m.label]), cfg.timeSigIndex, 'timeSigIndex'));
-    box.appendChild(selRow('Subdivision', SUBS.map((s) => [s.n, s.name]), cfg.subdivision, 'subdivision'));
-    box.appendChild(selRow('Accent', sig.accents.map((name, i) => [i, name]), Math.min(cfg.accentIndex, sig.accents.length - 1), 'accentIndex'));
-    box.appendChild(h('div', 'feel-empty', '2-bar count-in ≈ ' + countInSeconds(cfg.bpm, cfg.timeSigIndex).toFixed(1) + ' s before recording starts.'));
-  }
 }
 
 function calPanel(box, deck, handlers) {
@@ -451,5 +423,3 @@ function historyRow(t, deck, handlers) {
   wrap.append(row, confirmBar);
   return wrap;
 }
-
-const rowOf = (child) => { const r = h('div', 'row'); r.appendChild(child); return r; };
