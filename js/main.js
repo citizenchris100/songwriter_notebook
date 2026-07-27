@@ -219,10 +219,10 @@ function tapeDeckViewModel(active) {
   const clickConfig = clickLocked
     ? ((loadedTake && loadedTake.click) || defaultClickConfig())
     : (deckClickDraft || readClickDefault());
-  // Drums lock with the take exactly like the click: editable draft for a new take, the take's
-  // own (locked) config once it has audio.
-  const drumLocked = clickLocked;
-  const drumConfig = drumLocked
+  // Drums stay EDITABLE after recording (they regenerate from config at playback). `drumOnTake`
+  // just tells the panel it's editing a recorded take (edits persist to it) vs the new-take draft.
+  const drumOnTake = clickLocked;
+  const drumConfig = drumOnTake
     ? ((loadedTake && loadedTake.drums) || defaultDrumConfig())
     : (deckDrumDraft || readDrumDefault());
 
@@ -266,7 +266,7 @@ function tapeDeckViewModel(active) {
     clickConfig,
     clickLocked,
     drumConfig,
-    drumLocked,
+    drumOnTake,
     drumBar: deckDrumBar,
     masterVol: readMasterVol(),
     panelOpen: deckPanelOpen,
@@ -680,6 +680,50 @@ function readDrumDefault() {
 }
 function writeDrumDefault(cfg) {
   try { localStorage.setItem(DRUMS_KEY, JSON.stringify(cfg)); } catch { /* ignore */ }
+}
+
+// Drum + count-in settings stay EDITABLE after recording: drums are regenerated from config at
+// playback (never captured into a stem), so tweaking a recorded take's kit/pattern/mix/BPM is
+// safe. An edit therefore targets the loaded, recorded take's manifest record when there is one,
+// else the new-take DRAFT. `editingDeckTake()` returns that take (or null for a draft).
+function editingDeckTake() {
+  if (deckPendingNewTake || currentTake == null || !deckManifest) return null;
+  const t = deckManifest.takes.find((x) => x.take === currentTake && x.status === 'active');
+  return (t && takeModel.filledSlotKeys(t).length > 0) ? t : null;
+}
+function currentDrumBase() { const t = editingDeckTake(); return (t && t.drums) || deckDrumDraft || readDrumDefault(); }
+function currentClickBase() { const t = editingDeckTake(); return (t && t.click) || deckClickDraft || readClickDefault(); }
+function mergeDrums(base, patch) {
+  return clampDrumConfig({
+    ...base, ...patch,
+    master: { ...base.master, ...(patch.master || {}), eq: { ...base.master.eq, ...((patch.master && patch.master.eq) || {}) } },
+    voices: { ...base.voices, ...(patch.voices || {}) },
+    pattern: { ...base.pattern, ...(patch.pattern || {}) },
+  });
+}
+function persistDeckManifest() {
+  const a = activeSong();
+  if (a && deckManifest) takeStore.writeManifest(manifestPath(a.id), deckManifest).catch(() => { /* surfaced by onWriteError */ });
+}
+// Commit an edited drum config to the loaded take (manifest + invalidate the cached playback graph
+// so the next play rebuilds with the new config) or the new-take draft (localStorage). Same for click.
+function commitDrums(next) {
+  const t = editingDeckTake();
+  if (t) {
+    deckManifest = { ...deckManifest, takes: deckManifest.takes.map((x) => (x.take === t.take ? { ...x, drums: next } : x)) };
+    persistDeckManifest();
+    if (tapeDeck) tapeDeck.invalidatePlayback();
+  } else { deckDrumDraft = next; writeDrumDefault(next); }
+  render();
+}
+function commitClick(next) {
+  const t = editingDeckTake();
+  if (t) {
+    deckManifest = { ...deckManifest, takes: deckManifest.takes.map((x) => (x.take === t.take ? { ...x, click: next } : x)) };
+    persistDeckManifest();
+    if (tapeDeck) tapeDeck.invalidatePlayback();
+  } else { deckClickDraft = next; writeClickDefault(next); }
+  render();
 }
 
 // The master MONITOR volume (D35): an app-level monitor setting, NOT part of any take,
@@ -1396,60 +1440,35 @@ const handlers = {
     // Edit the new-take metronome draft (BPM/meter/subdivision/accent/on-off), persisted
     // as the last-used default. A patch that changes the time signature re-clamps the
     // accent index to the new meter's option list (clampClickConfig).
-    onSetClick: (patch) => {
-      const next = clampClickConfig({ ...(deckClickDraft || readClickDefault()), ...patch });
-      deckClickDraft = next;
-      writeClickDefault(next);
-      render();
-    },
+    // BPM / count-in edits — commit to the loaded take or the new-take draft (see commitClick).
+    onSetClick: (patch) => commitClick(clampClickConfig({ ...currentClickBase(), ...patch })),
 
-    // Edit the new-take drum draft (enable/kit/effect/mix/swing/master/per-voice), persisted as
-    // the last-used default. Deep-merges the nested master/voices/pattern so a single-field patch
-    // doesn't wipe siblings; clampDrumConfig re-shapes the result.
-    onSetDrums: (patch) => {
-      const base = deckDrumDraft || readDrumDefault();
-      const next = clampDrumConfig({
-        ...base, ...patch,
-        master: { ...base.master, ...(patch.master || {}), eq: { ...base.master.eq, ...((patch.master && patch.master.eq) || {}) } },
-        voices: { ...base.voices, ...(patch.voices || {}) },
-        pattern: { ...base.pattern, ...(patch.pattern || {}) },
-      });
-      deckDrumDraft = next;
-      writeDrumDefault(next);
-      render();
-    },
-    // Toggle one grid cell on/off (immutable transform); persists to the draft.
-    onToggleDrumCell: (voiceId, globalStep) => {
-      const next = toggleCell(deckDrumDraft || readDrumDefault(), voiceId, globalStep);
-      deckDrumDraft = next;
-      writeDrumDefault(next);
-      render();
-    },
+    // Drum edits (enable/kit/effect/mix/swing/master/per-voice) — deep-merged so a single-field
+    // patch doesn't wipe siblings, then committed to the loaded take or the draft.
+    onSetDrums: (patch) => commitDrums(mergeDrums(currentDrumBase(), patch)),
+    // Toggle one grid cell on/off (immutable transform).
+    onToggleDrumCell: (voiceId, globalStep) => commitDrums(toggleCell(currentDrumBase(), voiceId, globalStep)),
     // Scroll the grid to another bar of a multi-bar pattern (UI-local).
     onSetDrumBar: (n) => { deckDrumBar = Math.max(0, n | 0); render(); },
     // Grow/shrink the pattern's bar count (preserves existing cells).
     onSetDrumBars: (n) => {
-      const next = setBars(deckDrumDraft || readDrumDefault(), n);
-      deckDrumDraft = next;
-      writeDrumDefault(next);
+      const next = setBars(currentDrumBase(), n);
       if (deckDrumBar >= next.pattern.bars) deckDrumBar = next.pattern.bars - 1;
-      render();
+      commitDrums(next);
     },
-    // Import a Standard MIDI File -> quantize to the grid -> load as the draft pattern. Unmapped
-    // notes are discarded; the count is surfaced in the status strip.
+    // Import a Standard MIDI File -> quantize to the grid -> load as the pattern (loaded take or
+    // draft). Unmapped notes are discarded; the count is surfaced in the status strip.
     onImportDrumMidi: async (file) => {
       try {
         const bytes = new Uint8Array(await file.arrayBuffer());
         const r = smfToPattern(bytes);
-        const base = deckDrumDraft || readDrumDefault();
-        deckDrumDraft = clampDrumConfig({ ...base, enabled: true, pattern: r.pattern, source: { type: 'midi' } });
-        writeDrumDefault(deckDrumDraft);
         deckDrumBar = 0;
         deckStatus = { type: 'info', message: r.mappedCount + ' notes mapped to ' + r.pattern.bars + ' bar' + (r.pattern.bars === 1 ? '' : 's') + ', ' + r.discarded.length + ' unmapped (no matching voice).' };
+        commitDrums(mergeDrums(currentDrumBase(), { enabled: true, pattern: r.pattern, source: { type: 'midi' } }));
       } catch {
         deckStatus = { type: 'error', message: 'Could not read that MIDI file — is it a Standard MIDI File?' };
+        render();
       }
-      render();
     },
 
     onStopTake: async () => {

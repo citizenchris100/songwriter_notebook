@@ -11,22 +11,10 @@ import { METER_SEGMENTS } from './meterModel.js';
 import { VOICES, KITS, EFFECTS, STEPS_PER_BAR, SWING_MAX } from './drumModel.js';
 import { countInSeconds } from './clickModel.js';
 
-const kitLabel = (id) => { const k = KITS.find((x) => x.id === id); return k ? k.label : id; };
-
 export function buildDrumPanel(box, deck, handlers, meterSetters) {
   box.classList.add('drumpanel');
   const cfg = deck.drumConfig || null;
   const click = deck.clickConfig || { bpm: 120, countIn: false, timeSigIndex: 2 };
-
-  // Locked (the take has audio): read-only summary, mirroring the old click-locked path.
-  if (deck.drumLocked) {
-    const on = !!(cfg && cfg.enabled);
-    const bars = (cfg && cfg.pattern && cfg.pattern.bars) || 1;
-    box.appendChild(h('div', 'subtitle',
-      (on ? 'Drums: ' + kitLabel(cfg.kit) + ' · ' + bars + ' bar' + (bars === 1 ? '' : 's') + ' · ' + Math.round((cfg.swing || 0) * 100) + '% swing'
-          : 'Drums: off') + ' — locked to this take'));
-    return;
-  }
 
   const enabled = !!(cfg && cfg.enabled);
   const header = h('div', 'row');
@@ -35,6 +23,9 @@ export function buildDrumPanel(box, deck, handlers, meterSetters) {
   toggle.addEventListener('click', () => handlers.onSetDrums({ enabled: !enabled }));
   header.appendChild(toggle);
   box.appendChild(header);
+  // Editing a RECORDED take's drums (vs the new-take draft): changes persist to the take and are
+  // heard on the next play — the recorded tracks are untouched (drums regenerate from config).
+  if (deck.drumOnTake) box.appendChild(h('div', 'feel-empty', 'Editing take ' + (deck.currentTakeNo || '') + '’s drums — changes apply on the next play.'));
   if (!enabled) return;
 
   // ---- top controls: BPM (click), count-in (click), kit, effect, mix, swing ----
@@ -124,7 +115,7 @@ export function buildDrumPanel(box, deck, handlers, meterSetters) {
 function numCtl(label, min, max, val, onChange) {
   const c = h('div', 'drumctl');
   c.appendChild(h('span', 'lbl', label));
-  const inp = h('input', 'nameinput'); inp.type = 'number'; inp.min = String(min); inp.max = String(max); inp.step = '1'; inp.value = String(val); inp.style.maxWidth = '5rem';
+  const inp = h('input', 'drumnum'); inp.type = 'number'; inp.min = String(min); inp.max = String(max); inp.step = '1'; inp.value = String(val);
   inp.addEventListener('change', () => onChange(Number(inp.value)));
   c.appendChild(inp);
   return c;
