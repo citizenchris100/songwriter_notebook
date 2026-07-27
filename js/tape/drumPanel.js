@@ -30,7 +30,9 @@ export function buildDrumPanel(box, deck, handlers, meterSetters) {
 
   // ---- top controls: BPM (click), count-in (click), kit, effect, mix, swing ----
   const ctrls = h('div', 'drumctrls');
-  ctrls.appendChild(numCtl('BPM', 20, 300, click.bpm, (v) => handlers.onSetClick({ bpm: v })));
+  // BPM is LOCKED once the take is recorded — the recorded audio is fixed at that tempo, so
+  // changing it would drift the drums against the tracks. Everything else stays editable.
+  ctrls.appendChild(numCtl(deck.drumOnTake ? 'BPM (locked)' : 'BPM', 20, 300, click.bpm, (v) => handlers.onSetClick({ bpm: v }), deck.drumOnTake));
   const ci = h('button', 'btn mini' + (click.countIn ? ' primary' : ''), click.countIn ? 'Count-in: 2 bars' : 'Count-in: off');
   ci.addEventListener('click', () => handlers.onSetClick({ countIn: !click.countIn }));
   const ciCtl = h('div', 'drumctl'); ciCtl.append(h('span', 'lbl', 'Count-in'), ci); ctrls.appendChild(ciCtl);
@@ -65,7 +67,9 @@ export function buildDrumPanel(box, deck, handlers, meterSetters) {
   // ---- the step grid (12 voices × 16 steps for the visible bar; vol/pitch per voice) ----
   const gridWrap = h('div', 'drumgridwrap');
   const grid = h('div', 'drumgrid');
-  VOICES.forEach((v) => {
+  // Rows are drawn bottom-up (kick at the bottom, cymbals/percussion at the top) — the drum-machine
+  // convention. Only the DISPLAY reverses; VOICES stays the canonical order for the model/GM map.
+  [...VOICES].reverse().forEach((v) => {
     const rowEl = h('div', 'drumrow');
     rowEl.appendChild(h('div', 'drumvoice', v.label));
     const cells = h('div', 'drumcells');
@@ -112,11 +116,12 @@ export function buildDrumPanel(box, deck, handlers, meterSetters) {
 }
 
 // ---- small local control builders ----
-function numCtl(label, min, max, val, onChange) {
+function numCtl(label, min, max, val, onChange, disabled) {
   const c = h('div', 'drumctl');
   c.appendChild(h('span', 'lbl', label));
   const inp = h('input', 'drumnum'); inp.type = 'number'; inp.min = String(min); inp.max = String(max); inp.step = '1'; inp.value = String(val);
-  inp.addEventListener('change', () => onChange(Number(inp.value)));
+  if (disabled) inp.disabled = true;
+  else inp.addEventListener('change', () => onChange(Number(inp.value)));
   c.appendChild(inp);
   return c;
 }
