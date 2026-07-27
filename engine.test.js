@@ -1227,7 +1227,7 @@ ok('decayPeak fall rate matches FALL_DB_PER_SEC', Math.abs(decayPeak(1.0, 0, 100
 eq('12 drum voices', VOICES.length, 12);
 eq('voice ids are unique', new Set(VOICE_IDS).size, 12);
 ok('every voice has at least one GM note', VOICES.every((v) => v.gm.length >= 1));
-eq('4 kits', KIT_IDS.length, 4);
+eq('9 kits', KIT_IDS.length, 9);
 eq('12 effects (none + 8 IR + 3 biquad)', EFFECT_IDS.length, 12);
 eq('GM 36 -> kick', voiceForNote(36), 'kick');
 eq('GM 35 -> kick', voiceForNote(35), 'kick');
@@ -1419,9 +1419,9 @@ eq('readVarLen 0x81 0x80 0x00 -> 16384', readVarLen([0x81, 0x80, 0x00], 0).value
 // ============================================================================
 // 27. Take schema carries the per-take drums config (additive, defaulted on read).
 // ============================================================================
-const drumTake = makeTake({ take: 1, sampleRate: 48000, drums: { enabled: true, kit: 'jazz', swing: 0.5 } }, '2026-07-25T00:00:00Z');
+const drumTake = makeTake({ take: 1, sampleRate: 48000, drums: { enabled: true, kit: 'jazzfunk', swing: 0.5 } }, '2026-07-25T00:00:00Z');
 eq('makeTake stores drums enabled', drumTake.drums.enabled, true);
-eq('makeTake stores the drums kit', drumTake.drums.kit, 'jazz');
+eq('makeTake stores the drums kit', drumTake.drums.kit, 'jazzfunk');
 eq('makeTake clamps drums swing', drumTake.drums.swing, 0.5);
 eq('makeTake without drums defaults to disabled', makeTake({ take: 2, sampleRate: 48000 }, 'x').drums.enabled, false);
 // A legacy take with NO drums field normalizes to the disabled default (no drums gained).

@@ -55,9 +55,14 @@ export function voiceForNote(note) {
 
 export const KITS = [
   { id: 'kit4', label: 'Kit 4' },
-  { id: 'jazz', label: 'Jazz' },
-  { id: 'rnb', label: 'RnB' },
-  { id: 'latin', label: 'Latin' },
+  { id: 'jazzfunk', label: 'Jazz Funk Kit' },
+  { id: 'abeyroad', label: 'Abey Road Drums' },
+  { id: 'currentz', label: 'Currentz Drums Vol2' },
+  { id: 'demarco', label: 'Demarco Drums 3' },
+  { id: 'fleetwood', label: 'Fleetwood Drums Vol2' },
+  { id: 'harvest', label: 'Harvest Drums Vol 2' },
+  { id: 'seachange', label: 'Sea Change Drums' },
+  { id: 'wreckingcrew', label: '60s Wrecking Crew Drums' },
 ];
 export const KIT_IDS = KITS.map((k) => k.id);
 
