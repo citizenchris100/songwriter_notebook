@@ -1479,6 +1479,10 @@ ok('default grid has all 12 voices at 16 steps', VOICE_IDS.every((id) => default
   eq('all 12 voices present after clamp', Object.keys(cd.pattern.grid).length, 12);
   ok('clampDrumConfig is idempotent', JSON.stringify(clampDrumConfig(cd)) === JSON.stringify(cd));
 }
+eq('default drum master vol is unity', defaultDrumConfig().master.vol, 1.0);
+eq('drum master vol passes through mid-range', clampDrumConfig({ master: { vol: 0.4 } }).master.vol, 0.4);
+eq('drum master vol clamps above 1.5', clampDrumConfig({ master: { vol: 9 } }).master.vol, 1.5);
+eq('drum master vol clamps below 0', clampDrumConfig({ master: { vol: -3 } }).master.vol, 0);
 ok('validateDrumConfig ok on default', validateDrumConfig(defaultDrumConfig()).ok);
 ok('validateDrumConfig rejects non-boolean enabled', !validateDrumConfig({ enabled: 'yes' }).ok);
 ok('validateDrumConfig rejects an unknown kit', !validateDrumConfig({ enabled: true, kit: 'nope' }).ok);

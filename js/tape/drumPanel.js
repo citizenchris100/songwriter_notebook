@@ -103,6 +103,7 @@ export function buildDrumPanel(box, deck, handlers, meterSetters) {
     onCommit: (x) => handlers.onSetDrums(patch(x)), // no live preview: drums are silent while editing the draft
   }).el;
   knobs.append(
+    mk('VOL', 0, 1.5, 0.01, m.vol, 1.0, (x) => ({ master: { ...m, vol: x } })), // drum-bus fader into the mix (pre-EQ, like each track's vol); unity detent
     mk('HI', -12, 12, 0.5, m.eq.treble, 0, (x) => ({ master: { ...m, eq: { ...m.eq, treble: x } } })),
     mk('MID', -12, 12, 0.5, m.eq.mid, 0, (x) => ({ master: { ...m, eq: { ...m.eq, mid: x } } })),
     mk('LO', -12, 12, 0.5, m.eq.bass, 0, (x) => ({ master: { ...m, eq: { ...m.eq, bass: x } } })),
