@@ -1,7 +1,7 @@
 // sw.js — offline cache. Same recipe as the metronome/fretboard siblings.
 // IMPORTANT: bump CACHE on any file change, and keep ASSETS listing EVERY shipped
 // file (cache-first means anything not listed is unavailable offline).
-const CACHE = "sn-v36";
+const CACHE = "sn-v37";
 
 const ASSETS = [
   "./",
@@ -43,6 +43,15 @@ const ASSETS = [
   "./js/tape/drumKits.js",
   "./js/tape/drumMachine.js",
   "./js/tape/drumPanel.js",
+  "./js/tape/rulesetModel.js",
+  "./js/tape/rulesetStore.js",
+  "./js/tape/loopFolder.js",
+  "./js/tape/loopPicker.js",
+  // drum-loop sequencer starter rulesets (user-authored ones live in localStorage)
+  "./assets/rulesets/index.json",
+  "./assets/rulesets/wander-65.json",
+  "./assets/rulesets/even-bag.json",
+  "./assets/rulesets/round-robin.json",
   // drum machine samples + reverb impulses — CC-BY/CC0, see assets/drums/CREDITS.md
   "./assets/drums/kits/abeyroad/clap.wav",
   "./assets/drums/kits/abeyroad/closedHat.wav",

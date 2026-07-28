@@ -12,7 +12,7 @@
 // per-take `drums` field, so importing back would be a cycle); the master-strip settings
 // clamp is therefore defined locally here and mirrors takeModel's clampStemSettings shape.
 
-import { barSeconds } from './clickModel.js';
+import { barSeconds, barTicks } from './clickModel.js';
 import { parseSMF } from './midiParse.js';
 
 const clampNum = (v, lo, hi, dflt) => { const n = Number(v); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : dflt; };
@@ -20,7 +20,9 @@ const clampInt = (v, lo, hi, dflt) => { const n = Math.round(Number(v)); return 
 
 export const STEPS_PER_BAR = 16;
 export const MIN_BARS = 1;
-export const MAX_BARS = 64;             // import cap: bounds a runaway file (64 bars is plenty)
+export const MAX_BARS = 64;             // single-loop import + manual-grid cap (64 bars is plenty)
+export const MAX_FLAT_BARS = 512;       // sequencer flatten cap: a FROZEN intro+main+outro grid
+                                        // can far exceed 64 bars; bounds a runaway sequence only
 export const SWING_MAX = 0.75;          // 1/3 = triplet feel; -> 1 collides the odd 16th with the next even
 export const ON_VELOCITY = 100 / 127;   // default gain when hand-toggling a cell on
 
@@ -194,6 +196,26 @@ function clampGrid(gsrc, bars) {
   return g;
 }
 
+// The drum-loop SEQUENCER's per-take spec: the AUTHORING inputs + the FROZEN realized order.
+// The sounded artifact is the flattened `pattern` (built at record time); this block is the
+// compact record kept alongside it for display / re-derivation. null on a non-sequence take.
+// A whitelisted sub-object like the rest of the config — an unknown extra field is dropped.
+function clampSequence(s) {
+  if (s == null || typeof s !== 'object' || Array.isArray(s)) return null;
+  const strOrNull = (x) => (typeof x === 'string' && x ? x : null);
+  return {
+    folderName: typeof s.folderName === 'string' ? s.folderName : '',
+    loopFiles: Array.isArray(s.loopFiles) ? s.loopFiles.filter((f) => typeof f === 'string') : [],
+    algorithmId: typeof s.algorithmId === 'string' ? s.algorithmId : '',
+    count: clampInt(s.count, 1, MAX_FLAT_BARS, 1),
+    intro: strOrNull(s.intro),
+    outro: strOrNull(s.outro),
+    timeSigIndex: clampInt(s.timeSigIndex, 0, 15, 2),
+    realizedOrder: Array.isArray(s.realizedOrder) ? s.realizedOrder.map((n) => clampInt(n, 1, MAX_FLAT_BARS, 1)) : [],
+    realizedBars: clampInt(s.realizedBars, 0, MAX_FLAT_BARS, 0),
+  };
+}
+
 // The DISABLED schema baseline (like defaultClickConfig): a legacy take with no `drums`
 // normalizes to this (no drums silently gained). "Default ON" is a UI default in main.js.
 export function defaultDrumConfig() {
@@ -207,17 +229,21 @@ export function defaultDrumConfig() {
     voices: defaultVoiceSettings(),
     pattern: { bars: 1, steps: STEPS_PER_BAR, grid: emptyGrid(1) },
     source: { type: 'grid' },
+    sequence: null,
   };
 }
 
 export function clampDrumConfig(c) {
   const src = c || {};
   const p = src.pattern || {};
-  const bars = clampInt(p.bars, MIN_BARS, MAX_BARS, 1);
-  const isMidi = !!(src.source && src.source.type === 'midi');
-  const source = isMidi
-    ? { type: 'midi', ...(src.source && typeof src.source.midiFile === 'string' ? { midiFile: src.source.midiFile } : {}) }
-    : { type: 'grid' };
+  // A flattened sequence pattern can exceed MAX_BARS, so the STORED pattern clamps to
+  // MAX_FLAT_BARS. The single-loop import (smfToPattern) and manual grid (setBars) keep the
+  // 64-bar MAX_BARS cap themselves, so this looser cap never loosens the manual editor.
+  const bars = clampInt(p.bars, MIN_BARS, MAX_FLAT_BARS, 1);
+  const st = src.source && src.source.type;
+  const source = st === 'midi'
+    ? { type: 'midi', ...(typeof src.source.midiFile === 'string' ? { midiFile: src.source.midiFile } : {}) }
+    : st === 'sequence' ? { type: 'sequence' } : { type: 'grid' };
   return {
     enabled: !!src.enabled,
     kit: KIT_IDS.includes(src.kit) ? src.kit : 'kit4',
@@ -228,6 +254,7 @@ export function clampDrumConfig(c) {
     voices: clampVoices(src.voices),
     pattern: { bars, steps: STEPS_PER_BAR, grid: clampGrid(p.grid, bars) },
     source,
+    sequence: clampSequence(src.sequence),
   };
 }
 
@@ -244,7 +271,29 @@ export function validateDrumConfig(c) {
     if (typeof c.pattern !== 'object') errors.push('drums pattern must be an object');
     else if (!(typeof c.pattern.bars === 'number' && c.pattern.bars >= 1)) errors.push('drums pattern.bars must be >= 1');
   }
+  // `sequence` is additive: absent/null on non-sequence takes; when present it must be a
+  // well-formed object with a numeric count >= 1 and array loopFiles/realizedOrder.
+  if (c.sequence != null) {
+    if (typeof c.sequence !== 'object' || Array.isArray(c.sequence)) errors.push('drums sequence must be an object or null');
+    else {
+      if ('count' in c.sequence && !(typeof c.sequence.count === 'number' && c.sequence.count >= 1)) errors.push('drums sequence.count must be >= 1');
+      if ('loopFiles' in c.sequence && !Array.isArray(c.sequence.loopFiles)) errors.push('drums sequence.loopFiles must be an array');
+      if ('realizedOrder' in c.sequence && !Array.isArray(c.sequence.realizedOrder)) errors.push('drums sequence.realizedOrder must be an array');
+    }
+  }
   return { ok: errors.length === 0, errors };
+}
+
+// Editing a RECORDED take's drums: the tempo/arrangement-critical fields are LOCKED — changing
+// them would drift the frozen drums against the already-cut audio. Preserve {swing, pattern,
+// source, sequence} from the stored config; take the sound-only fields {enabled, kit, effect,
+// effectMix, master, voices} from the proposed edit (they regenerate at playback, never baked
+// into a stem). The commit layer applies this whenever the take has audio, so the lock is real
+// (not just a disabled input). bpm/timeSig live on the click config — see clickModel.lockClickEdit.
+export function lockDrumEdit(stored, proposed) {
+  const s = clampDrumConfig(stored);
+  const p = clampDrumConfig(proposed);
+  return clampDrumConfig({ ...p, swing: s.swing, pattern: s.pattern, source: s.source, sequence: s.sequence });
 }
 
 // ---- immutable pattern transforms (index-keyed edits, like songs.js) ----
@@ -282,13 +331,40 @@ export function setBars(config, bars) {
   return { ...cfg, pattern: { bars: nb, steps: STEPS_PER_BAR, grid } };
 }
 
+// Concatenate patterns end-to-end into one longer pattern (the drum-loop SEQUENCER's
+// flatten step: intro + each chosen main loop + outro -> one frozen grid). Every input
+// pattern shares this file's 16-equal-steps-per-bar grid, so gluing is just appending each
+// voice's cells in order; the result's bar count is the SUM. Nulls are skipped; an empty
+// list yields the 1-bar default. NOT capped here — the flatten cap (MAX_FLAT_BARS) is
+// applied by clampDrumConfig, so the raw concatenation stays lossless.
+export function concatPatterns(patterns) {
+  const list = (patterns || []).filter((p) => p && p.grid);
+  if (!list.length) return { bars: 1, steps: STEPS_PER_BAR, grid: emptyGrid(1) };
+  const grid = {};
+  for (const id of VOICE_IDS) grid[id] = [];
+  let bars = 0;
+  for (const p of list) {
+    const pb = Math.max(0, Math.floor(p.bars) || 0);
+    const len = pb * STEPS_PER_BAR;
+    for (const id of VOICE_IDS) {
+      const arr = Array.isArray(p.grid[id]) ? p.grid[id] : [];
+      for (let i = 0; i < len; i++) grid[id].push(clampNum(arr[i], 0, 1, 0));
+    }
+    bars += pb;
+  }
+  if (bars < 1) return { bars: 1, steps: STEPS_PER_BAR, grid: emptyGrid(1) };
+  return { bars, steps: STEPS_PER_BAR, grid };
+}
+
 // ---- MIDI import: SMF bytes -> a drum pattern on THIS kit's voices ----
-// Maps GM note-ons to voices, quantizes ticks to 16th steps, keeps the LOUDEST hit per cell,
-// and derives the bar count. Unmapped notes (and notes beyond the import cap) are collected
-// in `discarded` (surfaced in the UI). Returns { pattern, ppq, mappedCount, discarded }.
-export function smfToPattern(bytes) {
+// Maps GM note-ons to voices, quantizes ticks to 16 EQUAL cells per bar, keeps the LOUDEST
+// hit per cell, and derives the bar count. `timeSigIndex` sets the meter so the 16 cells span
+// the ACTUAL bar (barTicks/16) — 4/4 (the default) is ppq/4 exactly, so no regression; a 3/4
+// or 6/8 loop maps correctly instead of being stretched. Unmapped notes (and notes beyond the
+// import cap) go in `discarded`. Returns { pattern, ppq, mappedCount, discarded }.
+export function smfToPattern(bytes, timeSigIndex = 2) {
   const { ppq, tracks } = parseSMF(bytes);
-  const per16 = ppq / 4;
+  const per16 = barTicks(timeSigIndex, ppq) / STEPS_PER_BAR;
   const cap = MAX_BARS * STEPS_PER_BAR;
   const cells = {};            // voiceId -> Map(globalStep -> gain)
   const discarded = [];

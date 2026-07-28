@@ -19,6 +19,18 @@ import { makeClick } from './click.js';
 import { makeDrumMachine, renderDrumsOffline } from './drumMachine.js';
 import { loadKit, loadEffect } from './drumKits.js';
 import { CLIP_THRESHOLD } from './meterModel.js';
+import { barSeconds } from './clickModel.js';
+
+// The exact seconds a FLATTENED drum SEQUENCE take plays (its frozen intro+main+outro pattern,
+// once). 0 for a non-sequence take (single loop / grid), which loops for the take instead. This
+// is what makes a sequence play ONCE and stop, in both live playback and the offline bounce.
+function drumSequenceSeconds(take) {
+  const d = take && take.drums;
+  if (!d || !d.enabled || !(d.source && d.source.type === 'sequence')) return 0;
+  const bpm = (take.click && take.click.bpm) || 120;
+  const tsi = (take.click && take.click.timeSigIndex != null) ? take.click.timeSigIndex : 2;
+  return ((d.pattern && d.pattern.bars) || 0) * barSeconds(bpm, tsi);
+}
 
 const BOUNCE_RATE = 48000;
 const METER_INTERVAL_MS = 83; // ~12 Hz playback/monitor metering (setInterval, not rAF — PWA-throttle-proof)
@@ -135,6 +147,10 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   let clickEngine = null;     // the record-only count-in cue, null when off
   let drumMachine = null;     // the record-only drum BACKING (monitor bus), null when off. Playback
                               // drums live on playChains.drum instead (their own graph/dest).
+  let autoStopping = false;   // guards the sequence auto-stop so the worklet's {op:'ended'} and a
+                              // concurrent manual Stop can't both fire stop() for the same take.
+  let previewMachine = null;  // a throwaway drum machine for pre-record audition (no capture/take)
+  let previewTimer = null;
 
   // Stop + tear down the metronome count-in. Idempotent; called on Stop AND every teardown
   // path (interruption/dispose) so the cue can never outlive a recording pass.
@@ -276,7 +292,8 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   // ('measured'|'manual'|'none'). A measured/manual value aligns the overdub verbatim; when
   // uncalibrated ('none') the gate offset is AUTO-ESTIMATED from the live context + input track
   // (resolveMonitorLatencySec) instead of defaulting to 0 — see the shift computation below.
-  async function record({ slug, deviceId, routing, monitorLatencySec = 0, monitorLatencySource = 'none', existingTracks = [], clickConfig = null, drumConfig = null, folderHandle = null, onPassOpen }) {
+  async function record({ slug, deviceId, routing, monitorLatencySec = 0, monitorLatencySource = 'none', existingTracks = [], clickConfig = null, drumConfig = null, autoStopSec = null, folderHandle = null, onPassOpen }) {
+    autoStopping = false;
     const acquired = await devices.acquireForRecording(deviceId);
     if (!acquired.ok) { onStatus && onStatus({ type: 'blocked' }); return { ok: false, denied: true }; }
     mediaStream = acquired.stream;
@@ -355,6 +372,10 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
         onClock && onClock({ mode: 'record', elapsedSec: msg.frames / audioCtx.sampleRate, durationSec: null });
         return;
       }
+      // Sequence auto-stop: the worklet's endFrame gate reached the sequence end — run the
+      // NORMAL stop path (flush -> drain -> finalize -> onStatus('stopped')) so main.js
+      // finalizes the take with no extra plumbing. Guarded so a manual Stop can't double-fire.
+      if (msg.op === 'ended') { if (recording && !autoStopping) { autoStopping = true; stop('sequence-end'); } return; }
       if (!portTransferOk) {
         if (msg.op === 'append') takeStore.relayAppend(msg.stem, msg.bytes);
         else if (msg.op === 'drain') takeStore.relayDrain(msg.drainId); // relay the end-of-stream barrier too
@@ -409,7 +430,9 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
         // captured (the worklet records only the mic source). Loops for the whole take.
         drumMachine = makeDrumMachine({ ctx: audioCtx, dest: masterBus });
         drumMachine.load({ config: drumConfig, buffers: kitBuffers, irBuffer: drumIr, bpm, timeSigIndex });
-        drumMachine.start(musicStart, Infinity);
+        // A sequence take plays its flattened pattern ONCE for autoStopSec then stops; a
+        // single-loop/grid take loops for the whole take (Infinity).
+        drumMachine.start(musicStart, autoStopSec != null ? autoStopSec : Infinity);
       }
 
       if (overdub) startMonitorFromBuffers(monitorItems, musicStart);
@@ -427,7 +450,11 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
         inputLatency: settings.latency, // MediaTrackSettings.latency (seconds), may be undefined
       });
       const beginFrame = Math.round((musicStart + shift) * audioCtx.sampleRate);
-      node.port.postMessage({ op: 'begin', beginFrame });
+      // Sequence auto-stop: close the capture gate exactly autoStopSec after it opens, so the
+      // stem is EXACTLY the sequence length (sample-accurate), aligned to the drums. The worklet
+      // posts {op:'ended'} when it crosses endFrame; 0 = no auto-stop (record until manual Stop).
+      const endFrame = autoStopSec != null ? beginFrame + Math.round(autoStopSec * audioCtx.sampleRate) : 0;
+      node.port.postMessage({ op: 'begin', beginFrame, endFrame });
     }
 
     recording = true;
@@ -584,7 +611,9 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     stopPlaySources();
     const audioCtx = ctx;
     const startAt = audioCtx.currentTime + 0.1; // all stems start together -> sample-locked
-    const durationSec = maxKeyDuration(STEM_KEYS, take) || take.durationSec || 0;
+    const stemDur = maxKeyDuration(STEM_KEYS, take) || take.durationSec || 0;
+    const seqSec = drumSequenceSeconds(take);   // >0 only for a sequence take (else it loops)
+    const durationSec = Math.max(stemDur, seqSec);
     let any = false, primary = null;
     for (const key of STEM_KEYS) {
       const s = playChains.stems[key];
@@ -600,7 +629,9 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     if (any) {
       playState = { startAt, durationSec };
       startMeterLoop();
-      if (playChains.drum) playChains.drum.start(startAt, durationSec); // drums sample-locked to the stems (shared startAt)
+      // Sequence take: drums play their EXACT flattened length once (n%total never wraps, so no
+      // end-of-take stutter and the outro isn't cut). Single-loop/grid take: loop for the stems.
+      if (playChains.drum) playChains.drum.start(startAt, seqSec > 0 ? seqSec : stemDur);
     }
     if (primary) primary.onended = () => {
       onClock && onClock({ mode: 'play', elapsedSec: durationSec, durationSec }); // land the counter on the exact end
@@ -631,7 +662,11 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   // bounce and the per-track ping-pong bounce. Returns a Float32Array (mono) or
   // null if the take has no audio. Mono forever: no stereo/panning anywhere.
   async function renderMonoMix(keys, take, slug, opts = {}, folderHandle = null) {
-    const durationSec = maxKeyDuration(keys, take);
+    const stemDur = maxKeyDuration(keys, take);
+    // A sequence take's flattened pattern defines the arrangement length; extend the render to
+    // cover it (in case the outro rings past the stems) but only when drums are included.
+    const seqSec = opts.drums ? drumSequenceSeconds(take) : 0;
+    const durationSec = Math.max(stemDur, seqSec);
     const includeDrums = !!(opts.drums && take.drums && take.drums.enabled && durationSec > 0);
     const pad = includeDrums ? 0.5 : 0.05; // a late drum hit (crash) can ring past durationSec; comp tail otherwise
     const frames = Math.max(1, Math.ceil((durationSec + pad) * BOUNCE_RATE));
@@ -660,7 +695,8 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
       const irBuffer = await loadEffect(offlineCtx, take.drums.effect);
       const dbpm = (take.click && take.click.bpm) || 120;
       const dtsi = (take.click && take.click.timeSigIndex != null) ? take.click.timeSigIndex : 2;
-      renderDrumsOffline(offlineCtx, sumBus, { config: take.drums, buffers: kitBuffers, irBuffer, bpm: dbpm, timeSigIndex: dtsi, startAt: 0, durationSec });
+      // Sequence: render the drums for their EXACT length (play once); else the stem length (loop).
+      renderDrumsOffline(offlineCtx, sumBus, { config: take.drums, buffers: kitBuffers, irBuffer, bpm: dbpm, timeSigIndex: dtsi, startAt: 0, durationSec: seqSec > 0 ? seqSec : durationSec });
       any = true;
     }
     if (!any) return { mono: null, durationSec };
@@ -817,16 +853,38 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     return ctx ? { outputLatency: ctx.outputLatency, baseLatency: ctx.baseLatency } : { outputLatency: null, baseLatency: null };
   }
 
+  // ---- pre-record audition (Phase 8): play a config's pattern ONCE, no capture, no take ----
+  // Used by the DRUMS panel's ←/→ loop audition and the "preview sequence" button. Re-rolls are
+  // the CALLER's concern (it builds a fresh flattened config); this just sounds whatever it's given.
+  function stopPreview() {
+    if (previewTimer) { clearTimeout(previewTimer); previewTimer = null; }
+    if (previewMachine) { try { previewMachine.dispose(); } catch { /* already disposed */ } previewMachine = null; }
+  }
+  async function previewPattern({ config, bpm, timeSigIndex, durationSec }) {
+    const audioCtx = await ensureContext();
+    try { if (audioCtx.state !== 'running') await audioCtx.resume(); } catch { /* gesture-gated elsewhere */ }
+    const kitBuffers = await loadKit(audioCtx, config.kit);
+    const irBuffer = await loadEffect(audioCtx, config.effect);
+    stopPreview();
+    const machine = makeDrumMachine({ ctx: audioCtx, dest: masterBus });
+    machine.load({ config, buffers: kitBuffers, irBuffer, bpm, timeSigIndex });
+    const at = audioCtx.currentTime + 0.08;
+    machine.start(at, durationSec);
+    previewMachine = machine;
+    previewTimer = setTimeout(stopPreview, Math.max(200, (durationSec + 0.5) * 1000));
+  }
+
   function dispose() {
     if (recording) stop('interrupted');
     stopMeterLoop();
     stopClick();
     stopDrums();
     stopMonitor();
+    stopPreview();
     disposePlayback();
     if (wakeLock) { try { wakeLock.release(); } catch { /* already released */ } wakeLock = null; }
     if (ctx) { try { ctx.close(); } catch { /* already closed */ } ctx = null; masterBus = null; }
   }
 
-  return { probe, record, stop, play, replay, stopPlay, invalidatePlayback: disposePlayback, renderMaster, bounce, bounceTracks, applySettings, setMasterVol, calibrateLatency, getContextLatency, dispose };
+  return { probe, record, stop, play, replay, stopPlay, invalidatePlayback: disposePlayback, renderMaster, bounce, bounceTracks, applySettings, setMasterVol, calibrateLatency, getContextLatency, previewPattern, stopPreview, dispose };
 }

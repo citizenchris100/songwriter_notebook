@@ -1,0 +1,11 @@
+{
+  "id": "wander-65",
+  "name": "Wander 65",
+  "type": "markov",
+  "start": 1,
+  "transitions": {
+    "1": [{ "to": 1, "w": 0.325 }, { "to": 2, "w": 0.325 }, { "to": "any-other", "w": 0.35 }],
+    "2": [{ "to": 1, "w": 0.65 }, { "to": "any-other", "w": 0.35 }],
+    "default": [{ "to": "any", "w": 1 }]
+  }
+}

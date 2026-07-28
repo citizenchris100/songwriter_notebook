@@ -150,6 +150,10 @@ export async function deleteSongTakes(slug) {
 export async function deleteSongMidi(slug) {
   await call('deleteDir', { dir: 'midi/' + slug });
 }
+// Delete the song's OPFS loops-temp dir (sequencer loop scratch, copied to the folder on Save).
+export async function deleteSongLoops(slug) {
+  await call('deleteDir', { dir: 'loops/' + slug });
+}
 // Delete one arbitrary OPFS path (idempotent; a copied MIDI temp after Save). Best-effort.
 export async function deletePath(path) {
   await call('deleteFiles', { paths: [path] });

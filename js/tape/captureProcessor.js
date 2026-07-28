@@ -37,6 +37,11 @@ class CaptureProcessor extends AudioWorkletProcessor {
     // the first sample (a take's first pass, no monitoring). `currentFrame` is the
     // AudioContext sample clock, shared with the main thread that computes beginFrame.
     this.beginFrame = opts.beginFrame || 0;
+    // Sequence auto-stop gate: frames at/after endFrame are discarded, so the stem is EXACTLY
+    // endFrame-beginFrame samples (the drum-loop sequence length), sample-aligned to the drums.
+    // 0 = no auto-stop (record until the main thread's flush). Set with beginFrame via 'begin'.
+    this.endFrame = opts.endFrame || 0;
+    this.endedPosted = false;   // {op:'ended'} is posted once when the gate first crosses endFrame
     this.buffers = Array.from({ length: channelCount }, () => new Float32Array(CHUNK_FRAMES));
     this.cursor = 0;
     // Set true by {op:'flush'} on Stop. Once closed, process() returns FALSE so the
@@ -66,7 +71,7 @@ class CaptureProcessor extends AudioWorkletProcessor {
       const data = e.data;
       if (!data) return;
       if (data.port) { this.workerPort = data.port; return; }
-      if (data.op === 'begin' && typeof data.beginFrame === 'number') { this.beginFrame = data.beginFrame; return; }
+      if (data.op === 'begin' && typeof data.beginFrame === 'number') { this.beginFrame = data.beginFrame; if (typeof data.endFrame === 'number') this.endFrame = data.endFrame; return; }
       if (data.op === 'flush') {
         if (this.measure) {
           this.postMeasureChunk();
@@ -142,6 +147,12 @@ class CaptureProcessor extends AudioWorkletProcessor {
       }
       // Gate: don't commit to disk until the shared-timeline begin frame.
       if (currentFrame + i < this.beginFrame) continue;
+      // Auto-stop gate: at/after endFrame, commit nothing more (exact-length stem) and signal the
+      // main thread ONCE so it runs the normal Stop; stay alive to receive the ensuing flush.
+      if (this.endFrame > 0 && currentFrame + i >= this.endFrame) {
+        if (!this.endedPosted) { this.endedPosted = true; this.port.postMessage({ op: 'ended' }); }
+        continue;
+      }
       for (let c = 0; c < this.channelCount; c++) {
         const src = input[c] || input[0];
         this.buffers[c][this.cursor] = src[i];

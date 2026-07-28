@@ -19,23 +19,26 @@ const clampInt = (v, lo, hi, dflt) => {
 // the standalone app. `beats` = primary clicks per bar; "Off" = all beats equal, "On" =
 // accent the downbeat only, "a+b+c" = group the bar a|b|c and accent each group's first
 // beat (downbeat strongest). The ♩. entries are the compound meters with a fixed grouping.
+// `den` = the meter's denominator (note value of the beat), added for the drum sequencer's
+// tick math (barTicks); `beats` is the numerator. barSeconds uses only `beats`, so `den` is
+// purely additive and does not change the click/count-in timing.
 export const TIME_SIGS = [
-  { label: '2/4', beats: 2, accents: ['Off', 'On'] },
-  { label: '3/4', beats: 3, accents: ['Off', 'On'] },
-  { label: '4/4', beats: 4, accents: ['Off', 'On'] },
-  { label: '5/4', beats: 5, accents: ['Off', 'On', '3+2', '2+3'] },
-  { label: '5/8', beats: 5, accents: ['Off', 'On', '3+2', '2+3'] },
-  { label: '6/8', beats: 6, accents: ['Off', 'On', '3+3', '2+2+2'] },
-  { label: '6/8 ♩.', beats: 6, accents: ['Off', '3+3'] },
-  { label: '7/8', beats: 7, accents: ['Off', 'On', '3+4', '4+3', '3+2+2', '2+2+3'] },
-  { label: '8/8', beats: 8, accents: ['Off', 'On', '3+3+2'] },
-  { label: '9/8', beats: 9, accents: ['Off', 'On', '3+3+3', '4+3+2', '3+4+2', '4+5', '4+2+3'] },
-  { label: '9/8 ♩.', beats: 9, accents: ['Off', '3+3+3'] },
-  { label: '10/8', beats: 10, accents: ['Off', 'On', '3+3+2+2', '2+2+3+3'] },
-  { label: '11/8', beats: 11, accents: ['Off', 'On', '3+3+3+2', '4+4+3', '2+2+3+4'] },
-  { label: '12/8', beats: 12, accents: ['Off', 'On', '3+3+3+3', '3+3+2+2+2', '3+2+3+2+2', '3+2+3+4'] },
-  { label: '12/8 ♩.', beats: 12, accents: ['Off', '3+3+3+3'] },
-  { label: '13/8', beats: 13, accents: ['Off', 'On', '3+3+3+2+2', '4+4+3+2', '4+3+4+2', '3+4+2+4'] },
+  { label: '2/4', beats: 2, den: 4, accents: ['Off', 'On'] },
+  { label: '3/4', beats: 3, den: 4, accents: ['Off', 'On'] },
+  { label: '4/4', beats: 4, den: 4, accents: ['Off', 'On'] },
+  { label: '5/4', beats: 5, den: 4, accents: ['Off', 'On', '3+2', '2+3'] },
+  { label: '5/8', beats: 5, den: 8, accents: ['Off', 'On', '3+2', '2+3'] },
+  { label: '6/8', beats: 6, den: 8, accents: ['Off', 'On', '3+3', '2+2+2'] },
+  { label: '6/8 ♩.', beats: 6, den: 8, accents: ['Off', '3+3'] },
+  { label: '7/8', beats: 7, den: 8, accents: ['Off', 'On', '3+4', '4+3', '3+2+2', '2+2+3'] },
+  { label: '8/8', beats: 8, den: 8, accents: ['Off', 'On', '3+3+2'] },
+  { label: '9/8', beats: 9, den: 8, accents: ['Off', 'On', '3+3+3', '4+3+2', '3+4+2', '4+5', '4+2+3'] },
+  { label: '9/8 ♩.', beats: 9, den: 8, accents: ['Off', '3+3+3'] },
+  { label: '10/8', beats: 10, den: 8, accents: ['Off', 'On', '3+3+2+2', '2+2+3+3'] },
+  { label: '11/8', beats: 11, den: 8, accents: ['Off', 'On', '3+3+3+2', '4+4+3', '2+2+3+4'] },
+  { label: '12/8', beats: 12, den: 8, accents: ['Off', 'On', '3+3+3+3', '3+3+2+2+2', '3+2+3+2+2', '3+2+3+4'] },
+  { label: '12/8 ♩.', beats: 12, den: 8, accents: ['Off', '3+3+3+3'] },
+  { label: '13/8', beats: 13, den: 8, accents: ['Off', 'On', '3+3+3+2+2', '4+4+3+2', '4+3+4+2', '3+4+2+4'] },
 ];
 
 export const SUBS = [
@@ -83,6 +86,15 @@ export function countInSeconds(bpm, timeSigIndex, bars = 2) {
   return bars * barSeconds(bpm, timeSigIndex);
 }
 
+// Ticks in one bar of the given meter, at PPQ resolution: ppq * numerator * 4 / denominator
+// (4/4 -> 4*ppq, 6/8 -> 3*ppq). The drum-loop sequencer quantizes each loop into 16 EQUAL
+// cells of a bar, so a cell is barTicks/16 — meter-correct for any TIME_SIGS entry (the
+// single-meter analogue of the auditioner's smf.barTicks). Tempo-independent.
+export function barTicks(timeSigIndex, ppq) {
+  const m = TIME_SIGS[timeSigIndex] || TIME_SIGS[0];
+  return Math.round((ppq * m.beats * 4) / (m.den || 4));
+}
+
 // The first non-"Off" accent option (the standalone app's default: "On", or the fixed
 // grouping for a ♩. meter). Matches index.html defaultAccent().
 export function defaultAccentIndex(timeSigIndex) {
@@ -120,4 +132,13 @@ export function clampClickConfig(c) {
     subdivision: clampInt(src.subdivision, 1, 4, 1),
     accentIndex,
   };
+}
+
+// Editing a RECORDED take's click: bpm + timeSigIndex are LOCKED (the audio is physically fixed
+// at that tempo/meter). Preserve them from the stored config; take the rest from the proposed
+// edit. The commit layer applies this whenever the take has audio, matching drumModel.lockDrumEdit.
+export function lockClickEdit(stored, proposed) {
+  const s = clampClickConfig(stored);
+  const p = clampClickConfig(proposed);
+  return clampClickConfig({ ...p, bpm: s.bpm, timeSigIndex: s.timeSigIndex });
 }

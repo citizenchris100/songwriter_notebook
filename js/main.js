@@ -25,8 +25,11 @@ import * as audioStore from './audioStore.js';
 import { chordFromRootAndQuality } from './theory/roman.js';
 import * as takeModel from './tape/takeModel.js';
 import * as meterModel from './tape/meterModel.js';
-import { clampClickConfig, defaultClickConfig } from './tape/clickModel.js';
-import { clampDrumConfig, defaultDrumConfig, toggleCell, setBars, smfToPattern } from './tape/drumModel.js';
+import { clampClickConfig, defaultClickConfig, lockClickEdit, barSeconds } from './tape/clickModel.js';
+import { clampDrumConfig, defaultDrumConfig, toggleCell, setBars, smfToPattern, lockDrumEdit, MAX_FLAT_BARS } from './tape/drumModel.js';
+import { realizeSequence, flattenRealizedSequence, sequenceBars, validateRuleset, normalizeRuleset } from './tape/rulesetModel.js';
+import { makeLoopPicker, makeSingleMidiPicker } from './tape/loopPicker.js';
+import { loadBuiltinRulesets, loadUserRulesets, saveUserRulesets } from './tape/rulesetStore.js';
 import * as takeStore from './tape/takeStore.js';
 import * as folderStore from './tape/folderStore.js';
 import { SIZE_FIELDS } from './tape/wav.js';
@@ -107,6 +110,18 @@ let deckClickDraft = null;     // the editable metronome config for a NEW take (
 let deckDrumDraft = null;      // the editable drum config for a NEW take (last-used default)
 let deckDrumBar = 0;           // which bar of a multi-bar drum pattern the grid is showing (UI-local)
 let stemSettingsDebounce = null;
+// ---- drum-loop sequencer (new-take authoring; frozen onto the take at record) ----
+let deckDrumMode = 'single';   // 'single' (import/grid) | 'sequence' — the DRUMS panel mode for a new take
+let deckSequenceDraft = null;  // the sequencer SPEC + parsed patterns for a new take (makeEmptySequenceDraft)
+let deckLoopAuditionIndex = 0; // ←/→ audition cursor over [intro?, main loops…, outro?]
+let builtinRulesets = [];      // loaded once from assets/rulesets/ at boot
+let deckRulesets = [];         // normalized builtin+user rulesets (user overrides same id), for the dropdown + roll
+let deckSequenceReject = null; // last folder-pick rejection { reason, offenders, expected }, to show the reminder
+let loopPicker = null, introPicker = null, outroPicker = null; // lazily-created (they append hidden <input>s)
+
+function makeEmptySequenceDraft() {
+  return { folderName: null, loopFiles: [], loopPatterns: [], introName: null, introPattern: null, outroName: null, outroPattern: null, algorithmId: null, count: 8 };
+}
 
 function recompute() {
   const merged = mergeFeels(builtinFeels, userFeels);
@@ -151,6 +166,10 @@ function resetTapeDeckUi() {
   deckClickDraft = null;
   deckDrumDraft = null;
   deckDrumBar = 0;
+  deckDrumMode = 'single';
+  deckSequenceDraft = null;
+  deckLoopAuditionIndex = 0;
+  deckSequenceReject = null;
   clearTimeout(stemSettingsDebounce);
 }
 
@@ -234,6 +253,23 @@ function tapeDeckViewModel(active) {
     ? ((loadedTake && loadedTake.drums) || defaultDrumConfig())
     : (deckDrumDraft || readDrumDefault());
 
+  // ---- drum-loop sequencer slice ----
+  // A recorded take shows its FROZEN sequence read-only (drumOnTake); a new take shows the
+  // editable draft. drumMode picks the panel face (single import/grid vs the sequencer).
+  const recordedSeq = (drumOnTake && drumConfig.source && drumConfig.source.type === 'sequence') ? drumConfig.sequence : null;
+  const drumMode = drumOnTake ? (recordedSeq ? 'sequence' : 'single') : deckDrumMode;
+  const sd = deckSequenceDraft;
+  const sequenceDraft = sd ? {
+    folderName: sd.folderName,
+    loopCount: sd.loopFiles.length,
+    loopFiles: sd.loopFiles.slice(),
+    loopBars: sd.loopPatterns.map((p) => p.bars),
+    introName: sd.introName, introBars: sd.introPattern ? sd.introPattern.bars : 0,
+    outroName: sd.outroName, outroBars: sd.outroPattern ? sd.outroPattern.bars : 0,
+    algorithmId: sd.algorithmId,
+    count: sd.count,
+  } : null;
+
   // The number shown in the LED counter window.
   const counterTakeNo = loadedTake ? loadedTake.take : (pendingNewTake ? takeModel.nextTakeNumber(deckManifest) : (currentTake || null));
 
@@ -284,6 +320,12 @@ function tapeDeckViewModel(active) {
     drumConfig,
     drumOnTake,
     drumBar: deckDrumBar,
+    drumMode,
+    rulesets: deckRulesets.map((r) => ({ id: r.id, name: r.name, type: r.type })),
+    sequenceDraft,
+    recordedSequence: recordedSeq,
+    sequenceReject: deckSequenceReject,
+    loopAuditionIndex: deckLoopAuditionIndex,
     masterVol: readMasterVol(),
     panelOpen: deckPanelOpen,
     logOpen: deckLogOpen,
@@ -812,7 +854,11 @@ function persistDeckManifest() {
 function commitDrums(next) {
   const t = editingDeckTake();
   if (t) {
-    deckManifest = { ...deckManifest, takes: deckManifest.takes.map((x) => (x.take === t.take ? { ...x, drums: next } : x)) };
+    // Model-level lock: a recorded take's swing/pattern/source/sequence are immutable (they'd
+    // drift the frozen drums against the cut audio); only sound-only fields apply. Not just a
+    // disabled input — this is the real guard (also stops the legacy swing-post-record leak).
+    const safe = lockDrumEdit(t.drums, next);
+    deckManifest = { ...deckManifest, takes: deckManifest.takes.map((x) => (x.take === t.take ? { ...x, drums: safe } : x)) };
     persistDeckManifest();
     if (tapeDeck) tapeDeck.invalidatePlayback();
   } else { deckDrumDraft = next; writeDrumDefault(next); }
@@ -821,7 +867,8 @@ function commitDrums(next) {
 function commitClick(next) {
   const t = editingDeckTake();
   if (t) {
-    deckManifest = { ...deckManifest, takes: deckManifest.takes.map((x) => (x.take === t.take ? { ...x, click: next } : x)) };
+    const safe = lockClickEdit(t.click, next);   // bpm + timeSig locked once recorded
+    deckManifest = { ...deckManifest, takes: deckManifest.takes.map((x) => (x.take === t.take ? { ...x, click: safe } : x)) };
     persistDeckManifest();
     if (tapeDeck) tapeDeck.invalidatePlayback();
   } else { deckClickDraft = next; writeClickDefault(next); }
@@ -998,6 +1045,79 @@ async function refreshSpaceWarning() {
 // async onPassOpen callback, well after getUserMedia/worklet-load have started,
 // leaving a window for a fast double-tap to arm two passes off the same stale
 // manifest snapshot.
+// Roll the drum sequence ONCE and FREEZE it into a drum config for a new take (the algorithm's
+// only impure roll — Math.random injected here so the pure model stays testable). Returns
+// { ok, drumConfig, autoStopSec } or { ok:false, message } for a fail-fast BEFORE recording
+// starts (so a bad ruleset can never strand the deck). realizeSequence is total, so it never
+// throws; the guards here are for missing folder/algorithm and an over-long sequence.
+function buildFrozenSequence(clickCfg) {
+  const sd = deckSequenceDraft;
+  if (!sd || !sd.loopFiles.length) return { ok: false, message: 'Pick a main-section loop folder first.' };
+  if (!sd.algorithmId) return { ok: false, message: 'Choose a playback algorithm first.' };
+  const ruleset = deckRulesets.find((r) => r.id === sd.algorithmId);
+  if (!ruleset) return { ok: false, message: 'That algorithm is no longer available — pick another.' };
+  const count = Math.max(1, sd.count | 0);
+  const { order } = realizeSequence(sd.loopFiles.length, ruleset, count, Math.random);
+  const loopMap = {};
+  sd.loopPatterns.forEach((p, i) => { loopMap[i + 1] = p; });
+  const flat = flattenRealizedSequence(order, { introPattern: sd.introPattern, loopPatterns: loopMap, outroPattern: sd.outroPattern });
+  if (flat.bars > MAX_FLAT_BARS) return { ok: false, message: 'Sequence is too long (' + flat.bars + ' bars, max ' + MAX_FLAT_BARS + '). Lower the count.' };
+  const bpm = (clickCfg && clickCfg.bpm) || 120;
+  const tsi = (clickCfg && clickCfg.timeSigIndex != null) ? clickCfg.timeSigIndex : 2;
+  const sequence = {
+    folderName: sd.folderName || '', loopFiles: sd.loopFiles.slice(), algorithmId: sd.algorithmId,
+    count, intro: sd.introName || null, outro: sd.outroName || null,
+    timeSigIndex: tsi, realizedOrder: order, realizedBars: flat.bars,
+  };
+  const base = deckDrumDraft || readDrumDefault();
+  const drumConfig = clampDrumConfig({ ...base, enabled: true, pattern: flat, source: { type: 'sequence' }, sequence });
+  return { ok: true, drumConfig, autoStopSec: flat.bars * barSeconds(bpm, tsi) };
+}
+
+// Merge builtin + user rulesets (a user ruleset overrides a builtin of the same id), for the
+// Algorithm dropdown and the record-time roll. Called at boot and after every import/delete.
+function refreshRulesets() {
+  const byId = new Map(builtinRulesets.map((r) => [r.id, r]));
+  for (const u of loadUserRulesets()) byId.set(u.id, u);
+  deckRulesets = [...byId.values()];
+}
+
+// Archive a picked intro/outro .mid to the song's OPFS loops temp + parse it (in the take's
+// meter) into the draft. Parse BEFORE writeFile (writeFile transfers/detaches the buffer).
+async function setSequenceIntroOutro(kind, name, getBytes) {
+  const a = activeSong(); if (!a || !a.id) return;
+  if (!deckSequenceDraft) deckSequenceDraft = makeEmptySequenceDraft();
+  const tsi = currentClickBase().timeSigIndex != null ? currentClickBase().timeSigIndex : 2;
+  const bytes = await getBytes();
+  const pattern = smfToPattern(bytes, tsi).pattern;
+  try { await takeStore.writeFile(takeModel.loopsRef(a.id) + name, bytes.buffer); } catch { /* temp write failed; pattern still loads */ }
+  if (kind === 'intro') { deckSequenceDraft.introName = name; deckSequenceDraft.introPattern = pattern; }
+  else { deckSequenceDraft.outroName = name; deckSequenceDraft.outroPattern = pattern; }
+  render();
+}
+
+// The ←/→ audition list: [intro?, each main loop…, outro?].
+function auditionListFor(sd) {
+  const list = [];
+  if (!sd) return list;
+  if (sd.introPattern) list.push({ kind: 'intro', name: sd.introName, pattern: sd.introPattern });
+  sd.loopPatterns.forEach((p, i) => list.push({ kind: 'loop', name: sd.loopFiles[i], pattern: p }));
+  if (sd.outroPattern) list.push({ kind: 'outro', name: sd.outroName, pattern: sd.outroPattern });
+  return list;
+}
+// Preview the currently-highlighted audition item once (no capture), via the throwaway machine.
+function auditionPlayCurrent() {
+  const list = auditionListFor(deckSequenceDraft);
+  if (!list.length) return;
+  const idx = Math.max(0, Math.min(list.length - 1, deckLoopAuditionIndex));
+  const item = list[idx];
+  const click = currentClickBase();
+  const bpm = click.bpm || 120, tsi = click.timeSigIndex != null ? click.timeSigIndex : 2;
+  const base = deckDrumDraft || readDrumDefault();
+  const cfg = clampDrumConfig({ ...base, enabled: true, pattern: item.pattern, source: { type: 'grid' } });
+  ensureTapeDeck().previewPattern({ config: cfg, bpm, timeSigIndex: tsi, durationSec: item.pattern.bars * barSeconds(bpm, tsi) });
+}
+
 async function armRecording() {
   if (deckArming || deckRecording || deckSaving) return;
   const a = activeSong();
@@ -1050,7 +1170,16 @@ async function armRecording() {
   // The drum backing for this pass: the new-take draft for a first pass, else the take's locked
   // drums (overdubs share the take's backing). Drives the record-time drum machine + is stamped
   // onto the take at creation. bpm/meter come from the click config (shared tempo).
-  const drumCfg = isNew ? (deckDrumDraft || readDrumDefault()) : (baseTake && baseTake.drums);
+  let drumCfg = isNew ? (deckDrumDraft || readDrumDefault()) : (baseTake && baseTake.drums);
+  // A new take in SEQUENCE mode rolls + flattens the sequence NOW (fail-fast before recording),
+  // freezing it onto the take; autoStopSec makes the record auto-stop at the sequence end.
+  let autoStopSec = null;
+  if (isNew && deckDrumMode === 'sequence') {
+    const built = buildFrozenSequence(clickCfg);
+    if (!built.ok) { deckArming = false; deckStatus = { type: 'warn', message: built.message }; render(); return; }
+    drumCfg = built.drumConfig;
+    autoStopSec = built.autoStopSec;
+  }
 
   let started = false;
   try {
@@ -1063,6 +1192,7 @@ async function armRecording() {
       existingTracks,
       clickConfig: clickCfg,
       drumConfig: drumCfg,
+      autoStopSec,
       folderHandle,
       onPassOpen: async (capture, sampleRate) => {
         // Resolve this pass's destination slots from the routing (skip null/discard
@@ -1302,7 +1432,7 @@ const handlers = {
       if (gone && gone.sketches && gone.sketches.length) audioStore.deleteMany(gone.sketches.map((sk) => sk.id)).catch(() => {});
       // §5.7: also GC its OPFS take directory (no boot-time GC, D30 — deletion is
       // the one place a song's takes get removed, immediately, with confirm).
-      if (gone && gone.tapeDeck) { takeStore.deleteSongTakes(gone.id).catch(() => {}); takeStore.deleteSongMidi(gone.id).catch(() => {}); }
+      if (gone && gone.tapeDeck) { takeStore.deleteSongTakes(gone.id).catch(() => {}); takeStore.deleteSongMidi(gone.id).catch(() => {}); takeStore.deleteSongLoops(gone.id).catch(() => {}); }
     },
 
     // Save the current song's .json. Linked + File System Access → overwrite in place,
@@ -1625,6 +1755,83 @@ const handlers = {
       }
     },
 
+    // ---- drum-loop sequencer (new-take authoring) ----
+    onSetDrumMode: (mode) => {
+      deckDrumMode = mode === 'sequence' ? 'sequence' : 'single';
+      if (deckDrumMode === 'sequence' && !deckSequenceDraft) deckSequenceDraft = makeEmptySequenceDraft();
+      render();
+    },
+    onPickLoopFolder: () => {
+      const a = activeSong(); if (!a || !a.id) return;
+      if (!loopPicker) loopPicker = makeLoopPicker({
+        onFolder: async ({ folderName, files }) => {
+          const song = activeSong(); if (!song || !song.id) return;
+          const tsi = currentClickBase().timeSigIndex != null ? currentClickBase().timeSigIndex : 2;
+          const loopFiles = [], loopPatterns = [];
+          for (const f of files) {
+            const bytes = await f.getBytes();
+            const pattern = smfToPattern(bytes, tsi).pattern;   // parse BEFORE writeFile (buffer transfer)
+            try { await takeStore.writeFile(takeModel.loopsRef(song.id) + folderName + '/' + f.name, bytes.buffer); } catch { /* temp write failed; pattern still loads */ }
+            loopFiles.push(f.name); loopPatterns.push(pattern);
+          }
+          if (!deckSequenceDraft) deckSequenceDraft = makeEmptySequenceDraft();
+          deckSequenceDraft.folderName = folderName;
+          deckSequenceDraft.loopFiles = loopFiles;
+          deckSequenceDraft.loopPatterns = loopPatterns;
+          deckSequenceReject = null;
+          deckLoopAuditionIndex = 0;
+          deckDrumMode = 'sequence';
+          deckStatus = { type: 'info', message: loopFiles.length + ' loop' + (loopFiles.length === 1 ? '' : 's') + ' loaded from “' + folderName + '”.' };
+          render();
+        },
+        onReject: ({ reason, offenders, expected }) => {
+          deckSequenceReject = { reason, offenders, expected };
+          deckStatus = { type: 'warn', message:
+            reason === 'empty' ? 'No .mid files in that folder.'
+              : reason === 'gaps' ? ('Loops must be a gapless set ' + expected + '.mid.')
+              : ('Loops must be named 001.mid, 002.mid… (offenders: ' + (offenders || []).slice(0, 3).join(', ') + ').') };
+          render();
+        },
+      });
+      loopPicker.open();
+    },
+    onPickIntro: () => { if (!introPicker) introPicker = makeSingleMidiPicker({ onFile: ({ name, getBytes }) => setSequenceIntroOutro('intro', name, getBytes) }); introPicker.open(); },
+    onPickOutro: () => { if (!outroPicker) outroPicker = makeSingleMidiPicker({ onFile: ({ name, getBytes }) => setSequenceIntroOutro('outro', name, getBytes) }); outroPicker.open(); },
+    onClearIntro: () => { if (deckSequenceDraft) { deckSequenceDraft.introName = null; deckSequenceDraft.introPattern = null; deckLoopAuditionIndex = 0; render(); } },
+    onClearOutro: () => { if (deckSequenceDraft) { deckSequenceDraft.outroName = null; deckSequenceDraft.outroPattern = null; deckLoopAuditionIndex = 0; render(); } },
+    onAuditionStep: (delta) => {
+      const n = auditionListFor(deckSequenceDraft).length;
+      if (!n) return;
+      deckLoopAuditionIndex = (((deckLoopAuditionIndex + delta) % n) + n) % n;
+      render();
+      auditionPlayCurrent();
+    },
+    onAuditionPlay: () => auditionPlayCurrent(),
+    onSetAlgorithm: (id) => { if (!deckSequenceDraft) deckSequenceDraft = makeEmptySequenceDraft(); deckSequenceDraft.algorithmId = id || null; render(); },
+    onSetSequenceCount: (n) => { if (!deckSequenceDraft) deckSequenceDraft = makeEmptySequenceDraft(); deckSequenceDraft.count = Math.max(1, Math.min(MAX_FLAT_BARS, n | 0)); render(); },
+    onPreviewSequence: () => {
+      const click = currentClickBase();
+      const built = buildFrozenSequence(click);   // a FRESH roll each time (never persisted — record freezes its own)
+      if (!built.ok) { deckStatus = { type: 'warn', message: built.message }; render(); return; }
+      const bpm = click.bpm || 120, tsi = click.timeSigIndex != null ? click.timeSigIndex : 2;
+      ensureTapeDeck().previewPattern({ config: built.drumConfig, bpm, timeSigIndex: tsi, durationSec: built.drumConfig.pattern.bars * barSeconds(bpm, tsi) });
+      const seq = built.drumConfig.sequence;
+      deckStatus = { type: 'info', message: 'Preview: ' + seq.realizedBars + ' bars — ' + seq.realizedOrder.join('→') };
+      render();
+    },
+    onImportRuleset: (text) => {
+      let obj; try { obj = JSON.parse(text); } catch { deckStatus = { type: 'error', message: 'That is not valid JSON.' }; render(); return; }
+      const v = validateRuleset(obj);
+      if (!v.ok) { deckStatus = { type: 'error', message: 'Invalid ruleset: ' + v.errors[0] }; render(); return; }
+      const r = normalizeRuleset(obj);
+      saveUserRulesets(loadUserRulesets().filter((u) => u.id !== r.id).concat(r));
+      refreshRulesets();
+      if (deckSequenceDraft && !deckSequenceDraft.algorithmId) deckSequenceDraft.algorithmId = r.id;
+      deckStatus = { type: 'info', message: 'Ruleset “' + r.name + '” imported.' };
+      render();
+    },
+    onDeleteRuleset: (id) => { saveUserRulesets(loadUserRulesets().filter((u) => u.id !== id)); refreshRulesets(); render(); },
+
     onStopTake: async () => {
       if (!tapeDeck || !deckRecording) return;
       // stop() resolves after onStatus('stopped',...) has already finalized the manifest
@@ -1896,6 +2103,17 @@ const handlers = {
           takeStore.deletePath(rel).catch(() => {});
         }
 
+        // 2b. Same for each sequencer loop file (loops/<slug>/<folder>/NNN.mid + intro/outro). These
+        //     are provenance only (playback runs the frozen flattened pattern), but they travel so a
+        //     re-opened song can start a new take from the same folder.
+        for (const rel0 of takeModel.referencedLoopFiles(next)) {
+          const rel = takeModel.loopsRef(slug) + rel0;
+          let bytes;
+          try { bytes = await takeStore.readFile(rel); } catch { continue; }
+          await folderStore.writeFile(dir, rel, bytes);
+          takeStore.deletePath(rel).catch(() => {});
+        }
+
         // 3. Commit: folder manifest FIRST (the durable rebuild source), then the OPFS working index.
         await folderStore.writeFile(dir, manifestPath(slug), JSON.stringify(next, null, 2));
         await takeStore.writeManifest(manifestPath(slug), next);
@@ -1981,6 +2199,8 @@ const handlers = {
   builtinIds = builtin.ids;
   userFeels = loadUserFeels();
   recompute();
+  try { builtinRulesets = (await loadBuiltinRulesets()).rulesets; } catch { builtinRulesets = []; }
+  refreshRulesets();
 
   if (!feelList.length) {
     rootEl.textContent = '';

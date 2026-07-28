@@ -122,8 +122,8 @@ export async function deleteFile(dir, relPath) {
 }
 
 // The ONE destructive whole-song wipe, hard-scoped to a single song id: it can only
-// ever remove takes/<id>/, midi/<id>/, and <id>.json — never the granted folder
-// root and never another song sharing the folder. Idempotent (missing = fine).
+// ever remove takes/<id>/, midi/<id>/, loops/<id>/, and <id>.json — never the granted
+// folder root and never another song sharing the folder. Idempotent (missing = fine).
 export async function deleteSongArtifacts(dir, songId) {
   const id = String(songId || '');
   if (!id || id.includes('/') || id === '.' || id === '..') throw new Error('folderStore: bad songId ' + songId);
@@ -137,5 +137,6 @@ export async function deleteSongArtifacts(dir, songId) {
   };
   await removeUnder(['takes'], id, { recursive: true });
   await removeUnder(['midi'], id, { recursive: true });
+  await removeUnder(['loops'], id, { recursive: true });
   await removeUnder([], id + '.json', {});
 }

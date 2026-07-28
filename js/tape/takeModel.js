@@ -416,6 +416,42 @@ export function setDrumMidiFile(manifest, takeNo, name) {
   });
 }
 
+// ---- drum-loop archival (the sequencer's picked loops travel with the song) ----
+
+// The song's on-disk loops subdir (sibling of takes/<slug>/ and midi/<slug>/), id-namespaced.
+export function loopsRef(slug) {
+  return 'loops/' + slug + '/';
+}
+
+// Every loop-file path (relative under loops/<slug>/) referenced by any take's drum sequence:
+// each main-folder loop as `<folderName>/<file>`, plus the intro/outro filenames. Save copies
+// these OPFS->folder and Delete cleans them up. Playback never reads them — they are
+// provenance/re-derivation only, so a stale one is cosmetic, not a broken take.
+export function referencedLoopFiles(manifest) {
+  const out = new Set();
+  for (const t of (manifest && manifest.takes) || []) {
+    const seq = t && t.drums && t.drums.sequence;
+    if (!seq) continue;
+    const folder = typeof seq.folderName === 'string' ? seq.folderName : '';
+    for (const f of Array.isArray(seq.loopFiles) ? seq.loopFiles : []) {
+      if (typeof f === 'string' && f) out.add(folder ? folder + '/' + f : f);
+    }
+    if (typeof seq.intro === 'string' && seq.intro) out.add(seq.intro);
+    if (typeof seq.outro === 'string' && seq.outro) out.add(seq.outro);
+  }
+  return out;
+}
+
+// Freeze a realized sequence + its flattened pattern onto a take's drum config (source
+// becomes 'sequence', drums enabled). Mirrors setDrumMidiFile; the record path also builds
+// this same shape directly for makeTake, so this is the immutable-transform equivalent.
+export function setDrumSequence(manifest, takeNo, sequence, pattern) {
+  return mapTake(manifest, takeNo, (t) => {
+    const drums = t.drums || defaultDrumConfig();
+    return { ...t, drums: clampDrumConfig({ ...drums, enabled: true, pattern, source: { type: 'sequence' }, sequence }) };
+  });
+}
+
 // The take that loads when a deck opens (AC-11): the highest-numbered ACTIVE take
 // that still has audio (an emptied post-discard container is not auto-loaded).
 export function mostRecentKeptTake(manifest) {

@@ -33,6 +33,7 @@ import {
   nextGroup, lastGroupSlotKeys, freeSlotKeys, filledSlotKeys, maxSlotDuration, takeHasAudio,
   slotHasAudio, slotLoc, defaultRouting, stemFileName, mixFileName, tapeDeckRef, playbackCacheStale,
   pendingOpfsSlotKeys, takeIsSaved, migrateTakeSlots, revertSlotToOpfs, midiRef, referencedMidiFiles, setDrumMidiFile,
+  loopsRef, referencedLoopFiles, setDrumSequence,
   defaultStemSettings, clampStemSettings, compressorParams, bounceGainDb,
   LUFS_TARGET, LUFS_FLOOR, BOUNCE_GAIN_DB_MIN, BOUNCE_GAIN_DB_MAX, LIMITER_CEILING_DB,
   STEM_KEYS, MAX_TRACKS, TAKE_STATUS,
@@ -47,7 +48,7 @@ import {
 } from './js/tape/latency.js';
 import {
   TIME_SIGS, SUBS, MIN_BPM, MAX_BPM, computeLevels, accentGroups,
-  barSeconds, countInSeconds, defaultAccentIndex, defaultClickConfig, clampClickConfig,
+  barSeconds, countInSeconds, barTicks, defaultAccentIndex, defaultClickConfig, clampClickConfig, lockClickEdit,
 } from './js/tape/clickModel.js';
 import {
   CLIP_THRESHOLD, METER_TOP_DB, METER_FLOOR_DB, FALL_DB_PER_SEC, CLIP_HOLD_MS,
@@ -57,9 +58,16 @@ import {
   STEPS_PER_BAR, SWING_MAX, VOICES, VOICE_IDS, KIT_IDS, EFFECT_IDS, voiceForNote,
   stepSeconds, hitTime, cellOf, velocityFromMidi, quantizeTick, drumHitsUntil,
   defaultDrumConfig, clampDrumConfig, validateDrumConfig, toggleCell, setCellVelocity, setBars,
-  smfToPattern,
+  smfToPattern, concatPatterns, MAX_FLAT_BARS, lockDrumEdit,
 } from './js/tape/drumModel.js';
 import { readVarLen, parseSMF, notesFromSMF } from './js/tape/midiParse.js';
+import {
+  RULESET_TYPES, validateRuleset, normalizeRuleset, realizeSequence,
+  flattenRealizedSequence, sequenceBars,
+} from './js/tape/rulesetModel.js';
+import {
+  LOOP_NAME_RE, isLoopName, loopNumber, sortLoopNames, validateLoopFolderNames,
+} from './js/tape/loopFolder.js';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const readJSON = (p) => JSON.parse(readFileSync(here(p), 'utf8'));
@@ -976,7 +984,7 @@ eq('resolve is 0 when uncalibrated AND no context data',
 // ============================================================================
 // 18. Tape deck — sw.js caches every new module (tape/… asset-list assertion)
 // ============================================================================
-for (const f of ['tape/takeModel', 'tape/meterModel', 'tape/clickModel', 'tape/click', 'tape/wav', 'tape/lufs', 'tape/limiter', 'tape/latency', 'tape/audioEngine', 'tape/takeStore', 'tape/folderStore', 'tape/opfsWorker', 'tape/captureProcessor', 'tape/devices', 'tape/deckControls', 'tape/tapeView', 'tape/drumModel', 'tape/midiParse', 'tape/drumKits', 'tape/drumMachine', 'tape/drumPanel']) {
+for (const f of ['tape/takeModel', 'tape/meterModel', 'tape/clickModel', 'tape/click', 'tape/wav', 'tape/lufs', 'tape/limiter', 'tape/latency', 'tape/audioEngine', 'tape/takeStore', 'tape/folderStore', 'tape/opfsWorker', 'tape/captureProcessor', 'tape/devices', 'tape/deckControls', 'tape/tapeView', 'tape/drumModel', 'tape/midiParse', 'tape/drumKits', 'tape/drumMachine', 'tape/drumPanel', 'tape/rulesetModel', 'tape/rulesetStore', 'tape/loopFolder', 'tape/loopPicker']) {
   ok('sw.js caches ' + f + '.js', sw.includes(`"./js/${f}.js"`));
 }
 
@@ -1606,6 +1614,292 @@ eq('legacy take normalizes drums to disabled', legacyDrums.drums.enabled, false)
 ok('legacy take drums has a kit', typeof legacyDrums.drums.kit === 'string');
 ok('validateTake ok with no drums', validateTake({ take: 4, status: 'active', createdAt: 'x', durationSec: null, sampleRate: 48000, stems: { stem1: null, stem2: null, stem3: null, stem4: null }, bounce: null }).ok);
 ok('validateTake rejects a bad drums', !validateTake({ take: 5, status: 'active', createdAt: 'x', durationSec: null, sampleRate: 48000, stems: { stem1: null, stem2: null, stem3: null, stem4: null }, bounce: null, drums: { enabled: 'yes' } }).ok);
+
+// ============================================================================
+// 28. Drum-loop sequencer — pure ruleset realization + pattern flatten (Phase 0).
+//     realizeSequence is TOTAL, injected-rng (no Math.random), indices in 1..N.
+// ============================================================================
+// A scripted rng returns a fixed cycle of values, so a roll is reproducible in-test.
+const scriptedRng = (vals) => { let i = 0; return () => vals[i++ % vals.length]; };
+// Minimal pattern builder (bars of empty 16-step voices).
+const mkPat = (bars) => { const grid = {}; for (const id of VOICE_IDS) grid[id] = new Array(bars * 16).fill(0); return { bars, steps: 16, grid }; };
+
+// ---- concatPatterns: glue grids end-to-end, bars = SUM ----
+{
+  const p1 = mkPat(1); p1.grid.kick[0] = 1;
+  const p2 = mkPat(2); p2.grid.snare[0] = 0.5; p2.grid.kick[16] = 1;
+  const c = concatPatterns([p1, p2, p1]);
+  eq('concat bars = 1+2+1', c.bars, 4);
+  eq('concat kick grid length = 4*16', c.grid.kick.length, 64);
+  eq('concat p1 kick at global 0', c.grid.kick[0], 1);
+  eq('concat p2 snare at offset 16', c.grid.snare[16], 0.5);
+  eq('concat p2 kick at 16+16', c.grid.kick[32], 1);
+  eq('concat second p1 kick at offset 48', c.grid.kick[48], 1);
+  eq('concat empty list -> 1-bar default', concatPatterns([]).bars, 1);
+  eq('concat drops nulls', concatPatterns([null, p1, null]).bars, 1);
+}
+
+// ---- realizeSequence: sequential is rng-free and cycles ----
+{
+  const rr = { type: 'sequential', order: [1, 2, 3] };
+  eq('sequential cycles to count', realizeSequence(3, rr, 7, scriptedRng([0])).order.join(''), '1231231');
+  eq('sequential filters out-of-range then cycles', realizeSequence(2, rr, 5, scriptedRng([0])).order.join(''), '12121');
+  eq('sequential empty-after-filter -> [1]', realizeSequence(1, { type: 'sequential', order: [5, 6] }, 3, scriptedRng([0])).order.join(''), '111');
+}
+
+// ---- realizeSequence: weighted bag, deterministic when one weight dominates ----
+{
+  eq('weighted single loop always 1', realizeSequence(3, { type: 'weighted', weights: { 1: 1 } }, 4, scriptedRng([0.9])).order.join(''), '1111');
+  eq('weighted zero-vs-nonzero always picks nonzero', realizeSequence(3, { type: 'weighted', weights: { 1: 0, 2: 5 } }, 4, scriptedRng([0.1, 0.9])).order.join(''), '2222');
+  const w = realizeSequence(3, { type: 'weighted', weights: { 1: 1, 2: 1, 3: 1 } }, 20, scriptedRng([0.05, 0.4, 0.8]));
+  eq('weighted respects count', w.order.length, 20);
+  ok('weighted stays in 1..N', w.order.every((x) => x >= 1 && x <= 3));
+}
+
+// ---- realizeSequence: markov ----
+{
+  // Fully deterministic ring (single-entry transitions, no wildcard): 1->2->3->1...
+  const ring = { type: 'markov', start: 1, transitions: { 1: [{ to: 2, w: 1 }], 2: [{ to: 3, w: 1 }], 3: [{ to: 1, w: 1 }] } };
+  eq('markov deterministic ring', realizeSequence(3, ring, 5, scriptedRng([0.5])).order.join(''), '12312');
+  // default covers unlisted states.
+  const dflt = { type: 'markov', start: 1, transitions: { default: [{ to: 2, w: 1 }] } };
+  eq('markov default drives unlisted states', realizeSequence(3, dflt, 3, scriptedRng([0.5])).order.join(''), '122');
+  // out-of-range `to` dropped, valid one kept.
+  const drop = { type: 'markov', start: 1, transitions: { 1: [{ to: 5, w: 1 }, { to: 2, w: 1 }], 2: [{ to: 2, w: 1 }] } };
+  eq('markov drops to>N', realizeSequence(3, drop, 2, scriptedRng([0.9])).order.join(''), '12');
+  // any-other never repeats the current state.
+  const other = { type: 'markov', start: 1, transitions: { default: [{ to: 'any-other', w: 1 }] } };
+  const oo = realizeSequence(4, other, 12, scriptedRng([0.1, 0.37, 0.62, 0.88, 0.5]));
+  let noRepeat = true; for (let i = 1; i < oo.order.length; i++) if (oo.order[i] === oo.order[i - 1]) noRepeat = false;
+  ok('markov any-other never repeats consecutively', noRepeat);
+  ok('markov any-other stays in 1..N', oo.order.every((x) => x >= 1 && x <= 4));
+  // any-other with a single loop degrades to that loop (no infinite exclusion).
+  eq('markov any-other w/ 1 loop degrades', realizeSequence(1, other, 3, scriptedRng([0.5])).order.join(''), '111');
+  // Determinism: same rng values -> identical order (the wander-65 example).
+  const wander = { name: 'wander-65', type: 'markov', start: 1, transitions: { 1: [{ to: 1, w: 0.325 }, { to: 2, w: 0.325 }, { to: 'any-other', w: 0.35 }], 2: [{ to: 1, w: 0.65 }, { to: 'any-other', w: 0.35 }], default: [{ to: 'any', w: 1 }] } };
+  const seedVals = [0.11, 0.73, 0.42, 0.9, 0.05, 0.66, 0.31, 0.58];
+  const a = realizeSequence(3, wander, 8, scriptedRng(seedVals)).order.join('');
+  const b = realizeSequence(3, wander, 8, scriptedRng(seedVals)).order.join('');
+  eq('markov is deterministic for a fixed rng', a, b);
+  eq('markov respects count', a.length, 8);
+}
+
+// ---- totality: never throws even with a garbage / rng-less ruleset ----
+{
+  let threw = false;
+  try { realizeSequence(3, { type: 'markov' }, 5); } catch { threw = true; }   // no rng, no transitions
+  ok('realizeSequence total without rng or transitions', !threw);
+  eq('rng-less markov falls to start', realizeSequence(3, { type: 'markov', start: 2, transitions: {} }, 3).order[0], 2);
+}
+
+// ---- flatten + sequenceBars ----
+{
+  const intro = mkPat(1), l1 = mkPat(2), l2 = mkPat(1), outro = mkPat(1);
+  intro.grid.crash[0] = 1;
+  const parts = { introPattern: intro, loopPatterns: { 1: l1, 2: l2 }, outroPattern: outro };
+  eq('sequenceBars sums intro + chosen loops + outro', sequenceBars([1, 2, 1], parts), 7);
+  const flat = flattenRealizedSequence([1, 2], parts);
+  eq('flatten bars = 1 + 2 + 1 + 1', flat.bars, 5);
+  eq('flatten keeps intro crash at step 0', flat.grid.crash[0], 1);
+  eq('flatten w/o intro/outro is just the loops', flattenRealizedSequence([1, 1], { loopPatterns: { 1: l1 } }).bars, 4);
+}
+
+// ---- validate + normalize ----
+{
+  const markov = { name: 'wander-65', type: 'markov', start: 1, transitions: { 1: [{ to: 1, w: 0.325 }, { to: 2, w: 0.325 }, { to: 'any-other', w: 0.35 }], default: [{ to: 'any', w: 1 }] } };
+  const bag = { name: 'even-bag', type: 'weighted', weights: { 1: 3, 2: 1 } };
+  const rr = { name: 'round-robin', type: 'sequential', order: [1, 2, 3] };
+  ok('validateRuleset accepts the markov example', validateRuleset(markov).ok);
+  ok('validateRuleset accepts the weighted example', validateRuleset(bag).ok);
+  ok('validateRuleset accepts the sequential example', validateRuleset(rr).ok);
+  ok('validateRuleset rejects an unknown type', !validateRuleset({ name: 'x', type: 'nope' }).ok);
+  ok('validateRuleset rejects markov without start', !validateRuleset({ name: 'x', type: 'markov', transitions: { 1: [{ to: 1, w: 1 }] } }).ok);
+  ok('validateRuleset rejects a non-object', !validateRuleset(null).ok);
+  eq('RULESET_TYPES are the three families', RULESET_TYPES.join(','), 'markov,weighted,sequential');
+  eq('normalizeRuleset defaults name from id', normalizeRuleset({ id: 'foo', type: 'sequential', order: [1] }).name, 'foo');
+  eq('normalizeRuleset coerces string weights to numbers', normalizeRuleset({ id: 'x', type: 'weighted', weights: { 1: '3' } }).weights['1'], 3);
+}
+
+// ============================================================================
+// 29. Drum sequencer — meter-aware import, MAX_FLAT_BARS decoupling, sequence schema
+//     + loop archival helpers (Phase 1). Reuses the section-26 smf() byte-builder.
+// ============================================================================
+// ---- barTicks per meter ----
+eq('barTicks 4/4 @960 = 4*ppq', barTicks(2, 960), 3840);
+eq('barTicks 3/4 @960 = 3*ppq', barTicks(1, 960), 2880);
+eq('barTicks 6/8 @960 = 3*ppq', barTicks(5, 960), 2880);
+eq('barTicks 2/4 @480 = 2*ppq', barTicks(0, 480), 960);
+ok('barTicks positive for every meter', TIME_SIGS.every((_, i) => barTicks(i, 480) > 0));
+
+// ---- meter-aware smfToPattern: a note at the start of 3/4 bar 2 (tick 1440 @ppq480) ----
+{
+  // kick@0, kick@1440 (VLQ 0x8B 0x20 = 1440).
+  const trk = [0x00, 0x90, 0x24, 0x64, 0x8b, 0x20, 0x90, 0x24, 0x64, 0x00, 0xff, 0x2f, 0x00];
+  const bytes = smf(0, 480, [trk]);
+  const in34 = smfToPattern(bytes, 1);   // 3/4: barTicks 1440 -> the note IS bar 2
+  eq('3/4 import derives 2 bars', in34.pattern.bars, 2);
+  ok('3/4 kick on bar-2 downbeat (step 16)', in34.pattern.grid.kick[16] > 0);
+  ok('3/4 kick on step 0', in34.pattern.grid.kick[0] > 0);
+  const in44 = smfToPattern(bytes);      // 4/4 default: the same tick is 3/4 through bar 1
+  eq('4/4 default import derives 1 bar', in44.pattern.bars, 1);
+  ok('4/4 kick quantized to step 12 (1440/120)', in44.pattern.grid.kick[12] > 0);
+}
+
+// ---- MAX_FLAT_BARS decoupling: a flattened pattern survives clamp; setBars stays 64-capped ----
+{
+  ok('MAX_FLAT_BARS well above 64', MAX_FLAT_BARS >= 128);
+  const big = clampDrumConfig({ pattern: { bars: 100, steps: 16, grid: {} } });
+  eq('clampDrumConfig preserves a 100-bar pattern', big.pattern.bars, 100);
+  eq('clamped 100-bar grid length', big.pattern.grid.kick.length, 100 * 16);
+  eq('setBars still caps the manual grid at 64', setBars(defaultDrumConfig(), 100).pattern.bars, 64);
+}
+
+// ---- sequence schema: default null, clamp round-trips, source 'sequence', idempotent ----
+{
+  eq('defaultDrumConfig sequence is null', defaultDrumConfig().sequence, null);
+  const seq = { folderName: 'verse', loopFiles: ['001.mid', '002.mid'], algorithmId: 'wander-65', count: 8, intro: 'in.mid', outro: 'out.mid', timeSigIndex: 2, realizedOrder: [1, 2, 1], realizedBars: 24 };
+  const cfg = clampDrumConfig({ enabled: true, source: { type: 'sequence' }, sequence: seq });
+  eq('clamp keeps source.type sequence', cfg.source.type, 'sequence');
+  eq('clamp keeps folderName', cfg.sequence.folderName, 'verse');
+  eq('clamp keeps loopFiles', cfg.sequence.loopFiles.join(','), '001.mid,002.mid');
+  eq('clamp keeps realizedOrder', cfg.sequence.realizedOrder.join(''), '121');
+  eq('clamp keeps count', cfg.sequence.count, 8);
+  const twice = clampDrumConfig(cfg);
+  eq('clampDrumConfig is idempotent on a sequence', JSON.stringify(twice), JSON.stringify(cfg));
+  eq('an unknown source type falls back to grid', clampDrumConfig({ source: { type: 'bogus' } }).source.type, 'grid');
+  ok('validateDrumConfig ok with a sequence', validateDrumConfig(cfg).ok);
+  ok('validateDrumConfig rejects a bad sequence.count', !validateDrumConfig({ enabled: true, sequence: { count: 0 } }).ok);
+  ok('validateDrumConfig still ok with null sequence', validateDrumConfig(defaultDrumConfig()).ok);
+}
+
+// ---- loop archival helpers ----
+{
+  eq('loopsRef path', loopsRef('my-song'), 'loops/my-song/');
+  const seqA = { folderName: 'verse', loopFiles: ['001.mid', '002.mid'], intro: 'in.mid', outro: null, algorithmId: 'x', count: 2, timeSigIndex: 2, realizedOrder: [1], realizedBars: 4 };
+  const m = { schemaVersion: 2, slug: 's', takes: [
+    makeTake({ take: 1, sampleRate: 48000, drums: { enabled: true, source: { type: 'sequence' }, sequence: seqA } }, 'x'),
+    makeTake({ take: 2, sampleRate: 48000 }, 'x'),
+  ] };
+  const refs = referencedLoopFiles(m);
+  ok('referencedLoopFiles includes folder-prefixed main loops', refs.has('verse/001.mid') && refs.has('verse/002.mid'));
+  ok('referencedLoopFiles includes the intro', refs.has('in.mid'));
+  ok('referencedLoopFiles omits a null outro', !refs.has(null) && refs.size === 3);
+  // setDrumSequence freezes a pattern + spec onto a take.
+  const flat = concatPatterns([mkPat(2), mkPat(2)]);
+  const m2 = setDrumSequence(m, 2, seqA, flat);
+  const t2 = m2.takes.find((t) => t.take === 2);
+  eq('setDrumSequence enables drums', t2.drums.enabled, true);
+  eq('setDrumSequence sets source sequence', t2.drums.source.type, 'sequence');
+  eq('setDrumSequence stores the flattened bars', t2.drums.pattern.bars, 4);
+  ok('setDrumSequence round-trips through validate', validateTake(t2).ok);
+}
+
+// ============================================================================
+// 30. Drum sequencer — the NNN.mid loop-folder gate (Phase 2) + picker tripwires.
+// ============================================================================
+ok('LOOP_NAME_RE matches 001.mid', LOOP_NAME_RE.test('001.mid'));
+ok('isLoopName 001.mid', isLoopName('001.mid'));
+ok('isLoopName 010.midi', isLoopName('010.midi'));
+ok('isLoopName rejects 2-digit', !isLoopName('01.mid'));
+ok('isLoopName rejects 4-digit', !isLoopName('0001.mid'));
+ok('isLoopName rejects a word name', !isLoopName('kick.mid'));
+ok('isLoopName rejects a .wav', !isLoopName('001.wav'));
+eq('loopNumber 010.mid = 10', loopNumber('010.mid'), 10);
+eq('loopNumber of a bad name is null', loopNumber('x.mid'), null);
+eq('sortLoopNames numeric order', sortLoopNames(['010.mid', '002.mid', '001.mid']).join(','), '001.mid,002.mid,010.mid');
+{
+  const good = validateLoopFolderNames(['002.mid', '001.mid', '003.mid']);
+  ok('valid contiguous folder ok', good.ok && good.count === 3);
+  const bad = validateLoopFolderNames(['001.mid', 'kick.mid']);
+  ok('non-NNN name rejected', !bad.ok && bad.reason === 'names' && bad.offenders.join() === 'kick.mid');
+  const gap = validateLoopFolderNames(['001.mid', '003.mid']);
+  ok('a gap is rejected', !gap.ok && gap.reason === 'gaps');
+  eq('gap reports the expected contiguous range', gap.expected, '001..002');
+  ok('empty folder rejected', !validateLoopFolderNames([]).ok && validateLoopFolderNames([]).reason === 'empty');
+  ok('two-digit name rejected', !validateLoopFolderNames(['10.mid']).ok);
+}
+// Picker + store tripwires (impure paths node can't execute).
+{
+  const lpSrc = readFileSync(here('./js/tape/loopPicker.js'), 'utf8');
+  ok('loopPicker runs the pure NNN gate', lpSrc.includes('validateLoopFolderNames'));
+  ok('loopPicker is NON-recursive (no directory descent)', !/handle\.kind === 'directory'/.test(lpSrc) && !lpSrc.includes('walkDir'));
+  ok('loopPicker uses showDirectoryPicker with the sn-loops id', lpSrc.includes("showDirectoryPicker") && lpSrc.includes("id: 'sn-loops'"));
+  ok('loopPicker filters the <input> fallback to the folder root', lpSrc.includes("rel.split('/').length <= 2"));
+  const tsSrc = readFileSync(here('./js/tape/takeStore.js'), 'utf8');
+  ok('takeStore exposes deleteSongLoops', tsSrc.includes('export async function deleteSongLoops'));
+}
+
+// ============================================================================
+// 31. Drum sequencer — bundled starter rulesets load, validate, and are cached (Phase 6).
+// ============================================================================
+{
+  const RS_IDS = readJSON('./assets/rulesets/index.json');
+  eq('three starter rulesets shipped', RS_IDS.length, 3);
+  for (const id of RS_IDS) {
+    const r = readJSON('./assets/rulesets/' + id + '.json');
+    ok('starter ruleset ' + id + ' validates', validateRuleset(r).ok);
+    ok('starter ruleset ' + id + ' cached in sw', sw.includes('"./assets/rulesets/' + id + '.json"'));
+    eq('starter ' + id + ' normalizes to a stable id', normalizeRuleset(r).id, id);
+  }
+  ok('one starter per family shipped', ['markov', 'weighted', 'sequential'].every((t) => RS_IDS.some((id) => readJSON('./assets/rulesets/' + id + '.json').type === t)));
+  ok('rulesets index cached in sw', sw.includes('"./assets/rulesets/index.json"'));
+  const rsSrc = readFileSync(here('./js/tape/rulesetStore.js'), 'utf8');
+  ok('rulesetStore uses the sn_rulesets localStorage key', rsSrc.includes("'sn_rulesets'"));
+  ok('rulesetStore validates before normalizing', rsSrc.includes('validateRuleset') && rsSrc.includes('normalizeRuleset'));
+}
+
+// ============================================================================
+// 32. Drum sequencer — model-level locking of a recorded take (Phase 5, fixes M1).
+// ============================================================================
+{
+  // click: bpm + timeSigIndex locked; the rest still editable.
+  const storedClick = clampClickConfig({ enabled: true, bpm: 120, timeSigIndex: 2, subdivision: 1, accentIndex: 1 });
+  const lockedClick = lockClickEdit(storedClick, { enabled: true, bpm: 200, timeSigIndex: 5, subdivision: 3, accentIndex: 0 });
+  eq('lockClickEdit keeps the recorded bpm', lockedClick.bpm, 120);
+  eq('lockClickEdit keeps the recorded timeSig', lockedClick.timeSigIndex, 2);
+  eq('lockClickEdit still lets subdivision change', lockedClick.subdivision, 3);
+  // drums: swing + pattern + source + sequence locked; kit/effect/master/voices editable.
+  const seq = { folderName: 'v', loopFiles: ['001.mid'], algorithmId: 'x', count: 4, intro: null, outro: null, timeSigIndex: 2, realizedOrder: [1, 1, 1, 1], realizedBars: 8 };
+  const storedDrums = clampDrumConfig({ enabled: true, kit: 'kit4', swing: 0.3, pattern: concatPatterns([mkPat(2)]), source: { type: 'sequence' }, sequence: seq });
+  const lockedDrums = lockDrumEdit(storedDrums, { enabled: true, kit: 'jazzfunk', effect: 'room1', swing: 0.6, pattern: mkPat(1), source: { type: 'grid' }, sequence: null });
+  eq('lockDrumEdit keeps the recorded swing', lockedDrums.swing, 0.3);
+  eq('lockDrumEdit keeps the recorded pattern bars', lockedDrums.pattern.bars, 2);
+  eq('lockDrumEdit keeps the frozen sequence', lockedDrums.sequence.realizedOrder.join(''), '1111');
+  eq('lockDrumEdit keeps source sequence', lockedDrums.source.type, 'sequence');
+  eq('lockDrumEdit still lets the kit change', lockedDrums.kit, 'jazzfunk');
+  eq('lockDrumEdit still lets the effect change', lockedDrums.effect, 'room1');
+}
+
+// ============================================================================
+// 33. Drum sequencer — wiring tripwires (impure record/playback/UI paths node can't run).
+//     String-level guards so a refactor can't silently revert the integration.
+// ============================================================================
+{
+  const capSrc = readFileSync(here('./js/tape/captureProcessor.js'), 'utf8');
+  ok('capture worklet has an endFrame auto-stop gate', capSrc.includes('this.endFrame') && /currentFrame \+ i >= this\.endFrame/.test(capSrc));
+  ok('capture worklet posts {op:ended} once at the gate', capSrc.includes("op: 'ended'") && capSrc.includes('this.endedPosted'));
+
+  const aeSrc = readFileSync(here('./js/tape/audioEngine.js'), 'utf8');
+  ok('record() accepts autoStopSec', /record\(\{[^}]*autoStopSec/.test(aeSrc));
+  ok('record() sends endFrame in the begin message', /op: 'begin', beginFrame, endFrame/.test(aeSrc));
+  ok('record() starts drums finite for a sequence (not always Infinity)', aeSrc.includes('autoStopSec != null ? autoStopSec : Infinity'));
+  ok('engine auto-stops on the worklet ended signal', aeSrc.includes("op === 'ended'") && aeSrc.includes("stop('sequence-end')"));
+  ok('play/bounce drive drums off the EXACT sequence length', aeSrc.includes('drumSequenceSeconds') && /seqSec > 0 \? seqSec/.test(aeSrc));
+  ok('engine exposes previewPattern', /return\s*\{[^}]*\bpreviewPattern\b/.test(aeSrc));
+
+  const mainSrc = readFileSync(here('./js/main.js'), 'utf8');
+  ok('the roll is built BEFORE record() runs onPassOpen', mainSrc.indexOf('buildFrozenSequence(clickCfg)') > 0 && mainSrc.indexOf('buildFrozenSequence(clickCfg)') < mainSrc.indexOf('ensureTapeDeck().record('));
+  ok('the roll injects Math.random into the pure realizer', /realizeSequence\([^)]*Math\.random\)/.test(mainSrc));
+  ok('commit applies the model-level drum lock', mainSrc.includes('lockDrumEdit(t.drums'));
+  ok('commit applies the model-level click lock', mainSrc.includes('lockClickEdit(t.click'));
+  ok('Save copies referenced loop files', mainSrc.includes('referencedLoopFiles(next)') && mainSrc.includes('loopsRef(slug)'));
+  ok('song delete cleans the loops dir', mainSrc.includes('deleteSongLoops'));
+
+  const dpSrc = readFileSync(here('./js/tape/drumPanel.js'), 'utf8');
+  ok('drum panel branches on sequence mode', dpSrc.includes("mode === 'sequence'") && dpSrc.includes('buildSequenceSection'));
+  ok('drum panel exposes folder + algorithm + preview controls', dpSrc.includes('onPickLoopFolder') && dpSrc.includes('onSetAlgorithm') && dpSrc.includes('onPreviewSequence'));
+  ok('drum panel exposes a time-signature selector', dpSrc.includes('onSetClick({ timeSigIndex'));
+}
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail ? 1 : 0);
