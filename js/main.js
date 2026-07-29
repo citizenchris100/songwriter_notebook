@@ -13,7 +13,7 @@ import { validate, randomize, DEFAULT_FEEL } from './session.js';
 import { load, save, reflectUrl } from './persistence.js';
 import { loadBuiltinFeels, loadUserFeels, saveUserFeels } from './feelStore.js';
 import { validateFeel, normalizeFeel, mergeFeels } from './feels.js';
-import { loadSongs, saveSongs } from './songStore.js';
+import { loadSongs, saveSongs, onSaveError } from './songStore.js';
 import {
   validateSong, normalizeSong, nextUntitledName, slugifySongId, buildCapturedProgression,
   createSong, appendProgressions, reorderProgression, removeProgression, copyProgression,
@@ -94,7 +94,8 @@ let deckArming = false;        // synchronous re-entrancy guard for the Record b
 let deckBouncing = false;
 let deckSaving = false;        // a Save (OPFS -> song folder migration) is in flight; mutually exclusive with record/bounce
 let deckHasJsonHandle = false; // cached (sync for the view-model): the active song has a retained .json handle
-let deckHasFolderHandle = false; // cached: the active song has a granted folder (::dir) handle
+let deckHasFolderHandle = false; // cached: the active song has a remembered folder (::dir) handle
+let deckFolderNeedsGrant = false; // takes restored but folder access is needed (once/session) to PLAY their audio
 let deckOpenSeq = 0;           // bumped on every onOpenTapeDeck call; a stale in-flight open detects itself via this
 let deckPendingNewTake = false; // a "+ New take" container awaiting its first pass (materialized lazily at Record)
 let deckArmed = [];             // [{ slotKey, inputIndex }] — REC-armed strips for the next pass (normalized each render)
@@ -154,6 +155,7 @@ function resetTapeDeckUi() {
   deckSaving = false;
   deckHasJsonHandle = false;
   deckHasFolderHandle = false;
+  deckFolderNeedsGrant = false;
   deckCalibrating = false;
   deckPendingNewTake = false;
   deckArmed = [];
@@ -337,6 +339,7 @@ function tapeDeckViewModel(active) {
     takesPendingSave: takes.filter((t) => t.status !== 'discarded' && takeModel.takeHasAudio(t) && !takeModel.takeIsSaved(t)).length,
     saving: deckSaving,
     folderGranted: deckHasFolderHandle,
+    folderNeedsGrant: deckFolderNeedsGrant,
     jsonSaved: deckHasJsonHandle,
   };
 }
@@ -431,6 +434,15 @@ function toSongFile(s) {
       id: sk.id, filename: sk.filename, mimeType: sk.mimeType, format: sk.format, size: sk.size, addedAt: sk.addedAt, notes: sk.notes,
     })),
   };
+  // The tape deck's durable saved-take records travel WITH the song's .json so opening it
+  // restores its takes (the take audio stays in the song folder, referenced by filename; only
+  // folder-saved takes are here — see takeModel.projectTakesForJson). A FOREIGN import strips
+  // this (its audio isn't present and the id would reslug) — see importOneSong. The local
+  // `file` link is intentionally never written into the .json.
+  if (s.tapeDeck && typeof s.tapeDeck.path === 'string') {
+    out.tapeDeck = { path: s.tapeDeck.path, schemaVersion: 2, takes: Array.isArray(s.tapeDeck.takes) ? s.tapeDeck.takes : [] };
+  }
+  return out;
 }
 
 // Read a Blob as base64 (no "data:...," prefix).
@@ -470,14 +482,27 @@ async function toSongBundle(song) {
 // Import one raw song/bundle object: validate, normalize, resolve id collisions, decode
 // its audio under FRESH sketch ids (so re-import never clobbers existing blobs), and
 // persist. Returns { ok, name } or { ok:false, error }. Sets currentSongId on success.
-async function importOneSong(raw) {
+async function importOneSong(raw, mode = 'import') {
   const v = validateSong(raw);
   if (!v.ok) return { ok: false, error: v.errors[0] };
   let s = normalizeSong(raw);
   const now = nowISO();
   if (!s.createdAt) s = { ...s, createdAt: now };
   if (!s.updatedAt) s = { ...s, updatedAt: now };
-  if (songs.some((x) => x.id === s.id)) s = { ...s, id: slugifySongId(s.name, songs.map((x) => x.id)) };
+
+  // Open (the user's OWN .json) vs Import (a foreign/shared bundle) differ on identity + takes:
+  //  - Open + an existing record with the SAME id AND createdAt → genuine RE-OPEN: keep the id
+  //    (its take WAVs are named <id>_*.wav) and REPLACE the record in place (never concat → no
+  //    duplicate id), preserving tapeDeck.takes so the deck restores from it.
+  //  - Open + an id not present here → first open on this device: keep the id + takes, concat.
+  //  - A collision with a DIFFERENT song (createdAt differs), or any Import → reslug the id; the
+  //    incoming take refs would then point at a dead takes/<newid>/ and the bundle has no audio,
+  //    so strip tapeDeck. createdAt is the identity token: normalizeSong preserves it and edits
+  //    only bump updatedAt, so it distinguishes a re-open from a same-named different song.
+  const existing = mode === 'open' ? songs.find((x) => x.id === s.id) : null;
+  const sameSong = !!(existing && existing.createdAt && existing.createdAt === s.createdAt);
+  const reslug = songs.some((x) => x.id === s.id) && !sameSong;
+  if (reslug) s = { ...s, id: slugifySongId(s.name, songs.map((x) => x.id)) };
 
   const audioMap = (raw && raw.audio) || {};
   const rekeyed = [];
@@ -490,15 +515,17 @@ async function importOneSong(raw) {
   }
   s = { ...s, sketches: rekeyed };
 
-  // A bundle carries no take audio, and the id may just have been re-slugged —
-  // drop any tapeDeck ref (export already omits it; this is defense in depth
-  // against a hand-edited bundle). Reopening the deck recreates the manifest.
-  if ('tapeDeck' in s) { const { tapeDeck: _drop, ...rest } = s; s = rest; }
+  // Keep the durable tapeDeck.takes ONLY on a faithful open of one's own song (no reslug, and the
+  // stored path still matches this id — a hand-edited/foreign path falls through to strip). Every
+  // other case (a reslug, a plain Import) drops it: the take audio isn't present and the refs would
+  // be dead. Reopening the deck then recreates an empty manifest.
+  const keepTapeDeck = mode === 'open' && !reslug && !!(s.tapeDeck && s.tapeDeck.path === 'takes/' + s.id + '/');
+  if ('tapeDeck' in s && !keepTapeDeck) { const { tapeDeck: _drop, ...rest } = s; s = rest; }
   // The file link is local to whoever exported it; the opener re-links to the file it
   // actually opened (afterOpen), so never carry an incoming link in.
   if ('file' in s) { const { file: _dropFile, ...rest } = s; s = rest; }
 
-  songs = songs.concat(s);
+  songs = sameSong ? songs.map((x) => (x.id === s.id ? s : x)) : songs.concat(s);
   saveSongs(songs);
   currentSongId = s.id;
   return { ok: true, name: s.name, id: s.id };
@@ -506,14 +533,14 @@ async function importOneSong(raw) {
 
 // Parse text (a single bundle object or an array of them) and import each. Returns
 // { ok, ids, count, error } — ids are the resulting (possibly re-slugged) song ids.
-async function importSongsFromText(text) {
+async function importSongsFromText(text, mode = 'import') {
   let obj;
   try { obj = JSON.parse(text); } catch { return { ok: false, ids: [], count: 0, error: 'not valid JSON' }; }
   const items = Array.isArray(obj) ? obj : [obj];
   const ids = [];
   let firstErr = null;
   for (const raw of items) {
-    const r = await importOneSong(raw);
+    const r = await importOneSong(raw, mode);
     if (r.ok) ids.push(r.id); else if (!firstErr) firstErr = r.error;
   }
   return { ok: ids.length > 0, ids, count: ids.length, error: ids.length ? null : (firstErr || 'nothing to import') };
@@ -1519,7 +1546,7 @@ const handlers = {
       let text;
       try { const f = await handle.getFile(); text = await f.text(); }
       catch { songFlash = { ok: false, error: 'could not read that file' }; render(); return; }
-      const res = await importSongsFromText(text);
+      const res = await importSongsFromText(text, 'open'); // Open of one's own .json: keep id + tapeDeck.takes
       if (res.ok && res.count === 1) await rememberHandle(res.ids[0], handle);
       afterOpen(res, handle.name);
     },
@@ -1527,7 +1554,7 @@ const handlers = {
     // Open a song from text read via a hidden <input type=file> (iOS / Chrome Android /
     // any no-File-System-Access platform). No handle, so the link is name-only.
     onOpenSongText: async (text, filename) => {
-      const res = await importSongsFromText(text);
+      const res = await importSongsFromText(text, 'open'); // Open of one's own .json: keep id + tapeDeck.takes
       afterOpen(res, filename || null);
     },
 
@@ -1563,30 +1590,54 @@ const handlers = {
       await ensurePersist();
       if (stale()) return;
       const path = manifestPath(a.id);
+      const savedTakes = (a.tapeDeck && Array.isArray(a.tapeDeck.takes)) ? a.tapeDeck.takes : [];
+      const durableCount = takeModel.activeAudioTakeCount({ takes: savedTakes });
+      const folderDirHandle = await handleForSong(dirKey(a.id)); // remembered handle (may be null); permission checked below
+      if (stale()) return;
+      const folderGrantedNow = await folderStore.queryOnly(folderDirHandle); // query only — NEVER prompt off this passive open
+      if (stale()) return;
+
+      // Source selection — survive OPFS eviction AND the old empty-manifest poison, WITHOUT
+      // resurrecting an in-session delete. Precedence:
+      //   'opfs'   — the session working copy; TRUSTED whenever it reads back NON-EMPTY (a readable
+      //              manifest is intact, so a lower count than the durable copy is a real in-session
+      //              delete, not eviction — respect it, per "folder = last-Saved snapshot");
+      //   'folder' — the canonical last-Save snapshot, read only when folder permission is ALREADY
+      //              granted (never request here — too deep for transient user activation);
+      //   'json'   — hydrate from the song's embedded saved takes (permission-free: metadata + folder
+      //              refs; audio still loads lazily on Play);
+      //   'fresh'  — a genuinely empty deck.
+      // OPFS is consulted first; if it is unreadable (evicted → throws) OR empty while a fuller durable
+      // copy exists, we recover from the folder, else the .json.
       let manifest = null;
-      let rebuilt = false;
+      let source = 'fresh';
+      let opfsManifest = null;
       try {
         const raw = await takeStore.readManifest(path);
         const v = takeModel.validateManifest(raw);
-        if (!v.ok) { manifest = takeModel.createManifest(a.id); if (!stale()) { deckStatus = { type: 'error', message: 'This song’s take history looked corrupted and could not be loaded.' }; } }
-        else manifest = takeModel.normalizeManifest(raw);
+        if (v.ok) opfsManifest = takeModel.normalizeManifest(raw);
+        else if (!durableCount && !stale()) deckStatus = { type: 'error', message: 'This song’s take history looked corrupted and could not be loaded.' };
       } catch {
-        manifest = null; // OPFS working manifest unreadable (evicted / never written) — try the folder copy below
+        opfsManifest = null; // OPFS working manifest unreadable (evicted / never written)
       }
       if (stale()) return;
-      // Rebuild-from-folder (D30: rebuild, never wipe): if OPFS had no usable manifest but the
-      // durable folder copy exists, restore the working index from it. Needs folder permission.
-      if (!manifest) {
-        const dir = await folderHandleForSong(a.id);
-        if (dir) {
+
+      if (opfsManifest && takeModel.activeAudioTakeCount(opfsManifest) > 0) {
+        manifest = opfsManifest; source = 'opfs'; // intact + non-empty → session truth (in-session deletes respected)
+      } else {
+        // OPFS gone, or empty. Recover the fullest durable copy: folder (if already granted), else .json.
+        if (folderGrantedNow) {
           try {
-            const bytes = await folderStore.readFile(dir, path);
+            const bytes = await folderStore.readFile(folderDirHandle, path);
             const raw = JSON.parse(new TextDecoder().decode(new Uint8Array(bytes)));
-            if (takeModel.validateManifest(raw).ok) { manifest = takeModel.normalizeManifest(raw); rebuilt = true; }
+            const folderMan = takeModel.validateManifest(raw).ok ? takeModel.normalizeManifest(raw) : null;
+            if (folderMan && takeModel.activeAudioTakeCount(folderMan) > 0) { manifest = folderMan; source = 'folder'; }
           } catch { /* no usable folder copy */ }
         }
         if (stale()) return;
-        if (!manifest) manifest = takeModel.createManifest(a.id);
+        if (!manifest && durableCount > 0) { manifest = takeModel.hydrateSavedTakes(a.id, savedTakes); source = 'json'; }
+        if (!manifest && opfsManifest) { manifest = opfsManifest; source = 'opfs'; } // a legitimately empty OPFS deck
+        if (!manifest) { manifest = takeModel.createManifest(a.id); source = 'fresh'; }
       }
       if (stale()) return;
 
@@ -1613,12 +1664,23 @@ const handlers = {
       // Stamp the song's small OPFS reference on first open only (AC-19),
       // BEFORE writing the manifest: if the app dies between these two writes,
       // a dangling tapeDeck ref with no manifest.json yet self-heals on next
-      // open (load-or-create, D30) — the reverse order could instead leave a
-      // real OPFS directory with no song record pointing at it.
+      // open (load-or-create, D30). Guarded by !a.tapeDeck, so it never clobbers a
+      // restored tapeDeck.takes — onSaveDeck writes the full record.
       if (!a.tapeDeck) updateActive((s, now) => (s.id === a.id ? { ...s, tapeDeck: takeModel.tapeDeckRef(a.id), updatedAt: now } : s));
       if (stale()) return;
-      await takeStore.writeManifest(path, manifest);
-      if (stale()) return;
+
+      // Write the working manifest back to OPFS ONLY when it is trustworthy. NEVER cache a
+      // json-hydrated (metadata-only) manifest, and never cache an EMPTY manifest while a durable
+      // copy could still exist — the song's records, OR a folder we simply haven't been granted this
+      // session. Caching either would mask the folder/.json copy on every future open (the exact
+      // poisoning bug this work fixes). A folder rebuild or an in-session Record re-seeds OPFS later.
+      const mightHaveHiddenDurable = !!folderDirHandle || durableCount > 0;
+      const okToWriteOpfs = source === 'json'
+        ? false
+        : manifest.takes.length > 0
+          ? (source === 'opfs' || source === 'folder')
+          : !mightHaveHiddenDurable;
+      if (okToWriteOpfs) { await takeStore.writeManifest(path, manifest); if (stale()) return; }
 
       deckManifest = manifest;
       deckClickDraft = readClickDefault();
@@ -1628,11 +1690,18 @@ const handlers = {
       currentTake = kept ? kept.take : null;
 
       deckHasJsonHandle = !!(await handleForSong(a.id));
-      deckHasFolderHandle = !!(await handleForSong(dirKey(a.id)));
+      deckHasFolderHandle = !!folderDirHandle;
+      // Folder access is needed to PLAY a saved take's audio (not to list it). It's outstanding when
+      // we restored metadata from the .json, OR the loaded manifest references folder audio but the
+      // folder isn't granted this session. The take LIST always renders; only playback waits.
+      const hasFolderAudio = manifest.takes.some((t) => t.status === 'active' && takeHasFolderFile(t));
+      deckFolderNeedsGrant = (source === 'json') || (hasFolderAudio && !folderGrantedNow && !!folderDirHandle);
       if (stale()) return;
-      if (rebuilt) {
+      if (source === 'folder' || source === 'json') {
         const n = manifest.takes.filter((t) => t.status === 'active' && takeModel.takeHasAudio(t)).length;
-        deckStatus = { type: 'warn', message: 'Restored ' + n + ' saved take' + (n === 1 ? '' : 's') + ' from the song folder; any unsaved takes could not be recovered.' };
+        deckStatus = deckFolderNeedsGrant
+          ? { type: 'info', message: 'Restored ' + n + ' saved take' + (n === 1 ? '' : 's') + ' from the song — grant folder access to play their audio.' }
+          : { type: 'warn', message: 'Restored ' + n + ' saved take' + (n === 1 ? '' : 's') + ' from the song folder; any unsaved takes could not be recovered.' };
       }
 
       await refreshSpaceWarning();
@@ -1644,6 +1713,27 @@ const handlers = {
       deckBlocked = false;
       deckInputs = probeResult;
       if (!deckSelectedInputId) deckSelectedInputId = probeResult.preselectedId;
+      render();
+    },
+
+    // Re-grant the song's folder (once per session) so restored takes can PLAY their audio. Runs off
+    // a fresh user gesture (the Grant button), so requestPermission keeps transient activation — the
+    // reason the deck-open path only queries, never prompts. On success we re-run the deck open, which
+    // now finds the folder granted → restores from the folder copy and re-seeds OPFS; on failure we
+    // surface a classified, actionable status (the take list stays put — only playback was blocked).
+    onGrantFolder: async () => {
+      const a = activeSong();
+      if (!a || !a.id) return;
+      const dir = await handleForSong(dirKey(a.id));
+      const { state } = await folderStore.probePermission(dir);
+      if (state === 'granted') { await handlers.onOpenTapeDeck(); return; }
+      deckStatus = {
+        type: 'error',
+        message: state === 'stale' ? 'The song folder moved or was removed — re-Save to relink it.'
+          : state === 'unsupported' ? 'Saved-take playback needs desktop Chrome.'
+          : state === 'nohandle' ? 'No folder is linked yet — Save the takes to pick the song’s folder.'
+          : 'Folder access denied — saved takes stay listed but can’t play until you grant access.',
+      };
       render();
     },
 
@@ -2066,6 +2156,24 @@ const handlers = {
         await takeStore.writeManifest(manifestPath(slug), next);
         deckManifest = next;
 
+        // 3b. Mirror the just-saved takes into the song record + its .json so opening the song
+        //     restores them even after OPFS is evicted (the restore path reads a.tapeDeck.takes
+        //     with NO folder prompt; audio still loads lazily from the folder on Play). localStorage
+        //     is the permission-free per-device cache; the on-disk .json is the cross-session/-device
+        //     durable copy. tapeDeckWithTakes is a complete tapeDeck object (path + schemaVersion +
+        //     projected takes), so it replaces the bare {path} ref without dropping anything. Stamp
+        //     BY ID (not via currentSongId) so a long Save stamps THIS song even if the user navigated
+        //     away mid-save, and write the freshly-stamped record (not the stale `a` snapshot).
+        const td = takeModel.tapeDeckWithTakes(slug, next);
+        songs = songs.map((s) => (s.id === a.id ? { ...s, tapeDeck: td, updatedAt: nowISO() } : s));
+        saveSongs(songs);
+        const updatedSong = songs.find((s) => s.id === a.id);
+        const jsonHandle = await handleForSong(a.id);
+        if (updatedSong && jsonHandle && (await ensureHandleWritable(jsonHandle))) {
+          try { await writeJsonSink({ handle: jsonHandle }, await toSongBundle(updatedSong)); }
+          catch { /* stale .json handle → the folder manifest.json stays the authoritative durable copy */ }
+        }
+
         // 4. Only now delete OPFS temps for every take now fully in the folder (targets all
         //    folder-located takes, self-healing stray temps from a prior interrupted Save).
         for (const take of deckManifest.takes) {
@@ -2194,6 +2302,13 @@ const handlers = {
   songs = loadSongs();
   songs = await reconcileSketches(songs);   // drop dangling sketch metadata, GC orphan blobs
   app = mountApp(rootEl, handlers);
+  // Surface a failed localStorage persist (quota / private mode) instead of swallowing it: the
+  // song's durable copies (.json on disk, folder manifest.json for takes) are unaffected, but the
+  // fast per-device cache is stale, so tell the user rather than let it fail silently.
+  onSaveError(() => {
+    songFlash = { ok: false, error: 'This device’s storage is full — your song is still safe in its .json file (and takes in the song folder), but the in-app copy could not update. Free some space and Save again.' };
+    render();
+  });
   commit();
 })();
 

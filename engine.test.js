@@ -34,6 +34,7 @@ import {
   slotHasAudio, slotLoc, defaultRouting, stemFileName, mixFileName, tapeDeckRef, playbackCacheStale,
   pendingOpfsSlotKeys, takeIsSaved, migrateTakeSlots, revertSlotToOpfs, midiRef, referencedMidiFiles, setDrumMidiFile,
   loopsRef, referencedLoopFiles, setDrumSequence,
+  projectTakesForJson, hydrateSavedTakes, tapeDeckWithTakes, activeAudioTakeCount,
   defaultStemSettings, clampStemSettings, compressorParams, bounceGainDb,
   LUFS_TARGET, LUFS_FLOOR, BOUNCE_GAIN_DB_MIN, BOUNCE_GAIN_DB_MAX, LIMITER_CEILING_DB,
   STEM_KEYS, MAX_TRACKS, TAKE_STATUS,
@@ -503,6 +504,21 @@ ok('validateSong rejects a non-object tapeDeck', !validateSong({ ...goodSong, ta
 ok('normalizeSong preserves a present tapeDeck ref', normalizeSong({ ...goodSong, tapeDeck: { path: 'takes/my-song/' } }).tapeDeck.path === 'takes/my-song/');
 ok('normalizeSong omits the tapeDeck key entirely when absent', !('tapeDeck' in normalizeSong(goodSong)));
 
+// tapeDeck.takes — durable folder-saved take records embedded in the song (restore-on-open).
+const savedTakeRec = { take: 2, status: 'active', recovered: false, createdAt: 'T', durationSec: 5, sampleRate: 48000,
+  stems: { stem1: { file: 'my-song_2_stem1.wav', group: 1, durationSec: 5, loc: 'folder', vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0 }, stem2: null, stem3: null, stem4: null },
+  bounce: null };
+ok('validateSong accepts a tapeDeck with saved take records', validateSong({ ...goodSong, tapeDeck: { path: 'takes/my-song/', schemaVersion: 2, takes: [savedTakeRec] } }).ok);
+ok('validateSong rejects a non-array tapeDeck.takes', !validateSong({ ...goodSong, tapeDeck: { path: 'takes/my-song/', takes: 'nope' } }).ok);
+// A malformed take entry must NOT fail the whole song (else loadSongs drops lyrics + progressions).
+ok('validateSong does not fail the song over a malformed take entry', validateSong({ ...goodSong, tapeDeck: { path: 'takes/my-song/', takes: [{ take: 'bogus' }] } }).ok);
+const tdNorm = normalizeSong({ ...goodSong, tapeDeck: { path: 'takes/my-song/', takes: [savedTakeRec, { take: 'bogus' }] } });
+eq('normalizeSong drops invalid saved take entries, keeps valid ones', tdNorm.tapeDeck.takes.length, 1);
+eq('normalizeSong keeps the saved take number', tdNorm.tapeDeck.takes[0].take, 2);
+eq('normalizeSong keeps folder loc on a restored slot', tdNorm.tapeDeck.takes[0].stems.stem1.loc, 'folder');
+eq('normalizeSong stamps tapeDeck.schemaVersion 2', tdNorm.tapeDeck.schemaVersion, 2);
+ok('normalizeSong round-trips a bare { path } tapeDeck (back-compat, no takes key)', !('takes' in normalizeSong({ ...goodSong, tapeDeck: { path: 'takes/my-song/' } }).tapeDeck));
+
 // file link (additive, local-only — the .json a song is opened from / saved to; stays out
 // of the export bundle; schemaVersion stays 1).
 ok('validateSong accepts a song with a good file ref', validateSong({ ...goodSong, file: { name: 'My Song.json' } }).ok);
@@ -777,6 +793,60 @@ eq('normalizeStem preserves loc folder', normalizeTake(mkTake('folder')).stems.s
 eq('normalizeStem clamps a garbage loc to opfs', normalizeTake(mkTake('bogus')).stems.stem1.loc, 'opfs');
 ok('validateManifest rejects a bad slot loc', !validateManifest({ slug: 'x', takes: [mkTake('nope')] }).ok);
 ok('validateManifest accepts loc folder + bounce loc opfs', validateManifest({ slug: 'x', takes: [mkTake('folder', 'opfs')] }).ok);
+
+// ---- takeModel: durable song-embedded projection + hydrate (restore-on-open) ----
+let projMan = createManifest('blue-eyes');
+// take 1: fully saved — both slots + bounce migrated to the folder.
+projMan = appendTake(projMan, makeTake({ take: 1, sampleRate: 48000 }, 'T'));
+projMan = appendPassTracks(projMan, 1, ['stem1', 'stem2'], 1);
+projMan = finalizePass(projMan, 1, { stem1: 10, stem2: 8 });
+projMan = migrateTakeSlots(projMan, 1, ['stem1', 'stem2'], {});
+projMan = markBounced(projMan, 1, { file: mixFileName('blue-eyes', 1), bouncedAt: 'TB', lufs: -14, loc: 'opfs' });
+projMan = migrateTakeSlots(projMan, 1, [], { bounce: true });
+// take 2: partial — stem1 saved to folder, stem2 left in OPFS (will be lost on reboot).
+projMan = appendTake(projMan, makeTake({ take: 2, sampleRate: 48000 }, 'T'));
+projMan = appendPassTracks(projMan, 2, ['stem1', 'stem2'], 1);
+projMan = finalizePass(projMan, 2, { stem1: 12, stem2: 9 });
+projMan = migrateTakeSlots(projMan, 2, ['stem1'], {});
+// take 3: OPFS-only — never Saved, nothing durable to restore.
+projMan = appendTake(projMan, makeTake({ take: 3, sampleRate: 48000 }, 'T'));
+projMan = appendPassTracks(projMan, 3, ['stem1'], 1);
+projMan = finalizePass(projMan, 3, { stem1: 5 });
+// take 4: discarded tombstone.
+projMan = appendTake(projMan, makeTake({ take: 4, sampleRate: 48000 }, 'T'));
+projMan = appendPassTracks(projMan, 4, ['stem1'], 1);
+projMan = finalizePass(projMan, 4, { stem1: 3 });
+projMan = migrateTakeSlots(projMan, 4, ['stem1'], {});
+projMan = discardTake(projMan, 4);
+
+const proj = projectTakesForJson(projMan);
+eq('projectTakesForJson keeps only takes with folder audio', proj.map((t) => t.take).join(','), '1,2');
+const p1 = proj.find((t) => t.take === 1);
+ok('projection keeps both folder slots of a fully-saved take', slotLoc(p1.stems.stem1) === 'folder' && slotLoc(p1.stems.stem2) === 'folder');
+ok('projection keeps a folder bounce', !!(p1.bounce && p1.bounce.loc === 'folder'));
+ok('a fully-saved projected take is not flagged recovered', p1.recovered === false);
+const p2 = proj.find((t) => t.take === 2);
+ok('projection keeps the folder slot of a partial take', slotLoc(p2.stems.stem1) === 'folder');
+eq('projection nulls the opfs-only slot of a partial take', p2.stems.stem2, null);
+ok('a partial projected take is flagged recovered', p2.recovered === true);
+eq('projection recomputes durationSec from surviving slots', p2.durationSec, 12);
+ok('projection drops an opfs-only take', !proj.some((t) => t.take === 3));
+ok('projection drops a discarded take', !proj.some((t) => t.take === 4));
+
+eq('activeAudioTakeCount over the manifest counts active+audio takes', activeAudioTakeCount(projMan), 3);
+eq('activeAudioTakeCount over projected records', activeAudioTakeCount({ takes: proj }), 2);
+
+const hyd = hydrateSavedTakes('blue-eyes', proj);
+ok('hydrateSavedTakes yields a valid manifest', validateManifest(hyd).ok);
+eq('hydrate keeps schemaVersion 2', hyd.schemaVersion, 2);
+eq('hydrate keeps the take numbers', hyd.takes.map((t) => t.take).join(','), '1,2');
+eq('hydrate selects the right most-recent take', mostRecentKeptTake(hyd).take, 2);
+eq('project/hydrate round-trip is idempotent', JSON.stringify(projectTakesForJson(hyd)), JSON.stringify(proj));
+
+const tdw = tapeDeckWithTakes('blue-eyes', projMan);
+eq('tapeDeckWithTakes carries the path ref', tdw.path, 'takes/blue-eyes/');
+eq('tapeDeckWithTakes stamps schemaVersion 2', tdw.schemaVersion, 2);
+eq('tapeDeckWithTakes projects the saved takes', tdw.takes.length, 2);
 
 // ---- takeModel: MIDI archival helpers ----
 eq('midiRef path', midiRef('blue-eyes'), 'midi/blue-eyes/');

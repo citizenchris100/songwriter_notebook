@@ -9,6 +9,7 @@
 // presets-only section label (Verse, Chorus, …).
 
 import { validateSketchMeta, normalizeSketch } from './sketches.js';
+import { validateTake, normalizeTake } from './tape/takeModel.js';
 
 const SLUG = /^[a-z0-9][a-z0-9-]*$/;
 
@@ -45,13 +46,20 @@ export function validateSong(s) {
     else s.sketches.forEach((sk, i) => { const v = validateSketchMeta(sk); if (!v.ok) errors.push('sketch ' + i + ': ' + v.errors[0]); });
   }
 
-  // tapeDeck is an additive optional field: a small reference to the song's OPFS
-  // take directory (the take audio + manifest live out-of-band there, never in
-  // this record — see js/tape/takeModel.js tapeDeckRef).
+  // tapeDeck is an additive optional field: the song's take directory ref (path) PLUS a
+  // durable copy of its folder-saved take records (tapeDeck.takes), so opening a song restores
+  // its takes even after OPFS is evicted (the take audio itself still lives out-of-band in the
+  // song folder). Deliberately do NOT hard-fail the whole song over one malformed take record —
+  // that would make loadSongs drop the entire song (lyrics + progressions) over a bad drum grid;
+  // normalizeSong repairs it by dropping just the invalid entries.
   if ('tapeDeck' in s) {
     const td = s.tapeDeck;
     if (td == null || typeof td !== 'object' || Array.isArray(td)) errors.push('tapeDeck must be an object');
-    else if (typeof td.path !== 'string' || td.path.length < 1) errors.push('tapeDeck.path must be a non-empty string');
+    else {
+      if (typeof td.path !== 'string' || td.path.length < 1) errors.push('tapeDeck.path must be a non-empty string');
+      if ('schemaVersion' in td && typeof td.schemaVersion !== 'number') errors.push('tapeDeck.schemaVersion must be a number');
+      if ('takes' in td && !Array.isArray(td.takes)) errors.push('tapeDeck.takes must be an array');
+    }
   }
 
   // file is an additive optional field: the LOCAL link between this song and the .json
@@ -106,10 +114,17 @@ export function normalizeSong(s) {
     // strip-unknown-keys behavior would delete it on every relaunch and orphan the audio).
     sketches: (s.sketches || []).map(normalizeSketch),
   };
-  // Same reasoning for tapeDeck: a known field, present only when the deck has
-  // actually been opened once (absent key, not null, when there is no deck).
+  // Same reasoning for tapeDeck: a known field, present only when the deck has actually been
+  // opened once (absent key, not null, when there is no deck). Preserve the durable saved-take
+  // records (tapeDeck.takes) too — dropping them here would delete them on every relaunch and
+  // undo the whole restore-on-open feature. Each entry is re-normalized (normalizeTake) and any
+  // invalid entry is dropped rather than failing the load. A legacy bare { path } record round-
+  // trips unchanged (takes omitted).
   if (s.tapeDeck && typeof s.tapeDeck === 'object' && typeof s.tapeDeck.path === 'string') {
-    out.tapeDeck = { path: s.tapeDeck.path };
+    out.tapeDeck = { path: s.tapeDeck.path, schemaVersion: 2 };
+    if (Array.isArray(s.tapeDeck.takes)) {
+      out.tapeDeck.takes = s.tapeDeck.takes.filter((t) => validateTake(t).ok).map(normalizeTake);
+    }
   }
   // Same reasoning for the file link: a known field, present only once a song has been
   // opened from or saved to a .json (absent key when unlinked). name only — the handle is

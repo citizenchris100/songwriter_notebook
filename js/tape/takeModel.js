@@ -460,6 +460,62 @@ export function mostRecentKeptTake(manifest) {
   return takes.reduce((best, t) => (t.take > best.take ? t : best), takes[0]);
 }
 
+// ---- durable song-embedded take records (survive OPFS eviction; restored on song open) ----
+//
+// The song .json / localStorage carry a copy of the FOLDER-SAVED takes, so opening a song
+// restores its takes with no OPFS and no folder-permission prompt (audio still loads lazily
+// from the folder on Play). Only what was actually Saved to the folder can restore, so the
+// projection keeps folder-loc slots only and drops opfs-only / discarded takes.
+
+// Active, audio-bearing takes a manifest (or a bare { takes } / { takes: savedTakes }) claims.
+// The restore path compares the OPFS manifest's count against the song's embedded count to
+// detect a PARTIALLY evicted/poisoned OPFS (present but under-filled) — the permission-free
+// "takes should exist" signal.
+export function activeAudioTakeCount(manifest) {
+  return ((manifest && manifest.takes) || []).filter((t) => t && t.status === 'active' && takeHasAudio(t)).length;
+}
+
+// Project a manifest down to the durable, folder-backed take records. For each take:
+//  - keep only slots physically saved to the folder (loc:'folder'); null any opfs-loc slot
+//    (its bytes won't survive a reboot) — a take that thereby loses slots is PARTIAL and is
+//    stamped recovered:true so the UI flags it;
+//  - keep the bounce only if it too is folder-saved;
+//  - preserve the take NUMBER (the on-disk filename <slug>_<take>_stemN.wav embeds it);
+//  - recompute durationSec over the surviving slots;
+//  - omit discarded tombstones and any take left with zero folder slots (nothing to restore).
+export function projectTakesForJson(manifest) {
+  const out = [];
+  for (const t of (manifest && manifest.takes) || []) {
+    if (t.status !== 'active') continue; // tombstones carry no restorable audio
+    const stems = {};
+    let kept = 0;
+    let lostOpfs = false;
+    for (const key of STEM_KEYS) {
+      const s = (t.stems || {})[key];
+      if (slotHasAudio(s) && slotLoc(s) === 'folder') { stems[key] = { ...s }; kept += 1; }
+      else { stems[key] = null; if (slotHasAudio(s)) lostOpfs = true; } // an opfs-only slot is dropped
+    }
+    if (!kept) continue; // no folder audio -> nothing durable to store
+    const bounce = t.bounce && t.bounce.file && t.bounce.loc === 'folder' ? { ...t.bounce } : null;
+    out.push({ ...t, stems, bounce, durationSec: maxSlotDuration({ stems }), recovered: t.recovered || lostOpfs });
+  }
+  return out;
+}
+
+// The full tapeDeck field to stamp on a song record: the small path ref plus the durable
+// saved-take records. schemaVersion (nested, independent of the song's schemaVersion:1) tracks
+// the embedded-record format and matches the take-manifest version.
+export function tapeDeckWithTakes(slug, manifest) {
+  return { path: tapeDeckRef(slug).path, schemaVersion: 2, takes: projectTakesForJson(manifest) };
+}
+
+// Reconstruct a working manifest from a song's embedded saved takes (the restore path when
+// OPFS was evicted). Just normalizeManifest over the stored records — they are already
+// normalizeTake-shaped, so this re-normalizes (idempotent) into a valid v2 manifest.
+export function hydrateSavedTakes(slug, savedTakes) {
+  return normalizeManifest({ slug, takes: Array.isArray(savedTakes) ? savedTakes : [] });
+}
+
 // ---- validation / normalization (defensive: reading a manifest this app wrote) ----
 
 function validateStem(s, at, errors) {

@@ -36,7 +36,7 @@ export function buildDeckView(deck, handlers, songName) {
     onDiscardLastGroup, onBounceStemToTrack, onDeleteTake, onSelectTake,
     onSelectInput, onSetMonitorLatency, onCalibrateLatency, onSetClick,
     onPreviewStemSetting, onSetStemSetting, onPreviewMasterVol, onSetMasterVol,
-    onTogglePanel, onToggleTakeLog,
+    onTogglePanel, onToggleTakeLog, onGrantFolder,
     onPlayTake, onReplayTake, onStopPlayTake,
   } = handlers;
 
@@ -82,7 +82,7 @@ export function buildDeckView(deck, handlers, songName) {
   wrap.appendChild(head);
 
   // ---- status strip: banners -> chips, input-device picker, one hint line ----
-  wrap.appendChild(statusStrip(deck, { onSelectInput }));
+  wrap.appendChild(statusStrip(deck, { onSelectInput, onGrantFolder }));
 
   // ---- the deck face: 4 strips + master ----
   const face = h('div', 'tapedeck');
@@ -191,8 +191,26 @@ function statusStrip(deck, ctx) {
   else if (deck.unsupported) chip('err', 'Recording needs a current Safari or Chrome (no on-device audio storage here).');
   else if (deck.noInterface) chip('warn', 'No multi-input interface — the built-in mic records one track at a time.');
   if (deck.warnMoreThanMax) chip('warn', 'Interface has more than four inputs — only the first four are available.');
-  if (deck.status && deck.status.message) chip(deck.status.type === 'error' ? 'err' : 'warn', deck.status.message);
+  if (deck.status && deck.status.message) chip(deck.status.type === 'error' ? 'err' : deck.status.type === 'info' ? 'info' : 'warn', deck.status.message);
   if (deck.spaceWarning) chip('warn', 'Storage is running low. Delete a take, or export what you need to keep.');
+
+  // Restored takes whose audio lives in the song folder need a one-per-session permission grant to
+  // PLAY (the list already shows). An actionable banner (fresh gesture keeps requestPermission valid).
+  if (deck.folderNeedsGrant && ctx.onGrantFolder) {
+    const banner = h('div', 'tapechip info tapegrant');
+    banner.appendChild(h('span', null, 'Restored takes — grant folder access to play their audio.'));
+    const btn = h('button', 'btn mini primary', 'Grant folder access');
+    btn.addEventListener('click', () => ctx.onGrantFolder());
+    banner.appendChild(btn);
+    box.appendChild(banner);
+  }
+
+  // At-risk indicator: takes with audio still only on this device (not yet Saved to the folder) are
+  // lost if OPFS is evicted. Surface the count so the user knows to Save before a reboot.
+  const pendingSave = deck.takesPendingSave || 0;
+  if (pendingSave > 0 && !deck.recording) {
+    chip('warn', pendingSave + ' take' + (pendingSave === 1 ? '' : 's') + ' not yet saved to the folder — Save to keep ' + (pendingSave === 1 ? 'it' : 'them') + ' across restarts.');
+  }
 
   if (deck.inputs && deck.inputs.length > 1 && !deck.recording) {
     const sel = h('select', 'tapein');

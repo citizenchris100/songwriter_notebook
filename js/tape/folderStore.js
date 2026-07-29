@@ -14,17 +14,38 @@
 // Layout is id-namespaced inside the granted folder so one folder can hold many
 // songs safely: <id>.json, takes/<id>/*.wav + manifest.json, midi/<id>/*.mid.
 
-// Query then (if needed) request read/write permission on the dir handle. A persisted
-// handle re-read from IndexedDB needs this after a reload (one prompt per session).
-// Mirror of main.js ensureHandleWritable.
-export async function ensurePermission(dir) {
+// Query-only permission check — NEVER prompts, so it is safe to call off a passive code path
+// (e.g. deck open, where transient user activation is long gone). Returns true iff read/write is
+// ALREADY granted on this persisted handle.
+export async function queryOnly(dir) {
   if (!dir) return false;
+  try { return (await dir.queryPermission({ mode: 'readwrite' })) === 'granted'; }
+  catch { return false; }
+}
+
+// Classify the outcome of (re-)acquiring read/write permission on a persisted dir handle so the
+// UI can tell the user WHY a saved take can't play. MUST run under a user gesture (it may prompt
+// via requestPermission). States: granted | denied | stale | unsupported | nohandle | noactivation.
+export async function probePermission(dir) {
+  if (!dir) return { state: 'nohandle' };
+  if (typeof dir.queryPermission !== 'function' || typeof dir.requestPermission !== 'function') return { state: 'unsupported' };
   try {
     const opts = { mode: 'readwrite' };
-    if ((await dir.queryPermission(opts)) === 'granted') return true;
-    if ((await dir.requestPermission(opts)) === 'granted') return true;
-  } catch { /* handle stale / API missing */ }
-  return false;
+    if ((await dir.queryPermission(opts)) === 'granted') return { state: 'granted' };
+    return { state: (await dir.requestPermission(opts)) === 'granted' ? 'granted' : 'denied' };
+  } catch (e) {
+    // requestPermission off a lapsed user-activation throws SecurityError/NotAllowedError; a handle
+    // for a folder that was moved/removed throws NotFoundError (and friends) → treat as stale.
+    if (e && (e.name === 'SecurityError' || e.name === 'NotAllowedError')) return { state: 'noactivation' };
+    return { state: 'stale' };
+  }
+}
+
+// Query then (if needed) request read/write permission on the dir handle. A persisted handle
+// re-read from IndexedDB needs this after a reload (one prompt per session). Thin boolean wrapper
+// over probePermission for the callers that only need yes/no. Must run under a user gesture.
+export async function ensurePermission(dir) {
+  return (await probePermission(dir)).state === 'granted';
 }
 
 // Split a relative path into safe segments, or null if it is empty or contains a
