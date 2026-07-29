@@ -18,7 +18,7 @@ import { validateFeel, normalizeFeel } from './js/feels.js';
 import {
   validateSong, normalizeSong, nextUntitledName, slugifySongId, buildCapturedProgression,
   createSong, appendProgressions, reorderProgression, removeProgression, copyProgression,
-  setProgressionLabel, setLyrics, renameSong, finalizeDraft,
+  setProgressionLabel, setLyrics, renameSong, finalizeDraft, duplicateSong,
   appendRow, addChord, setChord, removeChord, toMarkdown,
 } from './js/songs.js';
 import {
@@ -34,7 +34,7 @@ import {
   slotHasAudio, slotLoc, defaultRouting, stemFileName, mixFileName, tapeDeckRef, playbackCacheStale,
   pendingOpfsSlotKeys, takeIsSaved, migrateTakeSlots, revertSlotToOpfs, midiRef, referencedMidiFiles, setDrumMidiFile,
   loopsRef, referencedLoopFiles, setDrumSequence,
-  projectTakesForJson, hydrateSavedTakes, tapeDeckWithTakes, activeAudioTakeCount,
+  projectTakesForJson, hydrateSavedTakes, tapeDeckWithTakes, activeAudioTakeCount, rekeyManifest,
   defaultStemSettings, clampStemSettings, compressorParams, bounceGainDb,
   LUFS_TARGET, LUFS_FLOOR, BOUNCE_GAIN_DB_MIN, BOUNCE_GAIN_DB_MAX, LIMITER_CEILING_DB,
   STEM_KEYS, MAX_TRACKS, TAKE_STATUS,
@@ -404,6 +404,29 @@ const renamed = renameSong(finalized, 'New Name', 't7');
 eq('renameSong keeps id stable', renamed.id, 'my-song');
 eq('renameSong changes name', renamed.name, 'New Name');
 ok('finalized song round-trips through validateSong', validateSong(finalized).ok);
+
+// duplicateSong (the "Dupe" feature) — fresh id/name/dates, deep-copied progressions, remapped
+// sketch ids, no tapeDeck (the impure caller attaches a rekeyed one).
+const dupSong = duplicateSong(finalized, { id: 'my-song-2', name: 'My Song copy', now: 't9' });
+eq('duplicateSong sets the new id', dupSong.id, 'my-song-2');
+eq('duplicateSong sets the new name', dupSong.name, 'My Song copy');
+eq('duplicateSong stamps createdAt = now', dupSong.createdAt, 't9');
+eq('duplicateSong stamps updatedAt = now', dupSong.updatedAt, 't9');
+eq('duplicateSong links the copy .json filename', dupSong.file.name, 'my-song-2.json');
+eq('duplicateSong copies every progression', dupSong.progressions.length, finalized.progressions.length);
+ok('duplicateSong deep-copies chords (new ref)', dupSong.progressions[0].chords !== finalized.progressions[0].chords);
+ok('duplicateSong carries no tapeDeck (attached impurely)', !('tapeDeck' in dupSong));
+ok('a duplicated song round-trips through validateSong', validateSong(dupSong).ok);
+ok('duplicateSong is immutable (source name unchanged)', finalized.name === 'My Song');
+// Sketch remap: keep only sketches the caller copied a blob for (present in sketchIdMap).
+const srcSk = { ...finalized, sketches: [
+  { id: 'sk-old-1', filename: 'a.m4a', mimeType: 'audio/mp4', format: 'm4a', size: 1, addedAt: 't0', notes: '' },
+  { id: 'sk-old-2', filename: 'b.m4a', mimeType: 'audio/mp4', format: 'm4a', size: 1, addedAt: 't0', notes: '' },
+] };
+const dupSk = duplicateSong(srcSk, { id: 'my-song-3', name: 'X', now: 't9', sketchIdMap: { 'sk-old-1': 'sk-new-1' } });
+eq('duplicateSong keeps only mapped sketches', dupSk.sketches.length, 1);
+eq('duplicateSong rekeys the sketch id', dupSk.sketches[0].id, 'sk-new-1');
+ok('duplicateSong drops a sketch with no copied blob', !dupSk.sketches.some((s) => s.id === 'sk-old-2'));
 
 // ============================================================================
 // 12. Hand-editing: chord builder, 12-tone picker, and row/chord transforms
@@ -847,6 +870,21 @@ const tdw = tapeDeckWithTakes('blue-eyes', projMan);
 eq('tapeDeckWithTakes carries the path ref', tdw.path, 'takes/blue-eyes/');
 eq('tapeDeckWithTakes stamps schemaVersion 2', tdw.schemaVersion, 2);
 eq('tapeDeckWithTakes projects the saved takes', tdw.takes.length, 2);
+
+// rekeyManifest (the "Dupe" feature) — re-key a manifest onto a new slug, re-deriving every
+// id-bearing stem/bounce filename; null (opfs-projected) slots stay null; immutable.
+const rekeyed = rekeyManifest({ schemaVersion: 2, slug: 'blue-eyes', takes: proj }, 'blue-eyes-copy');
+eq('rekeyManifest sets the new slug', rekeyed.slug, 'blue-eyes-copy');
+eq('rekeyManifest keeps schemaVersion 2', rekeyed.schemaVersion, 2);
+eq('rekeyManifest keeps the take numbers', rekeyed.takes.map((t) => t.take).join(','), '1,2');
+const rk1 = rekeyed.takes.find((t) => t.take === 1);
+eq('rekeyManifest re-derives a stem filename for the new slug', rk1.stems.stem1.file, stemFileName('blue-eyes-copy', 1, 'stem1'));
+eq('rekeyManifest re-derives the bounce filename', rk1.bounce.file, mixFileName('blue-eyes-copy', 1));
+const rk2 = rekeyed.takes.find((t) => t.take === 2);
+eq('rekeyManifest re-derives a partial take\'s surviving slot', rk2.stems.stem1.file, stemFileName('blue-eyes-copy', 2, 'stem1'));
+eq('rekeyManifest leaves an opfs-projected (null) slot null', rk2.stems.stem2, null);
+ok('rekeyManifest is immutable (source filename unchanged)', proj.find((t) => t.take === 1).stems.stem1.file === stemFileName('blue-eyes', 1, 'stem1'));
+ok('a rekeyed manifest validates', validateManifest(rekeyed).ok);
 
 // ---- takeModel: MIDI archival helpers ----
 eq('midiRef path', midiRef('blue-eyes'), 'midi/blue-eyes/');

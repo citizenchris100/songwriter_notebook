@@ -13,7 +13,7 @@ export function mountSongsView(container, handlers) {
   const {
     onSelectSong, onSetLabel, onReorder, onRemoveProgression, onCopyProgression,
     onNewSong, onConfirmNewSong, onCancelNewSong, onNewRow, onAddChord, onSetChord, onRemoveChord,
-    onLyricsChange, onRenameSong, onDeleteSong,
+    onLyricsChange, onRenameSong, onDeleteSong, onDupeSong,
     onOpenSongPicker, onOpenSongText, onSaveSongFile, onExportMd,
     onAddSketch, onSelectSketch, onDeleteSketch, onSketchNotesChange, onLoadSketchBlob,
     onOpenTapeDeck, onDeckLiveRefs,
@@ -158,7 +158,7 @@ export function mountSongsView(container, handlers) {
 
   function flashEl(flash) {
     return h('div', 'feel-status ' + (flash.ok ? 'ok' : 'err'),
-      flash.ok ? ('Saved ' + flash.name) : ('Could not open: ' + flash.error));
+      flash.msg ? flash.msg : (flash.ok ? ('Saved ' + flash.name) : ('Could not open: ' + flash.error)));
   }
 
   function progBlock(p, i, last) {
@@ -252,7 +252,23 @@ export function mountSongsView(container, handlers) {
     delCancel.addEventListener('click', () => delBar.classList.add('hidden'));
     btns.appendChild(delBtn);
 
-    row.append(hint, btns, renBar, delBar);
+    // Dupe (sits beside Delete, neutral styling — it isn't destructive). Names the copy in an
+    // inline bar (like Rename); ✓/Enter fires onDupeSong, which then prompts for the destination
+    // folder (native picker) and writes a full copy — progressions, lyrics, sketches, and any
+    // tape-deck recordings — under the new name, then switches to it.
+    const dupeBtn = h('button', 'btn', 'Dupe');
+    const dupeBar = h('div', 'namebar hidden');
+    const dupeInput = h('input', 'nameinput'); dupeInput.type = 'text';
+    const dupeOk = h('button', 'btn mini', '✓');
+    const dupeCancel = h('button', 'btn mini', '✗');
+    dupeBar.append(dupeInput, dupeOk, dupeCancel);
+    dupeBtn.addEventListener('click', () => { dupeInput.value = vm.activeSong.name + ' copy'; dupeBar.classList.remove('hidden'); dupeInput.focus(); dupeInput.select(); });
+    dupeOk.addEventListener('click', () => onDupeSong(dupeInput.value));
+    dupeInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') onDupeSong(dupeInput.value); });
+    dupeCancel.addEventListener('click', () => dupeBar.classList.add('hidden'));
+    btns.appendChild(dupeBtn);
+
+    row.append(hint, btns, renBar, delBar, dupeBar);
     return row;
   }
 

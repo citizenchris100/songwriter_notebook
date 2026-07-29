@@ -509,6 +509,25 @@ export function tapeDeckWithTakes(slug, manifest) {
   return { path: tapeDeckRef(slug).path, schemaVersion: 2, takes: projectTakesForJson(manifest) };
 }
 
+// Re-key a manifest onto a NEW slug for the song-duplicate path: clone it with slug=newSlug
+// and every id-bearing stem/bounce filename re-derived from newSlug (matching stemFileName/
+// mixFileName), so it references the WAVs the duplicate copies into the new folder. The caller
+// bases this on projectTakesForJson(srcManifest) — active, folder-saved takes only — and writes
+// every kept slot into the new folder, so folder-loc stays correct; non-id-bearing refs (a
+// drum source.midiFile, loop provenance) are left untouched. Pure.
+export function rekeyManifest(manifest, newSlug) {
+  const takes = ((manifest && manifest.takes) || []).map((t) => {
+    const stems = {};
+    for (const k of STEM_KEYS) {
+      const s = (t.stems || {})[k];
+      stems[k] = slotHasAudio(s) ? { ...s, file: stemFileName(newSlug, t.take, k) } : (s == null ? null : { ...s });
+    }
+    const bounce = (t.bounce && t.bounce.file) ? { ...t.bounce, file: mixFileName(newSlug, t.take) } : (t.bounce || null);
+    return { ...t, stems, bounce };
+  });
+  return { schemaVersion: 2, slug: newSlug, takes };
+}
+
 // Reconstruct a working manifest from a song's embedded saved takes (the restore path when
 // OPFS was evicted). Just normalizeManifest over the stored records — they are already
 // normalizeTake-shaped, so this re-normalizes (idempotent) into a valid v2 manifest.

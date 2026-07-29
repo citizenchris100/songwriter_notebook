@@ -17,7 +17,7 @@ import { loadSongs, saveSongs, onSaveError } from './songStore.js';
 import {
   validateSong, normalizeSong, nextUntitledName, slugifySongId, buildCapturedProgression,
   createSong, appendProgressions, reorderProgression, removeProgression, copyProgression,
-  setProgressionLabel, setLyrics, renameSong, finalizeDraft,
+  setProgressionLabel, setLyrics, renameSong, finalizeDraft, duplicateSong,
   appendRow, addChord, setChord, removeChord, toMarkdown,
 } from './songs.js';
 import { isAcceptedAudio, makeSketchMeta, addSketchMeta, removeSketchMeta, setSketchNotes } from './sketches.js';
@@ -1462,6 +1462,113 @@ const handlers = {
       // §5.7: also GC its OPFS take directory (no boot-time GC, D30 — deletion is
       // the one place a song's takes get removed, immediately, with confirm).
       if (gone && gone.tapeDeck) { takeStore.deleteSongTakes(gone.id).catch(() => {}); takeStore.deleteSongMidi(gone.id).catch(() => {}); takeStore.deleteSongLoops(gone.id).catch(() => {}); }
+    },
+
+    // Duplicate the open song into a directory the user picks, then switch to the copy. Writes a
+    // self-contained folder <newId>/ inside the chosen parent — <newId>.json plus takes/midi/loops
+    // — with every id-bearing reference rewritten to the new slug, so it re-opens independently.
+    // Recordings come from the SOURCE song's on-disk folder (the durable Saved snapshot; the song
+    // record alone may carry no tapeDeck.takes), projected via projectTakesForJson so only active,
+    // folder-saved takes travel (unsaved OPFS takes / discarded tombstones don't). Desktop-Chrome
+    // only (File System Access). Runs under the ✓-click gesture (showDirectoryPicker + permission).
+    onDupeSong: async (rawName) => {
+      const a = activeSong();
+      if (!a || !a.id) return;
+      const name = String(rawName || '').trim();
+      if (!name) { songFlash = { ok: false, msg: 'Give the duplicate a name.' }; render(); return; }
+      if (typeof window === 'undefined' || !window.showDirectoryPicker) {
+        songFlash = { ok: false, msg: 'Duplicate needs desktop Chrome (folder access).' }; render(); return;
+      }
+      const newId = slugifySongId(name, songs.map((s) => s.id));
+
+      // 1. Pick the PARENT directory, then create the song's own <newId>/ folder inside it (so the
+      //    copy lands as a subfolder of the chosen dir, not loose files in it).
+      let newDir;
+      try {
+        const startIn = await handleForSong(a.id);
+        const opts = { id: 'sn-song-folder', mode: 'readwrite' };
+        if (startIn) opts.startIn = startIn;
+        const parent = await window.showDirectoryPicker(opts);
+        if (!(await folderStore.ensurePermission(parent))) { songFlash = { ok: false, msg: 'Folder access was declined.' }; render(); return; }
+        newDir = await parent.getDirectoryHandle(newId, { create: true });
+      } catch (e) {
+        if (e && e.name === 'AbortError') return;   // cancelled the picker → no-op
+        songFlash = { ok: false, msg: 'Could not open the destination folder (' + ((e && e.message) || 'error') + ').' }; render(); return;
+      }
+
+      try {
+        if (await folderStore.fileExists(newDir, newId + '.json')) {
+          songFlash = { ok: false, msg: 'A song folder named “' + newId + '” already exists there — pick another name.' }; render(); return;
+        }
+
+        // 2. Copy each sketch's audio blob under a FRESH id, so the copy owns private bytes
+        //    (mirrors importOneSong; a sketch whose blob is missing is dropped).
+        const sketchIdMap = {};
+        for (const sk of (a.sketches || [])) {
+          let blob;
+          try { blob = await audioStore.getBlob(sk.id); } catch { blob = null; }
+          if (!blob) continue;
+          const nid = newSketchId();
+          try { await audioStore.putBlob(nid, blob); sketchIdMap[sk.id] = nid; } catch { /* write failed → drop this sketch */ }
+        }
+
+        // 3. Build the duplicate record (progressions/lyrics/sketches; tapeDeck attached below).
+        const dup = duplicateSong(a, { id: newId, name, now: nowISO(), sketchIdMap });
+
+        // 4. Copy the tape-deck recordings from the source's on-disk folder, if any were Saved.
+        let recFlash = '';
+        const dirHandle = await handleForSong(dirKey(a.id));   // the source's persisted folder handle
+        const srcDir = dirHandle && (await folderStore.ensurePermission(dirHandle)) ? dirHandle : null;
+        if (srcDir) {
+          let srcManifest = null;
+          try { srcManifest = JSON.parse(new TextDecoder().decode(await folderStore.readFile(srcDir, manifestPath(a.id)))); } catch { /* no folder manifest → nothing recorded */ }
+          const durable = srcManifest ? takeModel.projectTakesForJson(srcManifest) : [];
+          if (durable.length) {
+            const srcDp = takeModel.tapeDeckRef(a.id).path;   // 'takes/<srcId>/'
+            const dstDp = takeModel.tapeDeckRef(newId).path;  // 'takes/<newId>/'
+            const kept = { schemaVersion: 2, slug: a.id, takes: durable };
+            for (const t of durable) {
+              for (const key of takeModel.filledSlotKeys(t)) {
+                await folderStore.writeFile(newDir, dstDp + takeModel.stemFileName(newId, t.take, key), await folderStore.readFile(srcDir, srcDp + t.stems[key].file));
+              }
+              if (t.bounce && t.bounce.file) {
+                await folderStore.writeFile(newDir, dstDp + takeModel.mixFileName(newId, t.take), await folderStore.readFile(srcDir, srcDp + t.bounce.file));
+              }
+            }
+            // Imported drum MIDI + sequencer loop MIDI: filenames aren't id-keyed, only the dir is.
+            for (const nm of takeModel.referencedMidiFiles(kept)) {
+              try { await folderStore.writeFile(newDir, takeModel.midiRef(newId) + nm, await folderStore.readFile(srcDir, takeModel.midiRef(a.id) + nm)); } catch { /* provenance only */ }
+            }
+            for (const rel0 of takeModel.referencedLoopFiles(kept)) {
+              try { await folderStore.writeFile(newDir, takeModel.loopsRef(newId) + rel0, await folderStore.readFile(srcDir, takeModel.loopsRef(a.id) + rel0)); } catch { /* provenance only */ }
+            }
+            const newManifest = takeModel.rekeyManifest(kept, newId);
+            await folderStore.writeFile(newDir, manifestPath(newId), JSON.stringify(newManifest, null, 2));
+            dup.tapeDeck = takeModel.tapeDeckWithTakes(newId, newManifest);
+            recFlash = ' + ' + durable.length + ' take' + (durable.length === 1 ? '' : 's');
+          }
+        } else if (dirHandle || a.tapeDeck) {
+          recFlash = ' (recordings not copied — grant this song’s folder, then Dupe again)';
+        }
+
+        // 5. Write the copy's .json (embeds the freshly-copied sketch audio + tapeDeck.takes).
+        await folderStore.writeFile(newDir, newId + '.json', JSON.stringify(await toSongBundle(dup), null, 2));
+
+        // 6. Link handles + switch to the copy (commit to app state only after every write).
+        try { await rememberHandle(newId, await newDir.getFileHandle(newId + '.json')); } catch { /* handle persist is best-effort */ }
+        await rememberHandle(dirKey(newId), newDir);
+        songs = songs.concat(dup);
+        saveSongs(songs);
+        currentSongId = newId;
+        currentSketchId = null;
+        sketchFlash = null;
+        resetTapeDeckUi();
+        songFlash = { ok: true, msg: 'Duplicated to “' + newId + '/”' + recFlash + '.' };
+        render();
+      } catch (e) {
+        songFlash = { ok: false, msg: 'Duplicate failed (' + ((e && e.message) || 'write error') + '). Delete the partial “' + newId + '/” folder and retry.' };
+        render();
+      }
     },
 
     // Save the current song's .json. Linked + File System Access → overwrite in place,

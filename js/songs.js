@@ -306,6 +306,40 @@ export function finalizeDraft(draft, name, takenIds, now) {
   return { ...draft, id: slugifySongId(name, takenIds), name: String(name), updatedAt: now };
 }
 
+// Duplicate a whole song under a FRESH id/name (the "Dupe" feature). Deep-copies the
+// progressions (no shared refs, so edits on the copy stay independent — same shape as
+// copyProgression), copies the lyrics, remaps each sketch's id through sketchIdMap
+// (old id -> new id; the impure caller copies the audio blobs under the new ids and only
+// puts a mapping in for a blob it actually copied, so a sketch with no surviving bytes is
+// dropped — matching importOneSong), and stamps createdAt = updatedAt = now with a fresh
+// file link. The tape deck is intentionally NOT carried here: the impure caller copies the
+// take WAVs into the new folder and attaches a slug-rekeyed tapeDeck. Pure (ids + time
+// injected), so the engine test can load it.
+export function duplicateSong(src, opts) {
+  const o = opts || {};
+  const id = String(o.id);
+  const map = o.sketchIdMap || {};
+  const progressions = (src.progressions || []).map((p) => {
+    const copy = { label: p.label || '', title: p.title || '', chords: p.chords.map(cleanChord) };
+    if (p.provenance) copy.provenance = { ...p.provenance };
+    return copy;
+  });
+  const sketches = (src.sketches || [])
+    .filter((sk) => map[sk.id])                 // only sketches whose blob the caller copied
+    .map((sk) => ({ ...sk, id: map[sk.id] }));
+  return {
+    schemaVersion: 1,
+    id,
+    name: String(o.name),
+    createdAt: o.now,
+    updatedAt: o.now,
+    lyrics: String(src.lyrics || ''),
+    progressions,
+    sketches,
+    file: { name: id + '.json' },
+  };
+}
+
 // ---- markdown export (pure: song -> a cleanly formatted .md string) ----
 // Rich layout: title + updated date, one heading per row (its section label plus captured
 // title / key / feel), the chords as an aligned table with their spelled notes, then a
