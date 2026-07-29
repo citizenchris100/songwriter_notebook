@@ -33,10 +33,10 @@ const labelList = (keys) => (keys || []).map((k) => STEM_LABELS[k]).join(' & ');
 export function buildDeckView(deck, handlers, songName) {
   const {
     onCloseTapeDeck, onNewTake, onArmRecordPass, onArmTrack, onCycleInput, onStopTake,
-    onDiscardLastGroup, onBounceStemToTrack, onBounceTake, onDeleteTake, onSelectTake,
+    onDiscardLastGroup, onBounceStemToTrack, onDeleteTake, onSelectTake,
     onSelectInput, onSetMonitorLatency, onCalibrateLatency, onSetClick,
     onPreviewStemSetting, onSetStemSetting, onPreviewMasterVol, onSetMasterVol,
-    onTogglePanel, onToggleTakeLog, onShareTake,
+    onTogglePanel, onToggleTakeLog,
     onPlayTake, onReplayTake, onStopPlayTake,
   } = handlers;
 
@@ -66,6 +66,19 @@ export function buildDeckView(deck, handlers, songName) {
   const takeLabel = deck.pendingNewTake ? 'New take' : ('Take ' + (deck.currentTakeNo || '—'));
   title.appendChild(h('div', 'subtitle', takeLabel + (deck.path ? ' · ' + deck.path : '')));
   head.append(back, title);
+
+  // Prominent take pulldown — load any recorded take without digging into the TAPE LOG.
+  const takeNums = deck.loadableTakes || [];
+  if (takeNums.length) {
+    const sel = h('select', 'tapetakes');
+    if (deck.pendingNewTake) { const o = h('option', null, 'New take'); o.value = ''; o.disabled = true; o.selected = true; sel.appendChild(o); }
+    takeNums.forEach((n) => { const o = h('option', null, 'Take ' + n); o.value = String(n); sel.appendChild(o); });
+    if (!deck.pendingNewTake && deck.currentTakeNo != null) sel.value = String(deck.currentTakeNo);
+    sel.disabled = !!(deck.recording || deck.bouncing);
+    sel.title = 'Load a take';
+    sel.addEventListener('change', () => { if (sel.value) onSelectTake(Number(sel.value)); });
+    head.append(sel);
+  }
   wrap.appendChild(head);
 
   // ---- status strip: banners -> chips, input-device picker, one hint line ----
@@ -98,50 +111,51 @@ export function buildDeckView(deck, handlers, songName) {
   wrap.appendChild(transport(deck, { onArmRecordPass, onStopTake, onPlayTake, onReplayTake, onStopPlayTake, songId: deck.songId, setStat }));
 
   // ---- collapsible take log ----
-  wrap.appendChild(takeLog(deck, { onSelectTake, onDeleteTake, onShareTake, onToggleTakeLog }));
+  wrap.appendChild(takeLog(deck, { onSelectTake, onDeleteTake, onToggleTakeLog }));
 
-  wrap.appendChild(h('div', 'feel-empty tapenote', 'Save writes takes into the song’s folder on disk (durable). Until then they live only on this device — the SAVE badge counts unsaved takes. EXPORT renders the current take to a WAV.'));
+  wrap.appendChild(h('div', 'feel-empty tapenote', 'Save writes takes into the song’s folder on disk (durable). Until then they live only on this device — the Save badge counts unsaved takes. Export writes the current take’s mixdown + clean stems into a <song>-<take> subfolder of the song’s folder.'));
 
   return { el: wrap, live };
 }
 
 // ---- song-management row (Save / Export / Rename / Delete) ----
-// Same fnbtn + inline-namebar idiom as functionRow, but acting on the whole SONG: Save
-// migrates OPFS take audio + MIDI into the song's folder; Export renders a master WAV;
-// Rename changes the display name; Delete removes the song + its on-disk artifacts.
+// Uses the Songs-page .btn family (not the deck's transport fnbtn style) so these whole-SONG
+// actions match their twins on the Songs tab: Save migrates OPFS take audio + MIDI into the
+// song's folder; Export writes a mixdown + clean stems into a per-take subfolder; Rename
+// changes the display name; Delete removes the song + its on-disk artifacts.
 function songManageRow(deck, handlers, songName) {
   const wrap = h('div', 'col');
-  const row = h('div', 'fnrow');
+  const row = h('div', 'row songactions');
   const busy = deck.recording || deck.bouncing || deck.saving;
   const haveAudio = !!deck.loadedTake && deck.filledCount > 0;
 
-  const fn = (label, on, disabled, click) => {
-    const b = h('button', 'fnbtn' + (on ? ' on' : ''), label);
+  const fn = (label, cls, disabled, click) => {
+    const b = h('button', cls, label);
     b.disabled = !!disabled;
     b.addEventListener('click', click);
     row.appendChild(b);
     return b;
   };
 
-  // SAVE — migrate OPFS take audio + MIDI into the song's folder. No confirm; the count of
+  // Save — migrate OPFS take audio + MIDI into the song's folder. No confirm; the count of
   // unsaved takes is shown in the label so the user knows what an eviction would cost.
   const pending = deck.takesPendingSave || 0;
-  const saveLabel = deck.saving ? 'SAVING…' : (pending > 0 ? 'SAVE (' + pending + ')' : 'SAVE');
-  fn(saveLabel, pending > 0, busy || (pending === 0 && deck.folderGranted), () => handlers.onSaveDeck());
+  const saveLabel = deck.saving ? 'Saving…' : (pending > 0 ? 'Save (' + pending + ')' : 'Save');
+  fn(saveLabel, 'btn primary', busy || (pending === 0 && deck.folderGranted), () => handlers.onSaveDeck());
 
-  // EXPORT — render the loaded take to a mastered WAV (never persisted). Offer the drums
-  // opt-in exactly like MIX when the take has drums.
+  // Export — write the loaded take's mixdown (channel strips applied) + its clean stems into a
+  // <slug>-<take>/ subfolder of the song's folder. Offer the drums opt-in for the mixdown.
   const hasDrums = !!(deck.loadedTake && deck.loadedTake.drums && deck.loadedTake.drums.enabled);
   const expBar = h('div', 'namebar hidden');
   if (hasDrums) {
     const chk = h('input'); chk.type = 'checkbox'; chk.checked = true;
-    const lbl = h('label', 'savehint'); lbl.append(chk, ' Include drums in the master');
+    const lbl = h('label', 'savehint'); lbl.append(chk, ' Include drums in the mixdown');
     const go = h('button', 'btn mini primary', 'Export'); go.addEventListener('click', () => { expBar.classList.add('hidden'); handlers.onExportDeck({ includeDrums: chk.checked }); });
     const cx = h('button', 'btn mini', 'Cancel'); cx.addEventListener('click', () => expBar.classList.add('hidden'));
     expBar.append(lbl, go, cx);
-    fn('EXPORT', false, busy || !haveAudio, () => expBar.classList.remove('hidden'));
+    fn('Export', 'btn', busy || !haveAudio, () => expBar.classList.remove('hidden'));
   } else {
-    fn('EXPORT', false, busy || !haveAudio, () => handlers.onExportDeck());
+    fn('Export', 'btn', busy || !haveAudio, () => handlers.onExportDeck());
   }
 
   // RENAME — a name input; commits the song's display name (id/on-disk names unchanged).
@@ -154,7 +168,7 @@ function songManageRow(deck, handlers, songName) {
   nameIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') doRename(); });
   renameCancel.addEventListener('click', () => renameBar.classList.add('hidden'));
   renameBar.append(nameIn, renameOk, renameCancel);
-  fn('RENAME', false, busy, () => { nameIn.value = songName || ''; renameBar.classList.remove('hidden'); nameIn.focus(); });
+  fn('Rename', 'btn', busy, () => { nameIn.value = songName || ''; renameBar.classList.remove('hidden'); nameIn.focus(); });
 
   // DELETE — danger confirm; removes the song + its <id>-scoped on-disk artifacts.
   const delBar = h('div', 'namebar hidden');
@@ -163,7 +177,7 @@ function songManageRow(deck, handlers, songName) {
   delBar.append(h('span', 'savehint', 'Delete this song and its saved take/MIDI files on disk? This cannot be undone.'), delOk, delCancel);
   delOk.addEventListener('click', () => { delBar.classList.add('hidden'); handlers.onDeleteDeck(); });
   delCancel.addEventListener('click', () => delBar.classList.add('hidden'));
-  fn('DELETE', false, busy, () => delBar.classList.remove('hidden'));
+  fn('Delete', 'btn danger', busy, () => delBar.classList.remove('hidden'));
 
   wrap.append(row, expBar, renameBar, delBar);
   return wrap;
@@ -305,7 +319,6 @@ function masterStrip(deck, ctx, meterSetters) {
 function functionRow(deck, handlers) {
   const wrap = h('div', 'col');
   const row = h('div', 'fnrow');
-  const haveAudio = !!deck.loadedTake && deck.filledCount > 0;
   const busy = deck.recording || deck.bouncing;
 
   const fn = (label, on, disabled, click) => {
@@ -336,25 +349,10 @@ function functionRow(deck, handlers) {
   }
   fn('RETAKE', false, busy || !(deck.lastGroupKeys && deck.lastGroupKeys.length), () => retakeBar.classList.remove('hidden'));
 
-  // MIX — bounce to a mix WAV. If the loaded take has drums, an inline confirm offers to
-  // include them in the printed mix (per-bounce, default on); otherwise it bounces directly.
-  const hasDrums = !!(deck.loadedTake && deck.loadedTake.drums && deck.loadedTake.drums.enabled);
-  const mixBar = h('div', 'namebar hidden');
-  if (hasDrums) {
-    const chk = h('input'); chk.type = 'checkbox'; chk.checked = true;
-    const lbl = h('label', 'savehint'); lbl.append(chk, ' Include drums in the mix');
-    const go = h('button', 'btn mini primary', 'Bounce'); go.addEventListener('click', () => { mixBar.classList.add('hidden'); handlers.onBounceTake({ includeDrums: chk.checked }); });
-    const cx = h('button', 'btn mini', 'Cancel'); cx.addEventListener('click', () => mixBar.classList.add('hidden'));
-    mixBar.append(lbl, go, cx);
-    fn('MIX', false, busy || !haveAudio, () => mixBar.classList.remove('hidden'));
-  } else {
-    fn('MIX', false, busy || !haveAudio, () => handlers.onBounceTake());
-  }
   fn('DRUMS', deck.drumConfig && deck.drumConfig.enabled, deck.recording, () => handlers.onTogglePanel('drums'));
   fn('CAL', deck.panelOpen === 'cal', deck.recording, () => handlers.onTogglePanel('cal'));
-  fn('SHARE', deck.panelOpen === 'share', !haveAudio && !(deck.loadedTake && deck.loadedTake.bounce), () => handlers.onTogglePanel('share'));
 
-  wrap.append(row, newBar, retakeBar, mixBar);
+  wrap.append(row, newBar, retakeBar);
   return wrap;
 }
 
@@ -363,7 +361,6 @@ function flipPanel(deck, handlers, meterSetters) {
   const box = h('div', 'card grow tapepanel');
   if (deck.panelOpen === 'drums') buildDrumPanel(box, deck, handlers, meterSetters);
   else if (deck.panelOpen === 'cal') calPanel(box, deck, handlers);
-  else if (deck.panelOpen === 'share') sharePanel(box, deck, handlers);
   return box;
 }
 
@@ -386,26 +383,6 @@ function calPanel(box, deck, handlers) {
   row.append(latIn, calBtn);
   box.appendChild(row);
   box.appendChild(h('div', 'feel-empty', 'Loop the EVO output to input 1 (or hold the mic to your headphones), then Calibrate. Or type a value if you already know it.'));
-}
-
-function sharePanel(box, deck, handlers) {
-  box.appendChild(h('div', 'subtitle', 'Share / Export'));
-  const row = h('div', 'row');
-  if (deck.loadedTake && deck.loadedTake.stems) {
-    STEM_KEYS.forEach((key) => {
-      const stem = deck.loadedTake.stems[key];
-      if (!stem || !stem.file) return;
-      const btn = h('button', 'btn mini', 'Share ' + STEM_LABELS[key]);
-      btn.addEventListener('click', () => handlers.onShareTake(key));
-      row.appendChild(btn);
-    });
-  }
-  if (deck.loadedTake && deck.loadedTake.bounce && deck.loadedTake.bounce.file) {
-    const btn = h('button', 'btn mini', 'Share Mix');
-    btn.addEventListener('click', () => handlers.onShareTake('bounce'));
-    row.appendChild(btn);
-  }
-  box.appendChild(row);
 }
 
 // ---- piano-key transport ----
@@ -450,13 +427,6 @@ function filledCountOf(t) {
   if (!t || !t.stems) return 0;
   return STEM_KEYS.reduce((n, k) => n + (t.stems[k] && t.stems[k].file ? 1 : 0), 0);
 }
-function firstShareRef(t) {
-  if (t.bounce && t.bounce.file) return 'bounce';
-  if (!t.stems) return null;
-  for (const k of STEM_KEYS) if (t.stems[k] && t.stems[k].file) return k;
-  return null;
-}
-
 function historyRow(t, deck, handlers) {
   if (t.status === 'discarded') {
     const row = h('div', 'saved tombstone');
@@ -474,10 +444,6 @@ function historyRow(t, deck, handlers) {
   const when = h('div', 'stuning', fmtWhen(t.createdAt) + ' · ' + fmtTime(t.durationSec) + ' · ' + filledCountOf(t) + '/4');
   const loadBtn = h('button', 'btn mini', 'Load');
   loadBtn.addEventListener('click', (e) => { e.stopPropagation(); handlers.onSelectTake(t.take); });
-  const shareRef = firstShareRef(t);
-  const shareBtn = h('button', 'btn mini', 'Share');
-  shareBtn.disabled = !shareRef;
-  shareBtn.addEventListener('click', (e) => { e.stopPropagation(); if (shareRef) handlers.onShareTake(shareRef, t.take); });
   const delBtn = h('button', 'btn mini danger', '✕');
   delBtn.title = 'Delete take';
   delBtn.disabled = !!deck.bouncing; // a bounce in flight may be writing this take's mix file (AC-13/22 race)
@@ -488,7 +454,7 @@ function historyRow(t, deck, handlers) {
   delBtn.addEventListener('click', (e) => { e.stopPropagation(); if (!deck.bouncing) confirmBar.classList.remove('hidden'); });
   delOk.addEventListener('click', (e) => { e.stopPropagation(); handlers.onDeleteTake(t.take); });
   delCancel.addEventListener('click', (e) => { e.stopPropagation(); confirmBar.classList.add('hidden'); });
-  row.append(nm, when, loadBtn, shareBtn, delBtn);
+  row.append(nm, when, loadBtn, delBtn);
   const wrap = h('div', 'historyrowwrap');
   wrap.append(row, confirmBar);
   return wrap;

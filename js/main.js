@@ -287,6 +287,8 @@ function tapeDeckViewModel(active) {
     currentTakeNo: loadedTake ? loadedTake.take : null,
     counterTakeNo,
     manifestTakes: takes,
+    // Loadable take numbers, newest first — drives the header take pulldown.
+    loadableTakes: activeWithAudio.map((t) => t.take).sort((x, y) => y - x),
     loadedTake,
     pendingNewTake,
     recording: deckRecording,
@@ -590,9 +592,9 @@ async function openJsonSink(suggestedName) {
 
 // Tiers 2+3 of the export sink (share sheet, else anchor download) — the part
 // that doesn't need a synchronously-opened File System Access handle. Reused by
-// writeJsonSink (tier 1 handled separately, JSON-export-only) and by
-// onShareTake (a take's stems/bounce are real .wav files, AC-20; there is no
-// "save file picker" step for those, only "share sheet or download").
+// writeJsonSink (tier 1 handled separately, JSON-export-only) and by the
+// song/markdown export sinks (there is no "save file picker" step for those,
+// only "share sheet or download").
 // Returns true when the bytes reached a destination, false when the user dismissed
 // the share sheet. The anchor-download tier has no cancel signal, so it returns true.
 async function shareOrDownloadBlob(blob, name, mimeType) {
@@ -1956,34 +1958,6 @@ const handlers = {
     onPreviewMasterVol: (v) => { if (tapeDeck) tapeDeck.setMasterVol(v); },
     onSetMasterVol: (v) => { writeMasterVol(v); if (tapeDeck) tapeDeck.setMasterVol(v); render(); },
 
-    onBounceTake: async (opts) => {
-      const a = activeSong();
-      if (!a || !deckManifest || currentTake == null || !tapeDeck || deckBouncing || deckSaving) return;
-      const take = deckManifest.takes.find((t) => t.take === currentTake);
-      if (!take) return;
-      const takeNo = take.take;              // snapshot — `currentTake` can change while this await is in flight
-      deckBouncing = true;
-      render();
-      let result;
-      try {
-        const fh = takeHasFolderFile(take) ? await folderHandleForSong(a.id) : null; // saved stems read from the folder
-        result = await tapeDeck.bounce(take, a.id, { includeDrums: !!(opts && opts.includeDrums) }, fh);
-      } catch (e) { deckBouncing = false; surfaceReadError(e); return; }
-      deckBouncing = false;
-      if (!result.ok) { deckStatus = { type: 'error', message: 'Bounce failed: ' + result.error }; render(); return; }
-      // The take may have been discarded/deleted while the bounce was running
-      // (onDeleteTake also guards on deckBouncing, but this stays correct even
-      // if that guard is ever bypassed): don't resurrect a tombstoned take's
-      // bounce record, and don't leave an orphaned _mix.wav unexplained.
-      const stillActive = deckManifest.takes.find((t) => t.take === takeNo && t.status === 'active');
-      if (!stillActive) { takeStore.deleteTakeAudio(a.id, takeNo).catch(() => {}); render(); return; }
-      // The mix was written to OPFS (loc:'opfs'); a re-Save migrates it into the folder.
-      deckManifest = takeModel.markBounced(deckManifest, takeNo, { file: result.file, bouncedAt: nowISO(), lufs: result.lufs, loc: 'opfs' });
-      await takeStore.writeManifest(manifestPath(a.id), deckManifest);
-      await refreshSpaceWarning();
-      render();
-    },
-
     // Ping-pong bounce: sum one track into another (both effected, mono, baked),
     // freeing the source slot for more recording. Shares the deckBouncing guard with
     // the master bounce + delete so no two operations touch the same take's files.
@@ -2014,33 +1988,6 @@ const handlers = {
       takeStore.deleteSlotFiles(a.id, takeNo, [srcKey]).catch(() => {}); // metadata first, best-effort file delete second
       await refreshSpaceWarning();
       render();
-    },
-
-    // AC-20: the only way take audio leaves the app. `which` is 'stem1'|'stem2'|'bounce'.
-    // `takeNo` defaults to the loaded take (loadedActions' per-stem/mix buttons);
-    // AC-10 also needs Share reachable straight from a take-history row without
-    // first Loading it, so historyRow passes its own take's number explicitly.
-    onShareTake: async (which, takeNo) => {
-      const a = activeSong();
-      const tn = takeNo != null ? takeNo : currentTake;
-      if (!a || !deckManifest || tn == null) return;
-      const take = deckManifest.takes.find((t) => t.take === tn);
-      if (!take) return;
-      const slot = which === 'bounce' ? take.bounce : take.stems[which];
-      const fileRef = slot && slot.file;
-      if (!fileRef) return;
-      const rel = takeModel.tapeDeckRef(a.id).path + fileRef;
-      let bytes;
-      try {
-        if (slot.loc === 'folder') {
-          const fh = await folderHandleForSong(a.id);
-          if (!fh) throw Object.assign(new Error('folder access'), { code: 'FOLDER_UNAVAILABLE' });
-          bytes = await folderStore.readFile(fh, rel);
-        } else {
-          bytes = await takeStore.readFile(rel);
-        }
-      } catch (e) { surfaceReadError(e); return; }
-      await shareOrDownloadBlob(new Blob([bytes], { type: 'audio/wav' }), fileRef, 'audio/wav');
     },
 
     // Ephemeral playback — no persisted state, so these go straight to the
@@ -2148,20 +2095,52 @@ const handlers = {
       }
     },
 
-    // Export = render the CURRENT take to one mastered mono WAV and share/download it, WITHOUT
-    // persisting it (distinct from MIX, which saves the take's _mix.wav, and per-stem SHARE).
+    // Export (consolidates the old MIX / SHARE / EXPORT) = write the CURRENT take's mixdown +
+    // its clean stems into a <slug>-<take>/ subfolder of the song's on-disk folder:
+    //   (a) <slug>_<take>_mix.wav  — the summed mixdown WITH each track's channel-strip
+    //       settings (renderMaster: vol/EQ/comp per track, then LUFS-target + limiter master).
+    //   (b) <slug>_<take>_stemN.wav — the raw captured stems, UNPROCESSED (the strip is
+    //       non-destructive, so the on-disk stem files carry none of it — copied verbatim).
+    // The subfolder is a sibling of takes/ inside the granted folder and is a user-facing
+    // export, NOT part of Save's managed store (Save's GC / song-delete leave it alone).
+    // Desktop-Chrome only (needs the File System Access folder, like Save).
     onExportDeck: async (opts) => {
       const a = activeSong();
-      if (!a || !deckManifest || currentTake == null || !tapeDeck || deckBouncing || deckRecording || deckSaving) return;
+      if (!a || !a.id || !deckManifest || currentTake == null || !tapeDeck || deckBouncing || deckRecording || deckSaving) return;
       const take = deckManifest.takes.find((t) => t.take === currentTake);
       if (!take || !takeModel.takeHasAudio(take)) { deckStatus = { type: 'warn', message: 'Load a take with audio to export.' }; render(); return; }
-      let r;
+      const dir = await ensureFolderGrant(a.id);
+      if (!dir) { deckStatus = { type: 'warn', message: 'Pick the song’s folder to export into it (desktop Chrome only).' }; render(); return; }
+      deckHasFolderHandle = true;
+      deckBouncing = true;
+      deckStatus = { type: 'info', message: 'Exporting…' };
+      render();
       try {
-        const fh = takeHasFolderFile(take) ? await folderHandleForSong(a.id) : null;
-        r = await tapeDeck.renderMaster(take, a.id, { includeDrums: !!(opts && opts.includeDrums) }, fh);
-      } catch (e) { surfaceReadError(e); return; }
-      if (!r.ok) { deckStatus = { type: 'error', message: 'Export failed: ' + r.error }; render(); return; }
-      await shareOrDownloadBlob(new Blob([r.bytes], { type: 'audio/wav' }), a.id + '_take' + take.take + '_master.wav', 'audio/wav');
+        const slug = a.id;
+        const sub = slug + '-' + take.take + '/';    // e.g. my-song-3/ — sibling of takes/, midi/
+        const dp = takeModel.tapeDeckRef(slug).path;  // 'takes/<slug>/'
+
+        // (a) Mixdown with channel strips + master.
+        const r = await tapeDeck.renderMaster(take, slug, { includeDrums: !!(opts && opts.includeDrums) }, dir);
+        if (!r.ok) { deckStatus = { type: 'error', message: 'Export failed: ' + r.error }; return; }
+        await folderStore.writeFile(dir, sub + takeModel.mixFileName(slug, take.take), r.bytes);
+
+        // (b) Clean stems copied verbatim (folder-located slots read from the folder, opfs from OPFS).
+        const keys = takeModel.filledSlotKeys(take);
+        for (const key of keys) {
+          const slot = take.stems[key];
+          const rel = dp + slot.file;
+          const bytes = slot.loc === 'folder' ? await folderStore.readFile(dir, rel) : await takeStore.readFile(rel);
+          await folderStore.writeFile(dir, sub + takeModel.stemFileName(slug, take.take, key), bytes);
+        }
+
+        deckStatus = { type: 'info', message: 'Exported mix + ' + keys.length + ' stem' + (keys.length === 1 ? '' : 's') + ' to ' + slug + '-' + take.take + '/' };
+      } catch (e) {
+        deckStatus = { type: 'error', message: 'Export failed (' + ((e && e.message) || 'folder write error') + ').' };
+      } finally {
+        deckBouncing = false;
+        render();
+      }
     },
 
     // Rename the whole song from inside the deck — display name only; on-disk artifacts stay
