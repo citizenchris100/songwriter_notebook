@@ -2184,7 +2184,7 @@ const handlers = {
   if (!feelList.length) {
     rootEl.textContent = '';
     const msg = document.createElement('div');
-    msg.style.cssText = 'max-width:520px;margin:60px auto;text-align:center;color:#8b93a3;font:600 15px/1.6 -apple-system,sans-serif';
+    msg.style.cssText = 'max-width:520px;margin:60px auto;text-align:center;color:var(--muted);font:600 15px/1.6 -apple-system,sans-serif';
     msg.textContent = 'Could not load feels. Check your connection and reload.';
     rootEl.appendChild(msg);
     return;

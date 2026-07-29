@@ -1,11 +1,12 @@
 // sw.js — offline cache. Same recipe as the metronome/fretboard siblings.
 // IMPORTANT: bump CACHE on any file change, and keep ASSETS listing EVERY shipped
 // file (cache-first means anything not listed is unavailable offline).
-const CACHE = "sn-v40";
+const CACHE = "sn-v41";
 
 const ASSETS = [
   "./",
   "./index.html",
+  "./theme.css",
   "./styles.css",
   "./manifest.webmanifest",
   "./js/main.js",

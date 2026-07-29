@@ -1,16 +1,4 @@
-/* styles.css — clean dark UI, matching the metronome/fretboard family tokens. */
-:root {
-  --bg: #15171c;
-  --panel: #1b1e25;
-  --panel-2: #222631;
-  --line: #2c313c;
-  --text: #e9ecf1;
-  --muted: #8b93a3;
-  --accent: #ff5a3c;
-  --accent-soft: #ff7a60;
-  --led: #4f8cff;
-  --radius: 14px;
-}
+/* styles.css — clean dark UI. All theme colors + tokens live in theme.css (loaded first). */
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 body {
   margin: 0;
@@ -48,7 +36,7 @@ h1 {
   border-radius: 9px; padding: 8px 12px; font-size: 15px; font-weight: 600;
   cursor: pointer; line-height: 1; min-width: 38px;
 }
-.seg button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.seg button.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .seg.disabled button { opacity: 0.4; cursor: not-allowed; }
 .seg.disabled button.on { opacity: 0.55; }
 .seg.acc button { min-width: 34px; font-size: 16px; }
@@ -66,7 +54,7 @@ select {
   background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
   border-radius: var(--radius); padding: 13px 16px; font-size: 15px; font-weight: 700; cursor: pointer;
 }
-.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .btn.grow { flex: 1 1 auto; }
 .btn:active { transform: translateY(1px); }
 
@@ -107,10 +95,10 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
   padding: 7px 10px; font-size: 12px; font-weight: 600; border-radius: 9px; cursor: pointer;
   background: var(--panel-2); border: 1px solid var(--line); color: var(--text); display: inline-flex; align-items: center;
 }
-.btn.mini.danger { color: #ff8a7a; padding: 4px 9px; }
+.btn.mini.danger { color: var(--danger); padding: 4px 9px; }
 .feel-status { font-size: 12px; margin: 8px 0 2px; min-height: 14px; }
-.feel-status.ok { color: #43d39e; }
-.feel-status.err { color: #ff8a7a; }
+.feel-status.ok { color: var(--success); }
+.feel-status.err { color: var(--danger); }
 .savedlist { display: flex; flex-direction: column; gap: 5px; margin-top: 8px; }
 .saved { display: flex; align-items: center; gap: 8px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px; padding: 6px 9px; }
 .saved .nm { flex: 1; font-size: 13px; }
@@ -124,13 +112,13 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
   background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
   border-radius: 10px; padding: 8px 16px; font-size: 13px; font-weight: 700; letter-spacing: .04em; cursor: pointer;
 }
-.tab.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.tab.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .hidden { display: none !important; }
 
 /* ===== Generator: selectable rows + create/add action bar ===== */
 .selhead { display: flex; align-items: center; gap: 8px; cursor: pointer; }
 .pcheck { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; margin: 0; flex: none; }
-.selflash { font-size: 13px; color: #43d39e; text-align: center; margin-bottom: 8px; }
+.selflash { font-size: 13px; color: var(--success); text-align: center; margin-bottom: 8px; }
 .selbar {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   background: var(--panel); border: 1px solid var(--accent); border-radius: 10px; padding: 10px 12px; margin: 0 0 6px;
@@ -152,7 +140,7 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
 }
 .songactions { align-items: center; gap: 10px; }
 .savehint { font-size: 12px; color: var(--muted); margin-right: auto; }
-.btn.danger { color: #ff8a7a; }
+.btn.danger { color: var(--danger); }
 .namebar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; width: 100%; }
 .nameinput {
   background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
@@ -181,7 +169,7 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
 .chordpicker {
   position: fixed; z-index: 100; width: 190px;
   background: var(--panel); border: 1px solid var(--accent); border-radius: 12px;
-  padding: 8px; box-shadow: 0 12px 34px rgba(0, 0, 0, .5);
+  padding: 8px; box-shadow: 0 12px 34px var(--shadow);
   display: flex; flex-direction: column; gap: 6px;
 }
 .cp-arrow {
@@ -195,7 +183,7 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
   border-radius: 8px; padding: 9px 10px; font-size: 15px; font-weight: 600; line-height: 1;
   cursor: pointer; text-align: center;
 }
-.cp-tone.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.cp-tone.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .cp-quality { display: flex; align-items: center; gap: 6px; border-top: 1px solid var(--line); padding-top: 6px; }
 .cp-qname { font-size: 13px; font-weight: 700; color: var(--accent-soft); margin-right: auto; }
 .cp-remove { border-top: 1px solid var(--line); padding-top: 6px; display: flex; }
@@ -225,8 +213,8 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
 /* Status strip: compact chips + input picker + a single hint line. */
 .tapestatus { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .tapechip { border-radius: 9px; padding: 6px 10px; font-size: 12px; font-weight: 600; }
-.tapechip.warn { background: rgba(255, 122, 96, .12); border: 1px solid var(--accent-soft); color: var(--accent-soft); }
-.tapechip.err { background: rgba(255, 90, 60, .14); border: 1px solid var(--accent); color: #ff8a7a; }
+.tapechip.warn { background: var(--warn-bg); border: 1px solid var(--accent-soft); color: var(--accent-soft); }
+.tapechip.err { background: var(--err-bg); border: 1px solid var(--accent); color: var(--danger); }
 .tapein { width: auto; flex: 1 1 200px; }
 .tapehint { flex: 1 1 100%; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 
@@ -255,14 +243,14 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
 }
 .knob-ind {
   position: absolute; left: 50%; top: 4%; width: 4px; height: 46%;
-  margin-left: -2px; border-radius: 2px; background: #39ff14;
-  box-shadow: 0 0 5px rgba(57, 255, 20, .8), 0 0 2px rgba(0, 0, 0, .6);
+  margin-left: -2px; border-radius: 2px; background: var(--dial);
+  box-shadow: 0 0 5px var(--dial-glow), 0 0 2px var(--shadow);
 }
 .knob-lbl { font-size: 8px; letter-spacing: .08em; color: var(--muted); }
 /* Disabled knobs (a strip with no take loaded) still read the chosen position clearly: only a
    light dim, and a softer neon-green indicator rather than the near-invisible muted grey. */
 .knob.disabled { opacity: .75; pointer-events: none; }
-.knob.disabled .knob-ind { background: #57e04a; }
+.knob.disabled .knob-ind { background: var(--dial-dim); }
 
 /* Fader + meter side by side. */
 .tsfm { display: flex; align-items: stretch; justify-content: center; gap: 5px; width: 100%; }
@@ -279,14 +267,14 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
 .fader-cap::after { content: ""; position: absolute; left: 3px; right: 3px; top: 50%; height: 1px; background: var(--muted); }
 .fader.disabled { opacity: .35; pointer-events: none; }
 
-.ledmeter { position: relative; width: 12px; flex: none; border-radius: 3px; overflow: hidden; background: #0d0f13; border: 1px solid var(--line); }
+.ledmeter { position: relative; width: 12px; flex: none; border-radius: 3px; overflow: hidden; background: var(--inset); border: 1px solid var(--line); }
 .led-off, .led-on {
   position: absolute; inset: 1px;
   background: repeating-linear-gradient(to top,
     var(--ledc) 0 calc((100% - (var(--seg) - 1) * 2px) / var(--seg)),
     transparent calc((100% - (var(--seg) - 1) * 2px) / var(--seg)) calc((100% - (var(--seg) - 1) * 2px) / var(--seg) + 2px));
 }
-.led-off { --ledc: #262b36; }
+.led-off { --ledc: var(--led-off); }
 .led-on { --ledc: var(--led); clip-path: inset(calc((1 - var(--lit)) * 100%) 0 0 0); }
 .ledmeter.clip .led-on { --ledc: var(--accent); clip-path: none; }
 
@@ -311,7 +299,7 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
 .tsbounce:active, .tsin:active { transform: translateY(1px); }
 
 /* LED counter window (flat inset). */
-.tapecounter { width: 100%; background: #0d0f13; border: 1px solid var(--line); border-radius: 8px; padding: 7px 8px; text-align: center; }
+.tapecounter { width: 100%; background: var(--inset); border: 1px solid var(--line); border-radius: 8px; padding: 7px 8px; text-align: center; }
 .tc-time { font: 700 clamp(18px, 4.6vw, 26px)/1 ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; color: var(--accent-soft); }
 .tc-take { font-size: 9px; letter-spacing: .12em; color: var(--muted); margin-top: 3px; }
 .tc-stat { font-size: 9px; letter-spacing: .08em; color: var(--accent-soft); min-height: 11px; margin-top: 2px; }

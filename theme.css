@@ -1,0 +1,62 @@
+/* theme.css — THE single source of truth for every UI color (the theme config).
+ *
+ * Two layers:
+ *   1. palette primitives (--c-*)  — the raw color values, named by hue.
+ *   2. semantic roles (--accent, --danger, …) — what styles.css actually references;
+ *      each points at a primitive, so a role is recolored by repointing one line.
+ *   3. derived translucent fills — auto-follow their base via color-mix (desktop Chrome).
+ *
+ * To recolor the app: change a primitive. To add a color scheme later: add a
+ *   :root[data-theme="<name>"] { … reassign primitives … }
+ * block below and flip document.documentElement.dataset.theme.
+ *
+ * Note: the browser-chrome colors that CSS can't reach live outside this file and must
+ * be kept in sync by hand if --bg ever changes: index.html <meta name="theme-color">,
+ * manifest.webmanifest theme_color/background_color, and the pre-rendered icon PNGs.
+ */
+:root {
+  /* ---- palette primitives (raw values) ---- */
+  --c-bg:          #15171c;   /* app background */
+  --c-panel:       #1b1e25;   /* card / panel surface */
+  --c-panel-2:     #222631;   /* inset control surface (buttons, selects, inputs) */
+  --c-inset:       #0d0f13;   /* deep inset "screen" well (meters, counter) */
+  --c-line:        #2c313c;   /* borders / dividers */
+  --c-led-off:     #262b36;   /* unlit LED-meter segment */
+  --c-ink:         #e9ecf1;   /* primary text */
+  --c-ink-dim:     #8b93a3;   /* secondary / muted text */
+  --c-white:       #ffffff;   /* text on an accent-filled control */
+  --c-orange:      #ff6a00;   /* bright neon orange — primary accent (was red-orange #ff5a3c) */
+  --c-orange-soft: #ff9142;   /* softer orange — subtitles, hover, warn */
+  --c-green:       #39ff14;   /* neon-green dial pointer */
+  --c-green-dim:   #57e04a;   /* dimmer green — disabled dial */
+  --c-success:     #43d39e;   /* success / confirmation */
+  --c-blue:        #4f8cff;   /* LED meter (lit) */
+  --c-gold:        #f3b13b;   /* brand amber (icon accent-2) */
+
+  /* ---- semantic roles (referenced by styles.css) ---- */
+  --bg:          var(--c-bg);
+  --panel:       var(--c-panel);
+  --panel-2:     var(--c-panel-2);
+  --inset:       var(--c-inset);
+  --line:        var(--c-line);
+  --text:        var(--c-ink);
+  --muted:       var(--c-ink-dim);
+  --on-accent:   var(--c-white);
+  --accent:      var(--c-orange);
+  --accent-soft: var(--c-orange-soft);
+  --danger:      var(--c-orange);       /* red → neon orange; own token so it can diverge later */
+  --success:     var(--c-success);
+  --dial:        var(--c-green);
+  --dial-dim:    var(--c-green-dim);
+  --led:         var(--c-blue);
+  --led-off:     var(--c-led-off);
+
+  /* ---- derived translucent fills (follow their base token) ---- */
+  --warn-bg:   color-mix(in srgb, var(--accent-soft) 12%, transparent);
+  --err-bg:    color-mix(in srgb, var(--accent) 14%, transparent);
+  --dial-glow: color-mix(in srgb, var(--dial) 80%, transparent);
+  --shadow:    rgba(0, 0, 0, .55);
+
+  /* ---- non-color design tokens ---- */
+  --radius: 14px;
+}
