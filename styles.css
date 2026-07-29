@@ -254,15 +254,15 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
   will-change: transform;
 }
 .knob-ind {
-  position: absolute; left: 50%; top: 6%; width: 3px; height: 40%;
-  margin-left: -1.5px; border-radius: 2px; background: #f4f6fa;
-  box-shadow: 0 0 2px rgba(0, 0, 0, .55);
+  position: absolute; left: 50%; top: 4%; width: 4px; height: 46%;
+  margin-left: -2px; border-radius: 2px; background: #ffffff;
+  box-shadow: 0 0 3px rgba(0, 0, 0, .7), 0 0 5px rgba(255, 255, 255, .4);
 }
 .knob-lbl { font-size: 8px; letter-spacing: .08em; color: var(--muted); }
-/* Disabled knobs (a strip with no take loaded) still read the chosen position: dim the whole
-   knob a little, but keep the indicator light rather than the near-invisible muted grey. */
-.knob.disabled { opacity: .6; pointer-events: none; }
-.knob.disabled .knob-ind { background: #cfd4de; }
+/* Disabled knobs (a strip with no take loaded) still read the chosen position clearly: only a
+   light dim, and a light-grey indicator rather than the near-invisible muted grey. */
+.knob.disabled { opacity: .7; pointer-events: none; }
+.knob.disabled .knob-ind { background: #d7dbe4; }
 
 /* Fader + meter side by side. */
 .tsfm { display: flex; align-items: stretch; justify-content: center; gap: 5px; width: 100%; }
