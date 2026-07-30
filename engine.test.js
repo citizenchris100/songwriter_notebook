@@ -20,6 +20,7 @@ import {
   createSong, appendProgressions, reorderProgression, removeProgression, copyProgression,
   setProgressionLabel, setLyrics, renameSong, finalizeDraft, duplicateSong,
   appendRow, addChord, setChord, removeChord, toMarkdown,
+  toSongFile, resolveOpenedTapeDeck,
 } from './js/songs.js';
 import {
   isAcceptedAudio, makeSketchMeta, validateSketchMeta,
@@ -551,6 +552,54 @@ ok('normalizeSong preserves a present file ref', normalizeSong({ ...goodSong, fi
 ok('normalizeSong reduces file to { name } only', !('handle' in normalizeSong({ ...goodSong, file: { name: 'x.json', handle: 1 } }).file));
 ok('normalizeSong omits the file key entirely when absent', !('file' in normalizeSong(goodSong)));
 
+// ---- toSongFile: the pure export-shaped song file. It is the single writer of the .json's
+// metadata (the impure caller only adds the base64 `audio` map), and it MUST embed the durable
+// tapeDeck.takes so the .json is the single source of truth for restore-on-open (the take AUDIO
+// stays in the folder, referenced by filename). This is the guard for the dead-code bug where
+// main.js's copy returned before the tapeDeck block, silently dropping takes from every .json. ----
+const tdSongFile = { ...goodSong, tapeDeck: { path: 'takes/my-song/', schemaVersion: 2, takes: [savedTakeRec] } };
+const sf = toSongFile(tdSongFile);
+eq('toSongFile sets $schema', sf['$schema'], './song.schema.json');
+eq('toSongFile stamps schemaVersion 1', sf.schemaVersion, 1);
+eq('toSongFile carries id + name', sf.id + '/' + sf.name, 'my-song/My Song');
+ok('toSongFile passes progressions through', sf.progressions.length === 1 && sf.progressions[0].chords[0].name === 'C');
+ok('toSongFile passes sketches through', Array.isArray(sf.sketches));
+// THE RED-PROVING VECTOR — tapeDeck.takes must survive into the .json.
+ok('toSongFile embeds the tapeDeck', !!sf.tapeDeck && sf.tapeDeck.path === 'takes/my-song/');
+eq('toSongFile stamps tapeDeck.schemaVersion 2', sf.tapeDeck.schemaVersion, 2);
+eq('toSongFile round-trips the saved take records', sf.tapeDeck.takes.length, 1);
+eq('toSongFile keeps the saved take number', sf.tapeDeck.takes[0].take, 2);
+eq('toSongFile keeps the folder loc on a restored slot', sf.tapeDeck.takes[0].stems.stem1.loc, 'folder');
+ok('toSongFile omits tapeDeck when the song has none', !('tapeDeck' in toSongFile(goodSong)));
+ok('toSongFile never writes the local file link', !('file' in toSongFile({ ...goodSong, file: { name: 'x.json' } })));
+ok('toSongFile normalizes a takeless tapeDeck path to takes:[]',
+   JSON.stringify(toSongFile({ ...goodSong, tapeDeck: { path: 'takes/my-song/' } }).tapeDeck.takes) === '[]');
+
+// projectTakesForJson is lossless for durable metadata: it spreads the whole take, so a take's
+// click config and frozen drum pattern survive into the .json (see section 14's `proj` fixture).
+// (asserted in section 14 next to projectTakesForJson, where p1 is in scope.)
+
+// ---- resolveOpenedTapeDeck: opening a .json must NEVER destroy durable take records the file
+// itself doesn't contain (the migration-safety invariant that prevents the localStorage wipe). ----
+const ownTd = { path: 'takes/my-song/', schemaVersion: 2, takes: [savedTakeRec] };
+const openIncomingTd = { ...goodSong, id: 'my-song', tapeDeck: ownTd };
+const openIncomingNoTd = { ...goodSong, id: 'my-song' };
+const openExistingTd = { ...goodSong, id: 'my-song', tapeDeck: ownTd };
+ok('resolveOpenedTapeDeck keeps a matching incoming tapeDeck on a faithful open',
+   resolveOpenedTapeDeck(openIncomingTd, undefined, 'open', false) === ownTd);
+ok('resolveOpenedTapeDeck preserves EXISTING takes when the incoming .json has none (no wipe)',
+   resolveOpenedTapeDeck(openIncomingNoTd, openExistingTd, 'open', false) === ownTd);
+ok('resolveOpenedTapeDeck strips on a foreign import',
+   resolveOpenedTapeDeck(openIncomingTd, openExistingTd, 'import', false) === undefined);
+ok('resolveOpenedTapeDeck strips on an id reslug (dead refs)',
+   resolveOpenedTapeDeck(openIncomingTd, undefined, 'open', true) === undefined);
+ok('resolveOpenedTapeDeck drops a mismatched-path incoming tapeDeck when nothing durable exists',
+   resolveOpenedTapeDeck({ ...goodSong, id: 'other', tapeDeck: ownTd }, undefined, 'open', false) === undefined);
+ok('resolveOpenedTapeDeck yields undefined when neither side has takes',
+   resolveOpenedTapeDeck(openIncomingNoTd, undefined, 'open', false) === undefined);
+ok('resolveOpenedTapeDeck ignores an existing EMPTY takes array',
+   resolveOpenedTapeDeck(openIncomingNoTd, { ...goodSong, tapeDeck: { path: 'takes/my-song/', takes: [] } }, 'open', false) === undefined);
+
 // ---- toMarkdown: the pure Rich .md companion export (title, per-row headings, aligned
 // chord table with spelled notes, Lyrics block). Date is sliced off updatedAt, never Date. ----
 const mdSong = {
@@ -848,6 +897,11 @@ const p1 = proj.find((t) => t.take === 1);
 ok('projection keeps both folder slots of a fully-saved take', slotLoc(p1.stems.stem1) === 'folder' && slotLoc(p1.stems.stem2) === 'folder');
 ok('projection keeps a folder bounce', !!(p1.bounce && p1.bounce.loc === 'folder'));
 ok('a fully-saved projected take is not flagged recovered', p1.recovered === false);
+// Losslessness guard: the projection spreads the whole take, so per-take click config and the
+// frozen drum pattern survive into the .json — proving tapeDeck.takes is a COMPLETE durable
+// record (what lets the .json be the single source of truth and the folder manifest be dropped).
+ok('projectTakesForJson preserves per-take click config', 'click' in p1);
+ok('projectTakesForJson preserves per-take drums config (the frozen pattern lives here)', 'drums' in p1);
 const p2 = proj.find((t) => t.take === 2);
 ok('projection keeps the folder slot of a partial take', slotLoc(p2.stems.stem1) === 'folder');
 eq('projection nulls the opfs-only slot of a partial take', p2.stems.stem2, null);
@@ -1391,6 +1445,50 @@ ok('decayPeak fall rate matches FALL_DB_PER_SEC', Math.abs(decayPeak(1.0, 0, 100
   ok('audioEngine exposes getContextLatency on its public API', /return\s*\{[^}]*\bgetContextLatency\b/.test(aeSrc));
   ok('the live estimate is never persisted (writeLatency only for measured/manual)',
      !/writeLatency\([^)]*source:\s*['"](none|estimate)['"]/.test(mainSrc));
+}
+
+// ============================================================================
+// 23b. Single-source-of-truth wiring — the impure Save / open / dupe / migration glue the node
+//      test can't execute. These string tripwires lock in "the song .json is the source of truth
+//      for take records, the folder manifest.json is dropped", and guard the dead-code class of
+//      bug (a tapeDeck block stranded after toSongFile's early return, which shipped every .json
+//      without its takes).
+// ============================================================================
+{
+  const mainSrc = readFileSync(here('./js/main.js'), 'utf8');
+  const songsSrc = readFileSync(here('./js/songs.js'), 'utf8');
+
+  // The .json serializer is the pure, node-tested one; main.js no longer carries its own copy.
+  ok('main.js imports toSongFile from songs.js', /import\s*\{[\s\S]*?\btoSongFile\b[\s\S]*?\}\s*from\s*'\.\/songs\.js'/.test(mainSrc));
+  ok('main.js defines no local toSongFile (the dead-code copy is gone)', !/function\s+toSongFile\s*\(/.test(mainSrc));
+  ok('toSongBundle delegates to the pure toSongFile', mainSrc.includes('const base = toSongFile(song)'));
+  ok('songs.toSongFile assigns tapeDeck onto the returned object', songsSrc.includes('out.tapeDeck ='));
+
+  // The folder manifest.json is deprecated: never written; read ONCE, only by the legacy migration.
+  ok('no folder manifest.json is ever written', !/folderStore\.writeFile\([^)]*manifestPath/.test(mainSrc));
+  eq('the folder manifest is read only by the legacy migration', (mainSrc.match(/folderStore\.readFile\([^)]*manifestPath/g) || []).length, 1);
+  ok('migrateTapeDeckFromFolder backfills the .json via tapeDeckWithTakes',
+     /async function migrateTapeDeckFromFolder/.test(mainSrc) && /migrateTapeDeckFromFolder[\s\S]*?tapeDeckWithTakes/.test(mainSrc));
+
+  // Restore precedence is OPFS -> .json hydrate -> fresh; no 'folder' record source survives.
+  ok('restore never selects a folder record source', !/source\s*={1,3}\s*'folder'/.test(mainSrc));
+  ok('restore hydrates durable takes from the song record', mainSrc.includes('hydrateSavedTakes(a.id, savedTakes)'));
+
+  // Save writes the durable .json (via the shared writer) and surfaces a write failure.
+  ok('a shared writeSongJsonById exists', /async function writeSongJsonById/.test(mainSrc));
+  ok('onSaveDeck writes the song .json via writeSongJsonById', mainSrc.includes('const jsonWritten = await writeSongJsonById(a.id)'));
+  ok('a failed .json write is surfaced, not swallowed', mainSrc.includes('could not update the song .json'));
+
+  // Re-opening a tapeDeck-less .json can't wipe takes: importOneSong reconciles via the pure helper.
+  ok('importOneSong reconciles tapeDeck via resolveOpenedTapeDeck', mainSrc.includes('resolveOpenedTapeDeck(s, existing, mode, reslug)'));
+
+  // Dupe copies the takes listed by the SOURCE song's tapeDeck.takes (SSOT), writing no manifest.
+  ok('dupe sources takes from the source song tapeDeck.takes', mainSrc.includes('const durable = (a.tapeDeck && Array.isArray(a.tapeDeck.takes))'));
+
+  // Save must not destroy recovery sources when the durable .json commit failed: OPFS-temp deletion
+  // is gated on jsonWritten, and a legacy folder manifest.json is preserved when jsonWritten is false.
+  ok('onSaveDeck deletes OPFS temps only after a successful .json write', /if \(jsonWritten\)\s*\{[\s\S]{0,240}deleteTakeAudio\(/.test(mainSrc));
+  ok('onSaveDeck keeps a legacy folder manifest when the .json write failed', mainSrc.includes("if (!jsonWritten) referenced.add('manifest.json')"));
 }
 
 // ============================================================================

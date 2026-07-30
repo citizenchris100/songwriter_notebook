@@ -135,6 +135,61 @@ export function normalizeSong(s) {
   return out;
 }
 
+// ---- .json serialization + open reconciliation (the single source of truth) ----
+
+// Build the export-shaped song file (metadata only; the impure caller adds the base64 `audio`
+// map for sketches). This is the ONE writer of the .json's shape — song Save, tape-deck Save,
+// and duplicate all go through it — so embedding the durable tape-deck take records HERE makes
+// the .json the single source of truth: opening a song restores its takes with no folder read.
+// The take AUDIO stays out-of-band in the song folder, referenced by filename (only folder-saved
+// slots are here — see takeModel.projectTakesForJson, which feeds song.tapeDeck.takes). A FOREIGN
+// import strips tapeDeck (importOneSong) and the local `file` link is never written. Pure — so
+// the engine test proves the embed (the bug this replaces lived in impure main.js, untested, and
+// silently dropped tapeDeck from every .json).
+export function toSongFile(s) {
+  const out = {
+    '$schema': './song.schema.json',
+    schemaVersion: 1,
+    id: s.id,
+    name: s.name,
+    createdAt: s.createdAt,
+    updatedAt: s.updatedAt,
+    lyrics: s.lyrics,
+    progressions: (s.progressions || []).map((p) => {
+      const pOut = { label: p.label, title: p.title, chords: p.chords.map((c) => ({ name: c.name, notes: c.notes.slice() })) };
+      if (p.provenance) pOut.provenance = { ...p.provenance };
+      return pOut;
+    }),
+    sketches: (s.sketches || []).map((sk) => ({
+      id: sk.id, filename: sk.filename, mimeType: sk.mimeType, format: sk.format, size: sk.size, addedAt: sk.addedAt, notes: sk.notes,
+    })),
+  };
+  if (s.tapeDeck && typeof s.tapeDeck.path === 'string') {
+    out.tapeDeck = { path: s.tapeDeck.path, schemaVersion: 2, takes: Array.isArray(s.tapeDeck.takes) ? s.tapeDeck.takes : [] };
+  }
+  return out;
+}
+
+// Decide which tapeDeck a freshly opened/imported song should carry, so OPENING a .json can
+// never DESTROY durable take records the file itself doesn't contain (the invariant that stops
+// a tapeDeck-less .json from wiping the localStorage copy on re-open). Rules:
+//  - a foreign import, or any id reslug -> undefined (strip: the take audio isn't present and the
+//    refs would point at a dead takes/<id>/);
+//  - a faithful own-open whose incoming .json carries a tapeDeck whose path matches this id ->
+//    keep the incoming records (the .json is authoritative);
+//  - a faithful own-open whose incoming .json has NO (or a mismatched) tapeDeck, but the EXISTING
+//    in-memory record still holds saved takes -> keep the existing ones (never wipe; a later Save
+//    or the grant-migration re-embeds them into the .json).
+// Returns the tapeDeck object to set, or undefined to omit the field. Pure.
+export function resolveOpenedTapeDeck(incoming, existing, mode, reslug) {
+  if (mode !== 'open' || reslug) return undefined;
+  const inTd = incoming && incoming.tapeDeck;
+  if (inTd && typeof inTd.path === 'string' && inTd.path === 'takes/' + incoming.id + '/') return inTd;
+  const exTd = existing && existing.tapeDeck;
+  if (exTd && Array.isArray(exTd.takes) && exTd.takes.length) return exTd;
+  return undefined;
+}
+
 function normalizeProgression(p) {
   const out = {
     label: LABEL_SET.has(p.label) ? p.label : '',
