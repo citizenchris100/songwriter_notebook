@@ -80,6 +80,7 @@ import {
   clipEndBar, clipsOverlap, laneLengthBars, clipsInRegion, firstFreeBarFrom,
   replaceRegionWithClip, sliceClipAtBar, trimClipEdge, deleteClip, dupeClip,
 } from './js/tape/clipModel.js';
+import { maxScrollPx, pageScrollOffset } from './js/tape/timelineNav.js';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const readJSON = (p) => JSON.parse(readFileSync(here(p), 'utf8'));
@@ -1298,6 +1299,36 @@ ok('cache is stale after an in-place bounce bumps the epoch',
 }
 
 // ============================================================================
+// 14e. Tape deck (pure) — timelineNav.js: page-scroll geometry
+// ============================================================================
+// The horizontal nav-arrow math: one-screenful paging, clamped to [0, maxScroll].
+{
+  // maxScrollPx = how much wider the content is than the viewport (never negative).
+  eq('maxScrollPx = content - viewport', maxScrollPx(1000, 2400), 1400);
+  eq('maxScrollPx 0 when content fits', maxScrollPx(1000, 800), 0);
+  eq('maxScrollPx 0 at exact fit', maxScrollPx(1000, 1000), 0);
+
+  // pageScrollOffset: dir -1 left / +1 right, pages by (viewport - overlap = 952 here).
+  eq('page right from 0 = viewport - overlap', pageScrollOffset(0, 1, 1000, 2400, 48), 952);
+  eq('page left from 0 clamps to 0 (never negative)', pageScrollOffset(0, -1, 1000, 2400, 48), 0);
+  eq('page right clamps to maxScroll', pageScrollOffset(952, 1, 1000, 2400, 48), 1400);
+  eq('page right at max stays at max', pageScrollOffset(1400, 1, 1000, 2400, 48), 1400);
+  eq('page left from max steps back one page', pageScrollOffset(1400, -1, 1000, 2400, 48), 448);
+  eq('page left near start clamps to 0', pageScrollOffset(448, -1, 1000, 2400, 48), 0);
+
+  // Content fits on screen -> both directions pinned to 0 (drives BOTH arrows greyed).
+  eq('content fits: right = 0', pageScrollOffset(0, 1, 1000, 800, 48), 0);
+  eq('content fits: left = 0', pageScrollOffset(0, -1, 1000, 800, 48), 0);
+
+  // Degenerate viewport (narrower than the overlap): page floors to 1, still advances.
+  eq('tiny viewport still advances by >=1', pageScrollOffset(0, 1, 40, 2400, 48), 1);
+
+  // Integer discipline + overshoot.
+  eq('current px is floored', pageScrollOffset(10.9, 1, 1000, 2400, 48), 962);
+  ok('result is a non-negative integer', Number.isInteger(pageScrollOffset(0, 1, 1000, 2400, 48)) && pageScrollOffset(0, -1, 1000, 2400, 48) >= 0);
+}
+
+// ============================================================================
 // 15. Tape deck (pure) — wav.js
 // ============================================================================
 eq('SIZE_FIELDS shape', JSON.stringify(SIZE_FIELDS), JSON.stringify([{ offset: 4, bias: 36 }, { offset: 40, bias: 0 }]));
@@ -2477,6 +2508,28 @@ eq('sortLoopNames numeric order', sortLoopNames(['010.mid', '002.mid', '001.mid'
   ok('drum panel branches on sequence mode', dpSrc.includes("mode === 'sequence'") && dpSrc.includes('buildSequenceSection'));
   ok('drum panel exposes folder + algorithm + preview controls', dpSrc.includes('onPickLoopFolder') && dpSrc.includes('onSetAlgorithm') && dpSrc.includes('onPreviewSequence'));
   ok('drum panel exposes a time-signature selector', dpSrc.includes('onSetClick({ timeSigIndex'));
+}
+
+// ============================================================================
+// 34. Timeline nav arrows — wiring tripwires (impure view/CSS/SW paths node can't run).
+//     Guard the on-screen ◀/▶ paging so a refactor can't silently drop it.
+// ============================================================================
+{
+  const tvSrc = readFileSync(here('./js/tape/tapeView.js'), 'utf8');
+  ok('tapeView imports pageScrollOffset + maxScrollPx from timelineNav.js',
+     tvSrc.includes("from './timelineNav.js'") && /pageScrollOffset/.test(tvSrc) && /maxScrollPx/.test(tvSrc));
+  ok('tapeView renders a right-aligned .tlnav arrow group', tvSrc.includes("'tlnav'") && tvSrc.includes('◀') && tvSrc.includes('▶'));
+  ok('the nav step drives scroll off pageScrollOffset', /pageScrollOffset\(/.test(tvSrc) && tvSrc.includes('scroll.scrollLeft'));
+  ok('the nav step persists via onTimelineScroll', /handlers\.onTimelineScroll\(/.test(tvSrc));
+  ok('nav buttons grey out at the ends via maxScrollPx', /maxScrollPx\(/.test(tvSrc) && /\.disabled\s*=/.test(tvSrc));
+
+  const cssSrc = readFileSync(here('./styles.css'), 'utf8');
+  ok('styles.css right-aligns the nav group', /\.tlnav\s*\{[^}]*margin-left:\s*auto/.test(cssSrc));
+
+  const swSrc = readFileSync(here('./sw.js'), 'utf8');
+  ok('sw.js caches timelineNav.js', swSrc.includes('./js/tape/timelineNav.js'));
+  ok('sw.js cache version bumped past sn-v46',
+     /const CACHE = "sn-v(\d+)"/.test(swSrc) && Number((swSrc.match(/const CACHE = "sn-v(\d+)"/) || [])[1]) >= 47);
 }
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');

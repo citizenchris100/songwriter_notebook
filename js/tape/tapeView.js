@@ -18,6 +18,7 @@ import { h } from '../dom.js';
 import { STEM_KEYS, slotHasAudio, laneClips } from './takeModel.js';
 import { buildKnob, buildFader, buildLedMeter, buildCounter } from './deckControls.js';
 import { buildDrumPanel } from './drumPanel.js';
+import { pageScrollOffset, maxScrollPx } from './timelineNav.js';
 import { METER_SEGMENTS } from './meterModel.js';
 
 const STEM_LABELS = { stem1: 'Track 1', stem2: 'Track 2', stem3: 'Track 3', stem4: 'Track 4' };
@@ -415,6 +416,15 @@ function timelineBody(deck, handlers) {
   } else {
     toolbar.appendChild(h('div', 'tlhint', hintText));
   }
+  // Right-aligned ◀/▶ paging: scroll the timeline one screenful past what's visible.
+  const nav = h('div', 'tlnav');
+  const navLeft = h('button', 'tltool', '◀'); navLeft.title = 'Scroll left one screen';
+  const navRight = h('button', 'tltool', '▶'); navRight.title = 'Scroll right one screen';
+  navLeft.disabled = navRight.disabled = true; // enabled after layout measures the viewport
+  navLeft.addEventListener('click', () => navStep(-1));
+  navRight.addEventListener('click', () => navStep(1));
+  nav.append(navLeft, navRight);
+  toolbar.appendChild(nav);
   box.appendChild(toolbar);
 
   // ---- scrollable grid: ruler + 4 lanes + the head, all sharing bar-0 = x-0 ----
@@ -490,9 +500,24 @@ function timelineBody(deck, handlers) {
 
   scroll.appendChild(grid);
   box.appendChild(scroll);
-  // preserve + report the horizontal scroll across full re-renders
-  requestAnimationFrame(() => { scroll.scrollLeft = deck.scrollLeft || 0; });
-  scroll.addEventListener('scroll', () => handlers.onTimelineScroll(scroll.scrollLeft));
+
+  // ◀/▶ page the viewport one screenful (pure clamp in timelineNav.js); grey out at the ends.
+  function navStep(dir) {
+    const target = pageScrollOffset(scroll.scrollLeft, dir, scroll.clientWidth, gridW, PX);
+    scroll.scrollTo({ left: target, behavior: 'smooth' });
+    handlers.onTimelineScroll(target);
+    updateNav();
+  }
+  function updateNav() {
+    const max = maxScrollPx(scroll.clientWidth, gridW);
+    navLeft.disabled = recording || scroll.scrollLeft <= 0;
+    navRight.disabled = recording || scroll.scrollLeft >= max;
+  }
+
+  // preserve + report the horizontal scroll across full re-renders; refresh the nav grey-out
+  // on first paint (clientWidth is only known post-layout) and on every free scroll.
+  requestAnimationFrame(() => { scroll.scrollLeft = deck.scrollLeft || 0; updateNav(); });
+  scroll.addEventListener('scroll', () => { handlers.onTimelineScroll(scroll.scrollLeft); updateNav(); });
 
   return { el: box, counter };
 }

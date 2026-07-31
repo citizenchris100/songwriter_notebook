@@ -399,6 +399,7 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
 .tlwrap { padding: 10px; display: flex; flex-direction: column; gap: 10px; }
 .tltoolbar { align-items: center; gap: 14px; flex-wrap: wrap; }
 .tltools { display: flex; gap: 6px; }
+.tlnav { display: flex; gap: 6px; margin-left: auto; } /* push the ◀/▶ paging arrows to the toolbar's right edge */
 .tltool { width: 40px; height: 36px; border: 1px solid #333; border-radius: 7px; background: #1b1b1d; color: #cfd2d6; font-size: 16px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
 .tltool.on { background: #2a2a2e; border-color: #39ff14; color: #39ff14; box-shadow: 0 0 0 1px #39ff14 inset; }
 .tltool:disabled { opacity: .4; cursor: not-allowed; }
