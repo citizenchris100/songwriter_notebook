@@ -40,6 +40,10 @@ import {
   LUFS_TARGET, LUFS_FLOOR, BOUNCE_GAIN_DB_MIN, BOUNCE_GAIN_DB_MAX, LIMITER_CEILING_DB,
   STEM_KEYS, MAX_TRACKS, TAKE_STATUS,
 } from './js/tape/takeModel.js';
+import {
+  resolveDeckRestore, reconcileTakelessSong, reconstructManifestFromFiles,
+  planDupeTakes, pruneTapeDeckToCopied, runDeckRestore, manifestReferencesFolderAudio,
+} from './js/tape/deckRestore.js';
 import { wavHeader, floatToInt16, interleave, parseWav, SIZE_FIELDS } from './js/tape/wav.js';
 import { integratedLoudness } from './js/tape/lufs.js';
 import { limit } from './js/tape/limiter.js';
@@ -940,6 +944,179 @@ eq('rekeyManifest leaves an opfs-projected (null) slot null', rk2.stems.stem2, n
 ok('rekeyManifest is immutable (source filename unchanged)', proj.find((t) => t.take === 1).stems.stem1.file === stemFileName('blue-eyes', 1, 'stem1'));
 ok('a rekeyed manifest validates', validateManifest(rekeyed).ok);
 
+// ============================================================================
+// 14b. Deck restore reconciliation (pure decision + injected orchestrator)
+//   The multi-store reconciliation that used to live inline in impure main.js and only
+//   ever got grep-"tripwired". These RED tests make the COMPOSITION executable: the reboot
+//   hole (H B), the takeless-song repair (H1/everyday), the Dupe take source (H1/H2/H3),
+//   the legacy-read-then-DELETE (real deprecation), and the crash-safe write ordering (H6).
+// ============================================================================
+
+// A faithful "everyday" folder manifest: proj's two folder-saved takes, re-keyed + normalized
+// so the WAV filenames match the slug (everyday_1_stem1.wav, …). 2 active folder takes.
+const drFolderMan = normalizeManifest(rekeyManifest({ schemaVersion: 2, slug: 'blue-eyes', takes: proj }, 'everyday'));
+const drSaved = drFolderMan.takes;             // = song.tapeDeck.takes (durable embed)
+const drOpfsFull = projMan;                    // a non-empty OPFS working manifest (3 active-audio takes)
+const drOpfsEmpty = createManifest('everyday');
+
+// -- manifestReferencesFolderAudio --
+ok('manifestReferencesFolderAudio true when a take has a folder slot', manifestReferencesFolderAudio(drFolderMan) === true);
+ok('manifestReferencesFolderAudio false for an empty manifest', manifestReferencesFolderAudio(drOpfsEmpty) === false);
+
+// -- resolveDeckRestore: the full open precedence --
+const drJsonInputs = { slug: 'everyday', savedTakes: drSaved, opfsManifest: drOpfsEmpty, opfsReadable: true, folderManifest: null, folderGranted: false, hasFolderHandle: true };
+const dr1 = resolveDeckRestore({ slug: 'everyday', savedTakes: drSaved, opfsManifest: drOpfsFull, opfsReadable: true, folderManifest: null, folderGranted: false, hasFolderHandle: true });
+eq('R1 opfs non-empty is session truth', dr1.source, 'opfs');
+ok('R1 opfs source may cache to OPFS', dr1.canWriteOpfs === true);
+ok('R1 no recover offer when opfs is truth', dr1.offerRecover === false);
+ok('R10 opfs w/ folder audio, ungranted → needsGrant', dr1.needsGrant === true);
+
+const dr2 = resolveDeckRestore(drJsonInputs);
+eq('R2 opfs empty → json hydrate', dr2.source, 'json');
+eq('R2 json hydrates the durable takes', dr2.manifest.takes.length, 2);
+ok('R2 json restore never caches to OPFS', dr2.canWriteOpfs === false);
+ok('R2 json restore ungranted → needsGrant (to play audio)', dr2.needsGrant === true);
+
+const dr3 = resolveDeckRestore({ ...drJsonInputs, folderGranted: true });
+ok('R3 json restore already granted → no grant needed', dr3.needsGrant === false);
+
+const dr4 = resolveDeckRestore({ slug: 'everyday', savedTakes: [], opfsManifest: null, opfsReadable: false, folderManifest: null, folderGranted: false, hasFolderHandle: true });
+eq('R4 REBOOT HOLE: empty everywhere + remembered ungranted folder → fresh', dr4.source, 'fresh');
+ok('R4 REBOOT HOLE: offerRecover TRUE (the fix)', dr4.offerRecover === true);
+ok('R9 never poison OPFS with empty while a folder could hold takes', dr4.canWriteOpfs === false);
+ok('R8 totality: manifest is never null', dr4.manifest && Array.isArray(dr4.manifest.takes));
+
+const dr5 = resolveDeckRestore({ slug: 'everyday', savedTakes: [], opfsManifest: drOpfsEmpty, opfsReadable: true, folderManifest: null, folderGranted: false, hasFolderHandle: false });
+ok('R5 genuinely empty, no folder → no recover offer', dr5.offerRecover === false);
+ok('R5 genuinely empty, no folder → safe to seed OPFS', dr5.canWriteOpfs === true);
+
+const dr6 = resolveDeckRestore({ slug: 'everyday', savedTakes: [], opfsManifest: drOpfsEmpty, opfsReadable: true, folderManifest: drFolderMan, folderGranted: true, hasFolderHandle: true });
+eq('R6 grant re-run reads the folder manifest', dr6.source, 'folder');
+ok('R6 folder recovery flags migratedFromFolder', dr6.migratedFromFolder === true);
+eq('R6 folder recovery projects a tapeDeck to backfill', dr6.tapeDeckToStamp.takes.length, 2);
+ok('R6 folder recovery never caches to OPFS', dr6.canWriteOpfs === false);
+
+const dr7 = resolveDeckRestore({ slug: 'everyday', savedTakes: drSaved, opfsManifest: null, opfsReadable: false, folderManifest: null, folderGranted: false, hasFolderHandle: true });
+eq('R7 evicted OPFS does not block .json hydrate', dr7.source, 'json');
+
+// -- banner predicate = needsGrant || offerRecover --
+ok('banner: reboot hole raises it', (dr4.needsGrant || dr4.offerRecover) === true);
+ok('banner: json-ungranted raises it', (dr2.needsGrant || dr2.offerRecover) === true);
+ok('banner: genuinely-empty-no-folder does not', (dr5.needsGrant || dr5.offerRecover) === false);
+ok('banner: already-granted does not', (dr3.needsGrant || dr3.offerRecover) === false);
+
+// -- reconcileTakelessSong: the everyday repair core (shared by on-open recovery + the script) --
+const drTakelessSong = { ...goodSong, id: 'everyday' };
+const drRc = reconcileTakelessSong(drTakelessSong, drFolderMan);
+ok('R11 reconcile a takeless song whose folder has takes → changed', drRc.changed === true);
+eq('R11 reconcile backfills 2 takes', drRc.tapeDeck.takes.length, 2);
+eq('R11 reconcile reports the take count', drRc.takeCount, 2);
+ok('R11 reconcile yields a valid working manifest', validateManifest(drRc.manifest).ok);
+eq('R15 reconcile tapeDeck path', drRc.tapeDeck.path, 'takes/everyday/');
+eq('R15 reconcile tapeDeck schemaVersion 2', drRc.tapeDeck.schemaVersion, 2);
+ok('R12 reconcile NEVER clobbers a song that already has takes',
+   reconcileTakelessSong({ ...goodSong, id: 'everyday', tapeDeck: { path: 'takes/everyday/', schemaVersion: 2, takes: proj } }, drFolderMan).changed === false);
+ok('R13 reconcile no-op when the folder manifest is empty',
+   reconcileTakelessSong(drTakelessSong, createManifest('everyday')).changed === false);
+ok('R14 reconcile accepts a raw (un-normalized) folder manifest',
+   reconcileTakelessSong(drTakelessSong, JSON.parse(JSON.stringify({ slug: 'everyday', takes: proj }))).changed === true);
+
+// -- reconstructManifestFromFiles: filename-scan fallback (corrupt/absent manifest, WAVs intact, H4) --
+const drScan = reconstructManifestFromFiles('everyday', ['everyday_1_stem1.wav', 'everyday_1_stem2.wav', 'everyday_1_mix.wav', 'everyday_2_stem1.wav', 'manifest.json', 'junk.txt']);
+ok('H4 scan yields a valid manifest', validateManifest(drScan).ok);
+eq('H4 scan reconstructs the take numbers', drScan.takes.map((t) => t.take).sort((a, b) => a - b).join(','), '1,2');
+const drScan1 = drScan.takes.find((t) => t.take === 1);
+ok('H4 scan marks reconstructed slots folder-loc', slotHasAudio(drScan1.stems.stem1) && slotLoc(drScan1.stems.stem1) === 'folder');
+ok('H4 scan captures the bounce mix file', !!(drScan1.bounce && drScan1.bounce.file));
+ok('H4 scan flags reconstructed takes recovered', drScan1.recovered === true);
+eq('H4 scan ignores non-take files', activeAudioTakeCount(drScan), 2);
+
+// -- planDupeTakes: Dupe's take source decision (H1 legacy source, H2/H3 via pruneTapeDeckToCopied) --
+const drPlan = planDupeTakes({ embeddedTakes: proj, folderManifest: null, folderFiles: null, srcId: 'blue-eyes', newId: 'ns-copy' });
+ok('R18 dupe needs the source folder granted (WAVs to copy)', drPlan.needsSourceGrant === true);
+eq('R18 dupe tapeDeck is rekeyed to the new slug', drPlan.tapeDeck.path, 'takes/ns-copy/');
+eq('R18 dupe carries both projected takes', drPlan.tapeDeck.takes.length, 2);
+ok('R18 dupe copies a rekeyed stem', drPlan.copies.some((c) => c.dstFile === 'ns-copy_1_stem1.wav'));
+ok('R18 dupe copies the bounce', drPlan.copies.some((c) => c.dstFile === 'ns-copy_1_mix.wav'));
+const drPlanH1 = planDupeTakes({ embeddedTakes: [], folderManifest: drFolderMan, folderFiles: null, srcId: 'everyday', newId: 'everyday-2' });
+eq('H1 dupe of a LEGACY source recovers takes from the folder manifest', drPlanH1.tapeDeck.takes.length, 2);
+ok('H1 legacy dupe still needs the source grant', drPlanH1.needsSourceGrant === true);
+const drPlanScan = planDupeTakes({ embeddedTakes: [], folderManifest: null, folderFiles: ['everyday_1_stem1.wav', 'everyday_1_mix.wav'], srcId: 'everyday', newId: 'everyday-3' });
+ok('H4 dupe falls back to a folder scan when no manifest', drPlanScan.tapeDeck && drPlanScan.tapeDeck.takes.length === 1);
+const drPlanNone = planDupeTakes({ embeddedTakes: [], folderManifest: null, folderFiles: null, srcId: 'x', newId: 'y' });
+ok('R19 dupe of a genuinely takeless source → no tapeDeck', drPlanNone.tapeDeck === null);
+ok('R19 takeless dupe needs no source grant', drPlanNone.needsSourceGrant === false);
+eq('R19 takeless dupe copies nothing', drPlanNone.copies.length, 0);
+
+// -- pruneTapeDeckToCopied: embed only the takes whose WAVs actually copied (H2/H3) --
+const drCopiedAll = new Set(drPlan.copies.map((c) => c.dstFile));
+eq('H2 prune keeps every take when all WAVs copied', pruneTapeDeckToCopied(drPlan.tapeDeck, drCopiedAll).takes.length, 2);
+const drMissTake2 = new Set([...drCopiedAll]); drMissTake2.delete('ns-copy_2_stem1.wav');
+ok('H3 prune drops a take whose only slot failed to copy', !pruneTapeDeckToCopied(drPlan.tapeDeck, drMissTake2).takes.some((t) => t.take === 2));
+const drMissStem2 = new Set([...drCopiedAll]); drMissStem2.delete('ns-copy_1_stem2.wav');
+const drPruned1 = pruneTapeDeckToCopied(drPlan.tapeDeck, drMissStem2).takes.find((t) => t.take === 1);
+ok('H2 prune nulls a stem whose WAV did not copy', drPruned1.stems.stem2 === null);
+ok('H3 prune flags a partially-copied take recovered', drPruned1.recovered === true);
+
+// -- duplicateSong now carries opts.tapeDeck (pure; RED against current songs.js) --
+const drDupTd = { path: 'takes/ns-copy/', schemaVersion: 2, takes: proj };
+ok('R16 duplicateSong carries opts.tapeDeck', duplicateSong(goodSong, { id: 'ns-copy', name: 'NS Copy', now: 'T', tapeDeck: drDupTd }).tapeDeck === drDupTd);
+ok('R17 duplicateSong omits tapeDeck when none given (back-compat)', !('tapeDeck' in duplicateSong(goodSong, { id: 'ns-copy', name: 'NS Copy', now: 'T' })));
+
+// -- runDeckRestore: the DI orchestrator (executable composition — what grep can't check) --
+function drFakePorts(over) {
+  const o = over || {};
+  const calls = { readOpfsManifest: 0, readFolderManifest: 0, recoverPass: 0, stampTapeDeck: [], stampTapeDeckRef: 0, writeSongJson: 0, deleteFolderManifest: 0, writeOpfsManifest: 0 };
+  const ports = {
+    async readOpfsManifest() { calls.readOpfsManifest++; if (o.opfsThrows) throw new Error('evicted'); return o.opfsRaw || null; },
+    async readFolderManifest() { calls.readFolderManifest++; return o.folderRaw || null; },
+    async recoverPass(m) { calls.recoverPass++; return m; },
+    stampTapeDeck(id, td) { calls.stampTapeDeck.push({ id, td }); },
+    stampTapeDeckRef() { calls.stampTapeDeckRef++; },
+    async writeSongJson() { calls.writeSongJson++; return o.jsonWritten !== false; },
+    async deleteFolderManifest() { calls.deleteFolderManifest++; },
+    async writeOpfsManifest() { calls.writeOpfsManifest++; },
+  };
+  return { ports, calls };
+}
+const drBase = { slug: 'everyday', path: 'takes/everyday/manifest.json', savedTakes: [], hasTapeDeckRef: true };
+
+const drO20 = drFakePorts({ opfsThrows: true });
+const drR20 = await runDeckRestore({ ...drBase, folderGranted: false, hasFolderHandle: true }, drO20.ports);
+ok('R20 orchestrator reboot hole → offerRecover', drR20.offerRecover === true);
+eq('R20 orchestrator reboot hole → fresh', drR20.source, 'fresh');
+eq('R20 no OPFS write on the reboot hole', drO20.calls.writeOpfsManifest, 0);
+eq('R20 no folder read when not granted', drO20.calls.readFolderManifest, 0);
+
+const drO21 = drFakePorts({ opfsThrows: true, folderRaw: drFolderMan, jsonWritten: true });
+const drR21 = await runDeckRestore({ ...drBase, folderGranted: true, hasFolderHandle: true }, drO21.ports);
+eq('R21 granted re-run recovers from the folder', drR21.source, 'folder');
+ok('R21 migratedFromFolder', drR21.migratedFromFolder === true);
+eq('R21 stamps the full tapeDeck once', drO21.calls.stampTapeDeck.length, 1);
+eq('R21 stamps 2 recovered takes', drO21.calls.stampTapeDeck[0].td.takes.length, 2);
+eq('R21 stamps by the song id', drO21.calls.stampTapeDeck[0].id, 'everyday');
+eq('R21 writes the .json once (commit marker)', drO21.calls.writeSongJson, 1);
+eq('R21 DELETES the legacy manifest on contact (real deprecation)', drO21.calls.deleteFolderManifest, 1);
+eq('R21 does not also stamp a bare ref', drO21.calls.stampTapeDeckRef, 0);
+eq('R21 never caches a json/folder-hydrated manifest to OPFS', drO21.calls.writeOpfsManifest, 0);
+eq('R23 Hole C: post-recover a Save would embed 2 takes, not 0', tapeDeckWithTakes('everyday', drR21.manifest).takes.length, 2);
+ok('R22 orchestrator exposes NO folder-manifest WRITE port', typeof drO21.ports.writeFolderManifest === 'undefined');
+
+const drO6 = drFakePorts({ opfsThrows: true, folderRaw: drFolderMan, jsonWritten: false });
+await runDeckRestore({ ...drBase, folderGranted: true, hasFolderHandle: true }, drO6.ports);
+eq('H6 attempts the .json write', drO6.calls.writeSongJson, 1);
+eq('H6 does NOT delete the manifest when the .json write was not verified', drO6.calls.deleteFolderManifest, 0);
+
+const drO24 = drFakePorts({ opfsRaw: projMan, jsonWritten: true });
+const drR24 = await runDeckRestore({ slug: 'blue-eyes', path: 'takes/blue-eyes/manifest.json', savedTakes: [], hasTapeDeckRef: true, folderGranted: true, hasFolderHandle: false }, drO24.ports);
+eq('R24 intact non-empty OPFS is session truth', drR24.source, 'opfs');
+eq('R24 opfs source re-seeds OPFS', drO24.calls.writeOpfsManifest, 1);
+eq('R24 opfs source needs no folder read', drO24.calls.readFolderManifest, 0);
+
+const drORef = drFakePorts({ opfsThrows: true });
+await runDeckRestore({ slug: 'everyday', path: 'p', savedTakes: [], hasTapeDeckRef: false, folderGranted: false, hasFolderHandle: false }, drORef.ports);
+eq('AC-19 first open with no takes stamps a bare tapeDeck ref', drORef.calls.stampTapeDeckRef, 1);
+
 // ---- takeModel: MIDI archival helpers ----
 eq('midiRef path', midiRef('blue-eyes'), 'midi/blue-eyes/');
 let midiMan = appendTake(createManifest('s'), makeTake({ take: 1, sampleRate: 48000, drums: { enabled: true, source: { type: 'midi' } } }, 'T'));
@@ -1457,33 +1634,48 @@ ok('decayPeak fall rate matches FALL_DB_PER_SEC', Math.abs(decayPeak(1.0, 0, 100
 {
   const mainSrc = readFileSync(here('./js/main.js'), 'utf8');
   const songsSrc = readFileSync(here('./js/songs.js'), 'utf8');
+  const drSrc = readFileSync(here('./js/tape/deckRestore.js'), 'utf8');
 
   // The .json serializer is the pure, node-tested one; main.js no longer carries its own copy.
   ok('main.js imports toSongFile from songs.js', /import\s*\{[\s\S]*?\btoSongFile\b[\s\S]*?\}\s*from\s*'\.\/songs\.js'/.test(mainSrc));
   ok('main.js defines no local toSongFile (the dead-code copy is gone)', !/function\s+toSongFile\s*\(/.test(mainSrc));
   ok('toSongBundle delegates to the pure toSongFile', mainSrc.includes('const base = toSongFile(song)'));
   ok('songs.toSongFile assigns tapeDeck onto the returned object', songsSrc.includes('out.tapeDeck ='));
+  ok('songs.duplicateSong embeds the caller-supplied tapeDeck', songsSrc.includes('out.tapeDeck = o.tapeDeck'));
 
-  // The folder manifest.json is deprecated: never written; read ONCE, only by the legacy migration.
+  // The multi-store reconciliation is driven through the pure/DI seam (proven by §14b), NOT inline in
+  // main.js — the class of hole that recurred. No inline precedence-source ASSIGNMENT survives here.
+  ok('main.js imports the deck-restore seams', /import\s*\{[\s\S]*?\brunDeckRestore\b[\s\S]*?\}\s*from\s*'\.\/tape\/deckRestore\.js'/.test(mainSrc));
+  ok('onOpenTapeDeck drives restore through runDeckRestore', /const res = await runDeckRestore\(/.test(mainSrc));
+  ok('the restore precedence no longer lives inline in main.js', !/\bsource\s*=\s*'(json|folder|fresh|opfs)'/.test(mainSrc));
+  ok('deckRestore gates OPFS re-seed on canWriteOpfs (never poisons a durable copy)', drSrc.includes('if (d.canWriteOpfs) await ports.writeOpfsManifest'));
+
+  // The folder manifest.json is DEPRECATED for real: never written; read ONLY as legacy recovery
+  // (the deck-open recover port + the dupe source read); DELETED on contact after a VERIFIED .json
+  // write (H6). The delete-gate lives in the node-tested orchestrator (§14b R21/H6), locked here.
   ok('no folder manifest.json is ever written', !/folderStore\.writeFile\([^)]*manifestPath/.test(mainSrc));
-  eq('the folder manifest is read only by the legacy migration', (mainSrc.match(/folderStore\.readFile\([^)]*manifestPath/g) || []).length, 1);
-  ok('migrateTapeDeckFromFolder backfills the .json via tapeDeckWithTakes',
-     /async function migrateTapeDeckFromFolder/.test(mainSrc) && /migrateTapeDeckFromFolder[\s\S]*?tapeDeckWithTakes/.test(mainSrc));
-
-  // Restore precedence is OPFS -> .json hydrate -> fresh; no 'folder' record source survives.
-  ok('restore never selects a folder record source', !/source\s*={1,3}\s*'folder'/.test(mainSrc));
-  ok('restore hydrates durable takes from the song record', mainSrc.includes('hydrateSavedTakes(a.id, savedTakes)'));
+  eq('the folder manifest is read only as legacy recovery (deck-open + dupe-source)', (mainSrc.match(/folderStore\.readFile\([^)]*manifestPath/g) || []).length, 2);
+  ok('the recover orchestrator deletes the legacy manifest on contact', drSrc.includes('await ports.deleteFolderManifest'));
+  ok('the manifest delete is gated on a verified .json write (H6)', drSrc.includes('if (jsonWritten) await ports.deleteFolderManifest'));
+  ok('onOpenTapeDeck wires a deleteFolderManifest port to folderStore.deleteFile', /deleteFolderManifest:[\s\S]{0,160}folderStore\.deleteFile\([^)]*manifestPath/.test(mainSrc));
 
   // Save writes the durable .json (via the shared writer) and surfaces a write failure.
   ok('a shared writeSongJsonById exists', /async function writeSongJsonById/.test(mainSrc));
   ok('onSaveDeck writes the song .json via writeSongJsonById', mainSrc.includes('const jsonWritten = await writeSongJsonById(a.id)'));
   ok('a failed .json write is surfaced, not swallowed', mainSrc.includes('could not update the song .json'));
 
-  // Re-opening a tapeDeck-less .json can't wipe takes: importOneSong reconciles via the pure helper.
+  // A per-take Delete is durable immediately (H5): it re-embeds the surviving takes so an evicted
+  // reopen can't resurrect it. Re-opening a tapeDeck-less .json still can't wipe takes (importOneSong).
+  ok('onDeleteTake persists the delete durably via persistDeckTakes', mainSrc.includes('await persistDeckTakes(a.id)'));
   ok('importOneSong reconciles tapeDeck via resolveOpenedTapeDeck', mainSrc.includes('resolveOpenedTapeDeck(s, existing, mode, reslug)'));
 
-  // Dupe copies the takes listed by the SOURCE song's tapeDeck.takes (SSOT), writing no manifest.
-  ok('dupe sources takes from the source song tapeDeck.takes', mainSrc.includes('const durable = (a.tapeDeck && Array.isArray(a.tapeDeck.takes))'));
+  // Dupe decides its takes via the pure planDupeTakes (recovers a legacy source from the folder, H1),
+  // embeds only WAVs that actually copied (pruneTapeDeckToCopied, H2), and REFUSES rather than mint a
+  // takeless-but-claims-takes half-copy when the source folder can't be read (H2).
+  ok('dupe sources takes via planDupeTakes', /planDupeTakes\(\{/.test(mainSrc));
+  ok('dupe embeds only the copied takes via pruneTapeDeckToCopied', mainSrc.includes('pruneTapeDeckToCopied(plan.tapeDeck'));
+  ok('dupe refuses rather than minting a half-copy', mainSrc.includes('plan.needsSourceGrant && !srcDir'));
+  ok('the old unconditional-embed dupe source string is gone', !mainSrc.includes('const durable = (a.tapeDeck && Array.isArray(a.tapeDeck.takes))'));
 
   // Save must not destroy recovery sources when the durable .json commit failed: OPFS-temp deletion
   // is gated on jsonWritten, and a legacy folder manifest.json is preserved when jsonWritten is false.

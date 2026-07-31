@@ -194,12 +194,17 @@ function statusStrip(deck, ctx) {
   if (deck.status && deck.status.message) chip(deck.status.type === 'error' ? 'err' : deck.status.type === 'info' ? 'info' : 'warn', deck.status.message);
   if (deck.spaceWarning) chip('warn', 'Storage is running low. Delete a take, or export what you need to keep.');
 
-  // Restored takes whose audio lives in the song folder need a one-per-session permission grant to
-  // PLAY (the list already shows). An actionable banner (fresh gesture keeps requestPermission valid).
+  // Folder-grant banner (one per session; a fresh gesture keeps requestPermission valid). Two cases:
+  //  - offerRecover: the deck looks empty but the song's folder MAY hold saved takes (a remembered but
+  //    ungranted folder — e.g. a duplicate opened after a reboot). Granting reads + folds the folder
+  //    copy back into the .json, so the takes come back.
+  //  - otherwise: takes are already listed (restored from the .json); the folder is needed only to PLAY.
   if (deck.folderNeedsGrant && ctx.onGrantFolder) {
     const banner = h('div', 'tapechip info tapegrant');
-    banner.appendChild(h('span', null, 'Restored takes — grant folder access to play their audio.'));
-    const btn = h('button', 'btn mini primary', 'Grant folder access');
+    banner.appendChild(h('span', null, deck.offerRecover
+      ? 'This song may have saved takes in its folder — grant folder access to recover them.'
+      : 'Restored takes — grant folder access to play their audio.'));
+    const btn = h('button', 'btn mini primary', deck.offerRecover ? 'Grant folder access to recover' : 'Grant folder access');
     btn.addEventListener('click', () => ctx.onGrantFolder());
     banner.appendChild(btn);
     box.appendChild(banner);

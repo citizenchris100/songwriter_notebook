@@ -367,9 +367,10 @@ export function finalizeDraft(draft, name, takenIds, now) {
 // (old id -> new id; the impure caller copies the audio blobs under the new ids and only
 // puts a mapping in for a blob it actually copied, so a sketch with no surviving bytes is
 // dropped — matching importOneSong), and stamps createdAt = updatedAt = now with a fresh
-// file link. The tape deck is intentionally NOT carried here: the impure caller copies the
-// take WAVs into the new folder and attaches a slug-rekeyed tapeDeck. Pure (ids + time
-// injected), so the engine test can load it.
+// file link. The take AUDIO copy is impure (folder I/O), so the caller computes the slug-rekeyed
+// tapeDeck (from the source's durable takes, pruned to the WAVs it actually copied) and passes it
+// as opts.tapeDeck; embedding it here keeps the copy's .json the single source of truth. Pure
+// (ids + time injected), so the engine test can load it.
 export function duplicateSong(src, opts) {
   const o = opts || {};
   const id = String(o.id);
@@ -382,7 +383,7 @@ export function duplicateSong(src, opts) {
   const sketches = (src.sketches || [])
     .filter((sk) => map[sk.id])                 // only sketches whose blob the caller copied
     .map((sk) => ({ ...sk, id: map[sk.id] }));
-  return {
+  const out = {
     schemaVersion: 1,
     id,
     name: String(o.name),
@@ -393,6 +394,11 @@ export function duplicateSong(src, opts) {
     sketches,
     file: { name: id + '.json' },
   };
+  // Carry the caller-computed, slug-rekeyed tapeDeck (present only when the copy actually owns
+  // take audio — see deckRestore.planDupeTakes / pruneTapeDeckToCopied), so the copy's .json is
+  // self-contained. Absent opt => a takeless duplicate, exactly as before.
+  if (o.tapeDeck && typeof o.tapeDeck.path === 'string') out.tapeDeck = o.tapeDeck;
+  return out;
 }
 
 // ---- markdown export (pure: song -> a cleanly formatted .md string) ----
