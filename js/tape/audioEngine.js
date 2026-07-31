@@ -11,8 +11,9 @@ import { wavHeader, floatToInt16, interleave, parseWav, SIZE_FIELDS } from './wa
 import { integratedLoudness } from './lufs.js';
 import { limit } from './limiter.js';
 import {
-  STEM_KEYS, MAX_TRACKS, stemFileName, mixFileName, compressorParams, bounceGainDb,
+  STEM_KEYS, MAX_TRACKS, stemFileName, mixFileName, clipFileName, compressorParams, bounceGainDb,
   EQ_BANDS, LIMITER_CEILING_DB, defaultStemSettings, playbackCacheStale,
+  laneClips, slotHasAudio, secPerBar,
 } from './takeModel.js';
 import { detectClickSample, rttSeconds, summarizeTrials, resolveMonitorLatencySec } from './latency.js';
 import { makeClick } from './click.js';
@@ -211,7 +212,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   }
 
   function anyActiveSource() {
-    return !!(playChains && STEM_KEYS.some((k) => playChains.stems[k] && playChains.stems[k].activeSource));
+    return !!(playChains && STEM_KEYS.some((k) => playChains.stems[k] && playChains.stems[k].clips.some((c) => c.activeSource)));
   }
   function startMeterLoop() { if (!meterTimer) meterTimer = setInterval(meterTick, METER_INTERVAL_MS); }
   function stopMeterLoop() { if (meterTimer) { clearInterval(meterTimer); meterTimer = null; } }
@@ -223,7 +224,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
       const levels = {};
       for (const key of STEM_KEYS) {
         const s = playChains.stems[key];
-        if (s && s.tap && s.activeSource) levels[key] = lv(tapPeak(s.tap));
+        if (s && s.tap && s.clips.some((c) => c.activeSource)) levels[key] = lv(tapPeak(s.tap));
       }
       if (playChains.drum && playChains.drum.tap) levels.drum = lv(tapPeak(playChains.drum.tap)); // drum-bus meter
       const master = playChains.masterTap ? lv(tapPeak(playChains.masterTap)) : null;
@@ -262,7 +263,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
       const source = audioCtx.createBufferSource();
       source.buffer = it.buffer;
       source.connect(chain.input);
-      source.start(startAt);
+      source.start(startAt + (it.startSec || 0)); // backing clips honor their bar offset
       sources.push(source);
     }
     monitorGraph = { sumBus, sources, taps };
@@ -328,9 +329,15 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
 
     // Pre-load the backing buffers BEFORE choosing startAt, so the scheduled start
     // is always in the future no matter how long the OPFS reads / sample decodes take.
+    const monitorBarSec = barSeconds(bpm, timeSigIndex);
     const monitorItems = [];
     if (overdub) {
-      for (const t of existingTracks) monitorItems.push({ key: t.key, meta: t.meta, buffer: await loadStemBuffer(audioCtx, slug, t.meta, folderHandle) });
+      for (const t of existingTracks) {
+        for (const c of laneClips(t.meta)) {
+          if (!c.file) continue;
+          monitorItems.push({ key: t.key, meta: t.meta, buffer: await loadStemBuffer(audioCtx, slug, c, folderHandle), startSec: (c.startBar || 0) * monitorBarSec });
+        }
+      }
     }
     let kitBuffers = null, drumIr = null;
     if (drumsEnabled) { kitBuffers = await loadKit(audioCtx, drumConfig.kit); drumIr = await loadEffect(audioCtx, drumConfig.effect); }
@@ -390,7 +397,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     // exposed, but opening first is correct for every path.)
     const header = wavHeader(1, audioCtx.sampleRate, 0);
     const files = {};
-    for (const key of slotKeys) files[key] = stemFileName(slug, take, key);
+    for (const key of slotKeys) files[key] = (passInfo.files && passInfo.files[key]) || stemFileName(slug, take, key);
     await takeStore.openTakeFiles('takes/' + slug + '/', files, header, SIZE_FIELDS);
     recordEpoch++; // this take's WAV(s) were just truncated/overwritten — invalidate any cached playback buffers
 
@@ -562,13 +569,18 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     sumBus.connect(masterTap);  // master meter taps PRE-fader (D34): "is the mix clipping", not headphone loudness
     const stems = {};
     for (const key of STEM_KEYS) {
-      const stemMeta = take.stems && take.stems[key];
-      if (!stemMeta || !stemMeta.file) { stems[key] = null; continue; }
-      const buffer = await loadStemBuffer(audioCtx, slug, stemMeta, folderHandle);
-      const chain = buildEffectChain(audioCtx, stemMeta);
+      const lane = take.stems && take.stems[key];
+      if (!slotHasAudio(lane)) { stems[key] = null; continue; }
+      const chain = buildEffectChain(audioCtx, lane); // ONE lane-level effect chain (vol/EQ/comp)
       chain.output.connect(sumBus);
-      const tap = makeTap(audioCtx); chain.output.connect(tap); // per-track playback meter (D34)
-      stems[key] = { buffer, chain, tap, activeSource: null };
+      const tap = makeTap(audioCtx); chain.output.connect(tap); // per-lane playback meter (D34)
+      const clips = [];
+      for (const c of laneClips(lane)) {
+        if (!c.file) continue;
+        const buffer = await loadStemBuffer(audioCtx, slug, c, folderHandle); // a clip has file + loc
+        clips.push({ buffer, startBar: c.startBar || 0, durationSec: c.durationSec || 0, activeSource: null });
+      }
+      stems[key] = { chain, tap, clips };
     }
     // Drum backing (if the take has drums): its own graph -> sumBus (so it follows the monitor
     // fader + master meter with the stems). Started in play() off the SAME startAt as the stems.
@@ -597,7 +609,8 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     if (playChains) {
       for (const key of STEM_KEYS) {
         const s = playChains.stems[key];
-        if (s && s.activeSource) { try { s.activeSource.onended = null; s.activeSource.stop(); } catch { /* already stopped */ } s.activeSource = null; }
+        if (!s) continue;
+        for (const c of s.clips) { if (c.activeSource) { try { c.activeSource.onended = null; c.activeSource.stop(); } catch { /* already stopped */ } c.activeSource = null; } }
       }
       if (playChains.drum) { try { playChains.drum.stop(); } catch { /* already stopped */ } }
     }
@@ -605,32 +618,41 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     maybeStopMeterLoop();
   }
 
-  async function play(take, slug, folderHandle) {
+  // Play from bar `headBar` (0 on the Mix tab). Each clip is scheduled at (startBar-headBar)*barSec
+  // from a common startAt; a clip that straddles the head is seeked into; a clip entirely before the
+  // head is skipped. All clips of a lane feed that lane's one effect chain.
+  async function play(take, slug, folderHandle, headBar = 0) {
     const want = { slug, take: take.take, epoch: recordEpoch };
     if (playbackCacheStale(playChains, want)) await loadTake(take, slug, folderHandle);
     stopPlaySources();
     const audioCtx = ctx;
-    const startAt = audioCtx.currentTime + 0.1; // all stems start together -> sample-locked
-    const stemDur = maxKeyDuration(STEM_KEYS, take) || take.durationSec || 0;
-    const seqSec = drumSequenceSeconds(take);   // >0 only for a sequence take (else it loops)
-    const durationSec = Math.max(stemDur, seqSec);
-    let any = false, primary = null;
+    const barSec = secPerBar(take);
+    const startAt = audioCtx.currentTime + 0.1;
+    let stemDur = 0, any = false, primary = null, primaryEnd = -1;
     for (const key of STEM_KEYS) {
       const s = playChains.stems[key];
       if (!s) continue;
-      const source = audioCtx.createBufferSource();
-      source.buffer = s.buffer;
-      source.connect(s.chain.input);
-      source.start(startAt);
-      s.activeSource = source;
-      any = true;
-      if (!primary) primary = source;
+      for (const c of s.clips) {
+        const clipStart = (c.startBar - headBar) * barSec;   // seconds from the head
+        const clipEnd = clipStart + c.durationSec;
+        if (clipEnd <= 0.0001) continue;                     // entirely before the head
+        const source = audioCtx.createBufferSource();
+        source.buffer = c.buffer;
+        source.connect(s.chain.input);
+        if (clipStart >= 0) source.start(startAt + clipStart);
+        else source.start(startAt, Math.min(-clipStart, Math.max(0, c.durationSec - 0.0005))); // seek into a straddled clip
+        c.activeSource = source;
+        any = true;
+        if (clipEnd > stemDur) stemDur = clipEnd;
+        if (clipEnd > primaryEnd) { primaryEnd = clipEnd; primary = source; }
+      }
     }
+    const seqSec = drumSequenceSeconds(take);   // >0 only for a sequence take (else it loops)
+    const durationSec = Math.max(stemDur, seqSec);
     if (any) {
       playState = { startAt, durationSec };
       startMeterLoop();
-      // Sequence take: drums play their EXACT flattened length once (n%total never wraps, so no
-      // end-of-take stutter and the outro isn't cut). Single-loop/grid take: loop for the stems.
+      // Sequence take: drums play their EXACT flattened length once. Single-loop/grid: loop for the stems.
       if (playChains.drum) playChains.drum.start(startAt, seqSec > 0 ? seqSec : stemDur);
     }
     if (primary) primary.onended = () => {
@@ -641,10 +663,10 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     return any;
   }
 
-  async function replay(take, slug, folderHandle) {
+  async function replay(take, slug, folderHandle, headBar = 0) {
     const want = { slug, take: take.take, epoch: recordEpoch };
     if (!playbackCacheStale(playChains, want)) stopPlaySources();
-    return play(take, slug, folderHandle);
+    return play(take, slug, folderHandle, headBar);
   }
 
   function stopPlay() { stopPlaySources(); }
@@ -674,18 +696,22 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     const sumBus = offlineCtx.createGain();
     sumBus.gain.value = 1;
     sumBus.connect(offlineCtx.destination);
+    const barSec = secPerBar(take);
     let any = false;
     for (const key of keys) {
-      const stemMeta = take.stems && take.stems[key];
-      if (!stemMeta || !stemMeta.file) continue;
-      const buffer = await loadStemBuffer(offlineCtx, slug, stemMeta, folderHandle);
-      const chain = buildEffectChain(offlineCtx, stemMeta);
+      const lane = take.stems && take.stems[key];
+      if (!slotHasAudio(lane)) continue;
+      const chain = buildEffectChain(offlineCtx, lane); // one lane chain; every clip feeds it
       chain.output.connect(sumBus);
-      const source = offlineCtx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(chain.input);
-      source.start(0);
-      any = true;
+      for (const c of laneClips(lane)) {
+        if (!c.file) continue;
+        const buffer = await loadStemBuffer(offlineCtx, slug, c, folderHandle);
+        const source = offlineCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(chain.input);
+        source.start((c.startBar || 0) * barSec); // clip at its bar offset
+        any = true;
+      }
     }
     // Drums printed into the mix (opt-in per bounce). Pre-scheduled deterministically into the
     // SAME sumBus, so they sum + master exactly like a stem. Only the master bounce passes this;
@@ -704,9 +730,17 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     return { mono: rendered.getChannelData(0).slice(), durationSec };
   }
 
+  // The scheduled length (seconds) of the given lanes' clips, honoring each clip's bar OFFSET.
   function maxKeyDuration(keys, take) {
+    const barSec = secPerBar(take);
     let max = 0;
-    for (const key of keys) { const s = take.stems && take.stems[key]; if (s && s.file && s.durationSec) max = Math.max(max, s.durationSec); }
+    for (const key of keys) {
+      for (const c of laneClips(take.stems && take.stems[key])) {
+        if (!c.file || !c.durationSec) continue;
+        const end = (c.startBar || 0) * barSec + c.durationSec;
+        if (end > max) max = end;
+      }
+    }
     return max;
   }
 
@@ -717,6 +751,14 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     full.set(new Uint8Array(header), 0);
     full.set(new Uint8Array(i16.buffer), header.byteLength);
     return full.buffer;
+  }
+
+  // Render ONE lane's clips (each at its bar offset, through the lane's effect chain) into a mono
+  // WAV — the per-lane "clean stem" Export writes. Folder clips read from the folder, opfs from OPFS.
+  async function renderStem(take, key, slug, folderHandle = null) {
+    const { mono } = await renderMonoMix([key], take, slug, {}, folderHandle);
+    if (!mono) return null;
+    return encodeMonoWav(mono);
   }
 
   // ---- master bounce (AC-13/14): sum ALL tracks -> one mono _mix.wav with the
@@ -752,11 +794,12 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   async function bounceTracks(take, srcKey, dstKey, slug, folderHandle = null) {
     const src = take.stems && take.stems[srcKey];
     const dst = take.stems && take.stems[dstKey];
-    if (!src || !src.file || !dst || !dst.file) return { ok: false, error: 'both tracks must have audio' };
+    if (!slotHasAudio(src) || !slotHasAudio(dst)) return { ok: false, error: 'both tracks must have audio' };
+    const dstClip = laneClips(dst)[0]; // the collapsed aggregate reuses the dst's first clip file
     const { mono, durationSec } = await renderMonoMix([srcKey, dstKey], take, slug, {}, folderHandle);
     if (!mono) return { ok: false, error: 'nothing to bounce' };
     limit([mono], BOUNCE_RATE, LIMITER_CEILING_DB);
-    await takeStore.writeFile('takes/' + slug + '/' + dst.file, encodeMonoWav(mono));
+    await takeStore.writeFile('takes/' + slug + '/' + dstClip.file, encodeMonoWav(mono));
     recordEpoch++; // dst WAV overwritten in place under the same take number — invalidate cached playback buffers
     return { ok: true, srcKey, dstKey, durationSec };
   }
@@ -886,5 +929,5 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     if (ctx) { try { ctx.close(); } catch { /* already closed */ } ctx = null; masterBus = null; }
   }
 
-  return { probe, record, stop, play, replay, stopPlay, invalidatePlayback: disposePlayback, renderMaster, bounce, bounceTracks, applySettings, setMasterVol, calibrateLatency, getContextLatency, previewPattern, stopPreview, dispose };
+  return { probe, record, stop, play, replay, stopPlay, invalidatePlayback: disposePlayback, renderMaster, renderStem, bounce, bounceTracks, applySettings, setMasterVol, calibrateLatency, getContextLatency, previewPattern, stopPreview, dispose };
 }

@@ -10,17 +10,17 @@
 // on contact (gated on a verified .json write). OPFS stays an ephemeral recording scratch.
 import {
   activeAudioTakeCount, hydrateSavedTakes, projectTakesForJson, tapeDeckWithTakes, rekeyManifest,
-  createManifest, normalizeManifest, validateManifest, tapeDeckRef, stemFileName, mixFileName,
-  filledSlotKeys, maxSlotDuration, slotHasAudio, slotLoc, defaultStemSettings,
-  referencedMidiFiles, referencedLoopFiles, midiRef, loopsRef, STEM_KEYS,
+  createManifest, normalizeManifest, validateManifest, tapeDeckRef, stemFileName, mixFileName, clipFileName,
+  filledSlotKeys, maxSlotDuration, slotHasAudio, slotLoc, defaultStemSettings, laneClips, clipHasAudio,
+  referencedMidiFiles, referencedLoopFiles, midiRef, loopsRef, STEM_KEYS, MANIFEST_SCHEMA,
 } from './takeModel.js';
 
-// A manifest "references folder audio" iff any active take has a folder-loc filled slot or a folder
-// bounce — i.e. listing it is free, but PLAYING it needs the song folder granted this session.
+// A manifest "references folder audio" iff any active take has a folder-loc CLIP or a folder bounce
+// — i.e. listing it is free, but PLAYING it needs the song folder granted this session.
 export function manifestReferencesFolderAudio(manifest) {
   const takes = (manifest && manifest.takes) || [];
   return takes.some((t) => t && t.status === 'active' && (
-    STEM_KEYS.some((k) => slotHasAudio(t.stems && t.stems[k]) && slotLoc(t.stems[k]) === 'folder')
+    STEM_KEYS.some((k) => laneClips(t.stems && t.stems[k]).some((c) => clipHasAudio(c) && c.loc === 'folder'))
     || !!(t.bounce && t.bounce.file && t.bounce.loc === 'folder')
   ));
 }
@@ -97,29 +97,36 @@ export function reconcileTakelessSong(song, folderManifestRaw) {
 }
 
 // Filename-scan fallback (H4): reconstruct a minimal but valid manifest from the WAVs on disk when
-// the folder manifest.json is corrupt/absent. Loses per-slot EQ/comp/duration (defaults applied) and
-// flags every take `recovered` — the last-resort recovery so intact WAVs are never orphaned.
+// the folder manifest.json is corrupt/absent. Accepts both legacy (slug_N_stemK.wav) and v3 clip
+// (slug_N_stemK_id.wav) names. Clip POSITIONS aren't encoded on disc, so it defaults them sequentially
+// and flags every take `recovered` — the .json (SSOT) carries real positions; this is last-resort so
+// intact WAVs are never orphaned.
 export function reconstructManifestFromFiles(slug, fileNames) {
   const files = Array.isArray(fileNames) ? fileNames : [];
   const esc = String(slug).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const stemRe = new RegExp('^' + esc + '_(\\d+)_(stem[1-4])\\.wav$');
+  const stemRe = new RegExp('^' + esc + '_(\\d+)_(stem[1-4])(?:_([A-Za-z0-9]+))?\\.wav$');
   const mixRe = new RegExp('^' + esc + '_(\\d+)_mix\\.wav$');
   const byTake = new Map();
   const ensure = (n) => { if (!byTake.has(n)) byTake.set(n, { stems: {}, bounce: null }); return byTake.get(n); };
   for (const f of files) {
     let m = stemRe.exec(f);
-    if (m) { ensure(Number(m[1])).stems[m[2]] = f; continue; }
+    if (m) { const rec = ensure(Number(m[1])); (rec.stems[m[2]] = rec.stems[m[2]] || []).push({ file: f, clipId: m[3] || null }); continue; }
     m = mixRe.exec(f);
     if (m) ensure(Number(m[1])).bounce = f;
   }
   const takes = [];
   for (const [take, rec] of [...byTake.entries()].sort((a, b) => a[0] - b[0])) {
     const stems = {};
-    for (const k of STEM_KEYS) stems[k] = rec.stems[k] ? { file: rec.stems[k], group: 1, durationSec: 0, loc: 'folder', ...defaultStemSettings() } : null;
+    for (const k of STEM_KEYS) {
+      const cfs = rec.stems[k] || [];
+      stems[k] = cfs.length
+        ? { ...defaultStemSettings(), clips: cfs.map((cf, i) => ({ id: cf.clipId || ('c' + i), file: cf.file, startBar: i, bars: 1, durationSec: 0, loc: 'folder', group: 1 })) }
+        : null;
+    }
     if (!STEM_KEYS.some((k) => stems[k])) continue; // a bounce with no stems is not restorable as tracks
     takes.push({ take, status: 'active', recovered: true, createdAt: '', durationSec: 0, sampleRate: 48000, stems, bounce: rec.bounce ? { file: rec.bounce, bouncedAt: '', lufs: null, loc: 'folder' } : null });
   }
-  return normalizeManifest({ schemaVersion: 2, slug, takes });
+  return normalizeManifest({ schemaVersion: MANIFEST_SCHEMA, slug, takes });
 }
 
 // Dupe's take-source decision (pure): WHICH durable takes travel and WHICH files to copy, sourcing
@@ -145,15 +152,18 @@ export function planDupeTakes(args) {
   const copies = [];
   for (const t of projected) {
     for (const key of filledSlotKeys(t)) {
-      const dstFile = stemFileName(newId, t.take, key);
-      copies.push({ src: srcDp + t.stems[key].file, dst: dstDp + dstFile, dstFile, take: t.take, slot: key });
+      for (const c of laneClips(t.stems[key])) {
+        if (!clipHasAudio(c)) continue;
+        const dstFile = clipFileName(newId, t.take, key, c.id);
+        copies.push({ src: srcDp + c.file, dst: dstDp + dstFile, dstFile, take: t.take, slot: key, clipId: c.id });
+      }
     }
     if (t.bounce && t.bounce.file) {
       const dstFile = mixFileName(newId, t.take);
       copies.push({ src: srcDp + t.bounce.file, dst: dstDp + dstFile, dstFile, take: t.take, slot: 'bounce' });
     }
   }
-  const rekeyed = rekeyManifest({ schemaVersion: 2, slug: srcId, takes: projected }, newId);
+  const rekeyed = rekeyManifest({ schemaVersion: MANIFEST_SCHEMA, slug: srcId, takes: projected }, newId);
   const tapeDeck = tapeDeckWithTakes(newId, rekeyed);
   const midiCopies = [...referencedMidiFiles(rekeyed)].map((nm) => ({ src: midiRef(srcId) + nm, dst: midiRef(newId) + nm }));
   const loopCopies = [...referencedLoopFiles(rekeyed)].map((rel) => ({ src: loopsRef(srcId) + rel, dst: loopsRef(newId) + rel }));
@@ -170,15 +180,20 @@ export function pruneTapeDeckToCopied(tapeDeck, copiedDstFiles) {
     const stems = {};
     let kept = 0; let lost = false;
     for (const key of STEM_KEYS) {
-      const s = t.stems && t.stems[key];
-      if (slotHasAudio(s) && copied.has(s.file)) { stems[key] = { ...s }; kept += 1; }
-      else { stems[key] = null; if (slotHasAudio(s)) lost = true; }
+      const lane = t.stems && t.stems[key];
+      const audio = laneClips(lane).filter(clipHasAudio);
+      const copiedClips = audio.filter((c) => copied.has(c.file));
+      if (copiedClips.length) {
+        stems[key] = { ...lane, clips: copiedClips.map((c) => ({ ...c })) };
+        kept += copiedClips.length;
+        if (copiedClips.length < audio.length) lost = true;
+      } else { stems[key] = null; if (audio.length) lost = true; }
     }
     if (!kept) continue;
     const bounce = t.bounce && t.bounce.file && copied.has(t.bounce.file) ? { ...t.bounce } : null;
-    takes.push({ ...t, stems, bounce, durationSec: maxSlotDuration({ stems }), recovered: !!t.recovered || lost });
+    takes.push({ ...t, stems, bounce, durationSec: maxSlotDuration({ stems, click: t.click }), recovered: !!t.recovered || lost });
   }
-  return { path: tapeDeck && tapeDeck.path, schemaVersion: 2, takes };
+  return { path: tapeDeck && tapeDeck.path, schemaVersion: MANIFEST_SCHEMA, takes };
 }
 
 // The impure-by-INJECTION deck-open orchestrator: gather the stores via injected ports, run the pure

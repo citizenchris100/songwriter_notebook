@@ -9,7 +9,7 @@
 // presets-only section label (Verse, Chorus, …).
 
 import { validateSketchMeta, normalizeSketch } from './sketches.js';
-import { validateTake, normalizeTake } from './tape/takeModel.js';
+import { validateTake, normalizeTake, MANIFEST_SCHEMA } from './tape/takeModel.js';
 
 const SLUG = /^[a-z0-9][a-z0-9-]*$/;
 
@@ -121,7 +121,7 @@ export function normalizeSong(s) {
   // invalid entry is dropped rather than failing the load. A legacy bare { path } record round-
   // trips unchanged (takes omitted).
   if (s.tapeDeck && typeof s.tapeDeck === 'object' && typeof s.tapeDeck.path === 'string') {
-    out.tapeDeck = { path: s.tapeDeck.path, schemaVersion: 2 };
+    out.tapeDeck = { path: s.tapeDeck.path, schemaVersion: MANIFEST_SCHEMA };
     if (Array.isArray(s.tapeDeck.takes)) {
       out.tapeDeck.takes = s.tapeDeck.takes.filter((t) => validateTake(t).ok).map(normalizeTake);
     }
@@ -165,7 +165,7 @@ export function toSongFile(s) {
     })),
   };
   if (s.tapeDeck && typeof s.tapeDeck.path === 'string') {
-    out.tapeDeck = { path: s.tapeDeck.path, schemaVersion: 2, takes: Array.isArray(s.tapeDeck.takes) ? s.tapeDeck.takes : [] };
+    out.tapeDeck = { path: s.tapeDeck.path, schemaVersion: MANIFEST_SCHEMA, takes: Array.isArray(s.tapeDeck.takes) ? s.tapeDeck.takes : [] };
   }
   return out;
 }

@@ -136,12 +136,19 @@ export async function readFile(path) {
   return res.bytes;
 }
 
-// Best-effort delete of every file a take could own (stems + mix); missing ones
-// are fine (the worker's deleteFiles is idempotent). Filenames are re-derived
-// from the naming helpers rather than passed in, so callers only need slug+take.
-export async function deleteTakeAudio(slug, take) {
-  const names = STEM_KEYS.map((k) => stemFileName(slug, take, k)).concat([mixFileName(slug, take)]);
-  await call('deleteFiles', { paths: names.map((f) => 'takes/' + slug + '/' + f) });
+// Best-effort delete of every file a take owns. v3 clip files carry arbitrary ids, so they can no
+// longer be re-derived from slug+take — pass the take RECORD and its clip files are read off it
+// (bounce included). Falls back to the legacy stem/mix names when no record is given.
+export async function deleteTakeAudio(slug, take, takeRecord) {
+  const names = [];
+  if (takeRecord && takeRecord.stems) {
+    for (const k of STEM_KEYS) for (const c of (takeRecord.stems[k] && takeRecord.stems[k].clips) || []) if (c && c.file) names.push(c.file);
+    if (takeRecord.bounce && takeRecord.bounce.file) names.push(takeRecord.bounce.file);
+  } else {
+    for (const k of STEM_KEYS) names.push(stemFileName(slug, take, k));
+    names.push(mixFileName(slug, take));
+  }
+  if (names.length) await call('deleteFiles', { paths: names.map((f) => 'takes/' + slug + '/' + f) });
 }
 export async function deleteSongTakes(slug) {
   await call('deleteDir', { dir: 'takes/' + slug });
@@ -159,12 +166,12 @@ export async function deletePath(path) {
   await call('deleteFiles', { paths: [path] });
 }
 
-// Delete just the named slot WAVs of one take (a ping-pong bounce frees its source
-// slot; a group-discard frees the last pass's slots) — the take's other tracks and
-// its mix stay on disc. Best-effort; missing files are fine.
-export async function deleteSlotFiles(slug, take, keys) {
-  const paths = keys.map((k) => 'takes/' + slug + '/' + stemFileName(slug, take, k));
-  await call('deleteFiles', { paths });
+// Delete explicit clip/stem WAVs by filename under takes/<slug>/ (a ping-pong bounce frees its
+// source lane's clips; a group-discard frees the last pass's clips; a clip delete/edit orphans a
+// file). Clip files carry ids, so callers pass the actual filenames. Best-effort; missing = fine.
+export async function deleteSlotFiles(slug, files) {
+  const paths = (files || []).filter(Boolean).map((f) => 'takes/' + slug + '/' + f);
+  if (paths.length) await call('deleteFiles', { paths });
 }
 
 export async function estimateSpace() {

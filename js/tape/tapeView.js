@@ -15,7 +15,7 @@
 // back as `live` — { setLevels, setCounter, setPlayStatus } — refreshed every render, and
 // driven by main.js's meter merge layer.
 import { h } from '../dom.js';
-import { STEM_KEYS } from './takeModel.js';
+import { STEM_KEYS, slotHasAudio, laneClips } from './takeModel.js';
 import { buildKnob, buildFader, buildLedMeter, buildCounter } from './deckControls.js';
 import { buildDrumPanel } from './drumPanel.js';
 import { METER_SEGMENTS } from './meterModel.js';
@@ -40,7 +40,7 @@ export function buildDeckView(deck, handlers, songName) {
     onPlayTake, onReplayTake, onStopPlayTake,
   } = handlers;
 
-  const wrap = h('div', 'songswrap tapewrap');
+  const wrap = h('div', 'songswrap tapewrap tapewide');
 
   // ---- live refs: the LED meters, the counter, and the play-status text ----
   const meterSetters = {};   // 'stem1'..'stem4' + 'master' -> ledmeter.set(lit, clip)
@@ -84,19 +84,30 @@ export function buildDeckView(deck, handlers, songName) {
   // ---- status strip: banners -> chips, input-device picker, one hint line ----
   wrap.appendChild(statusStrip(deck, { onSelectInput, onGrantFolder }));
 
-  // ---- the deck face: 4 strips + master ----
-  const face = h('div', 'tapedeck');
-  const bounceBars = {}; // key -> the (hidden) full-width destination-confirm bar in the drawer
-  STEM_KEYS.forEach((key) => face.appendChild(trackStrip(key, deck, handlers, meterSetters, bounceBars)));
-  const master = masterStrip(deck, { onPreviewMasterVol, onSetMasterVol }, meterSetters);
-  counter = master.counter;
-  face.appendChild(master.el);
-  wrap.appendChild(face);
+  // ---- Mix | Timeline tab toggle (the controls below persist on BOTH tabs) ----
+  wrap.appendChild(tabToggle(deck, handlers));
 
-  // ---- drawer: per-strip bounce destination-confirm bars (won't fit in a 63px strip) ----
-  const drawer = h('div', 'tapedrawer');
-  STEM_KEYS.forEach((key) => { if (bounceBars[key]) drawer.appendChild(bounceBars[key]); });
-  wrap.appendChild(drawer);
+  // ---- the deck BODY: only this node swaps between the Mix mixer and the Timeline clips.
+  // Each body builds its OWN counter; buildDeckView points `counter` at whichever renders, so the
+  // LED time/play-status live-refs keep working on both tabs. ----
+  if (deck.tab === 'timeline') {
+    const tl = timelineBody(deck, handlers);
+    counter = tl.counter;
+    wrap.appendChild(tl.el);
+  } else {
+    const face = h('div', 'tapedeck');
+    const bounceBars = {}; // key -> the (hidden) full-width destination-confirm bar in the drawer
+    STEM_KEYS.forEach((key) => face.appendChild(trackStrip(key, deck, handlers, meterSetters, bounceBars)));
+    const master = masterStrip(deck, { onPreviewMasterVol, onSetMasterVol }, meterSetters);
+    counter = master.counter;
+    face.appendChild(master.el);
+    wrap.appendChild(face);
+
+    // ---- drawer: per-strip bounce destination-confirm bars (won't fit in a 63px strip) ----
+    const drawer = h('div', 'tapedrawer');
+    STEM_KEYS.forEach((key) => { if (bounceBars[key]) drawer.appendChild(bounceBars[key]); });
+    wrap.appendChild(drawer);
+  }
 
   // ---- function row + its inline confirm bars ----
   wrap.appendChild(functionRow(deck, handlers));
@@ -338,6 +349,125 @@ function masterStrip(deck, ctx, meterSetters) {
   return { el: card, counter };
 }
 
+// ---- Mix | Timeline tab toggle (segmented control in the deck header area) ----
+function tabToggle(deck, handlers) {
+  const row = h('div', 'row taptabs');
+  const mk = (label, tab) => {
+    const b = h('button', 'taptab' + (deck.tab === tab ? ' on' : ''), label);
+    b.addEventListener('click', () => { if (deck.tab !== tab) handlers.onTapeTab(tab); });
+    return b;
+  };
+  row.append(mk('MIX', 'mix'), mk('TIMELINE', 'timeline'));
+  return row;
+}
+
+// ---- Timeline body: a bar ruler + 4 color-coded clip lanes + a record/play head, plus the
+// clip tools (slice / dupe / trim / delete). Clips are self-contained WAVs positioned at integer
+// bars; the pure geometry + WAV surgery live in clipModel.js / wav.js. Desktop-Chrome only. ----
+const LANE_COLORS = ['lane1', 'lane2', 'lane3', 'lane4']; // stem1..4 -> blue / orange / violet / teal (CSS)
+function timelineBody(deck, handlers) {
+  const PX = 48; // pixels per bar (no zoom v1; horizontal scroll instead)
+  const strips = deck.strips || {};
+  const armedSet = new Set((deck.armed || []).map((a) => a.slotKey));
+  const recSet = new Set(deck.recordingSlotKeys || []);
+  const recording = !!deck.recording;
+
+  // Bar extent: furthest clip end + headroom, at least 16 bars, and past the head.
+  let maxEnd = 0;
+  STEM_KEYS.forEach((k) => ((strips[k] && strips[k].clips) || []).forEach((c) => { if (c.file) maxEnd = Math.max(maxEnd, c.startBar + (c.bars || 1)); }));
+  const totalBars = Math.max(16, Math.ceil(maxEnd) + 4, (deck.head || 0) + 4);
+  const gridW = totalBars * PX;
+
+  const box = h('div', 'card grow tlwrap');
+
+  // ---- toolbar: LED counter + the four clip tools + a context hint ----
+  const toolbar = h('div', 'row tltoolbar');
+  const initTime = deck.recording ? 0 : (deck.loadedTake ? (deck.loadedTake.durationSec || 0) : 0);
+  const counter = buildCounter({
+    time: fmtTime(initTime),
+    take: deck.counterTakeNo ? ('TAKE ' + deck.counterTakeNo) : '',
+    stat: deck.bouncing ? 'BOUNCING' : (deck.overdub ? 'OVERDUB' : ''),
+  });
+  toolbar.appendChild(counter.el);
+  const tools = h('div', 'tltools');
+  [['slice', '✂', 'Slice at a bar'], ['dupe', '⧉', 'Duplicate a clip'], ['trim', '▖', 'Trim an edge bar'], ['delete', '🗑', 'Delete a clip']].forEach(([id, glyph, title]) => {
+    const b = h('button', 'tltool' + (deck.tool === id ? ' on' : ''), glyph);
+    b.title = title; b.disabled = recording;
+    b.addEventListener('click', () => handlers.onTimelineTool(id));
+    tools.appendChild(b);
+  });
+  toolbar.appendChild(tools);
+  const hintText = deck.tool
+    ? (deck.tool === 'dupe'
+      ? (deck.dupeSrc ? 'DUPE — click an empty spot in the lane to place the copy' : 'DUPE — click a clip to copy')
+      : deck.tool.toUpperCase() + ' — click a clip')
+    : (armedSet.size ? 'Click a bar to move the ● record head, then ● REC' : 'Click a bar to move the ▶ play head, then ▶ PLAY');
+  toolbar.appendChild(h('div', 'tlhint', hintText));
+  box.appendChild(toolbar);
+
+  // ---- scrollable grid: ruler + 4 lanes + the head, all sharing bar-0 = x-0 ----
+  const scroll = h('div', 'tlscroll');
+  const grid = h('div', 'tlgrid');
+  grid.style.width = gridW + 'px';
+
+  const ruler = h('div', 'tlruler');
+  for (let b = 0; b <= totalBars; b++) {
+    const t = h('div', 'tltick' + (b % 4 === 0 ? ' major' : ''));
+    t.style.left = (b * PX) + 'px';
+    if (b % 4 === 0 && b < totalBars) t.appendChild(h('span', 'tlbarnum', String(b + 1)));
+    ruler.appendChild(t);
+  }
+  grid.appendChild(ruler);
+
+  const barFromEvent = (e, el) => { const r = el.getBoundingClientRect(); return Math.max(0, Math.floor((e.clientX - r.left) / PX)); };
+  function act(e, key, clip, laneEl) {
+    if (recording) return;
+    const bar = barFromEvent(e, laneEl);
+    if (deck.tool && clip) {
+      if (deck.tool === 'slice') handlers.onTimelineSlice(key, clip.id, bar);
+      else if (deck.tool === 'trim') handlers.onTimelineTrim(key, clip.id, bar);
+      else if (deck.tool === 'delete') handlers.onTimelineDelete(key, clip.id);
+      else if (deck.tool === 'dupe') handlers.onTimelineDupePick(key, clip.id);
+      return;
+    }
+    if (deck.tool === 'dupe' && deck.dupeSrc && !clip) { handlers.onTimelineDupePlace(deck.dupeSrc.key, bar); return; }
+    if (!deck.tool) handlers.onTimelineSeek(bar); // move the head (floor-snap to the bar left of the click)
+  }
+
+  STEM_KEYS.forEach((key, i) => {
+    const lane = h('div', 'tllane ' + LANE_COLORS[i]
+      + (armedSet.has(key) ? ' armed' : '')
+      + (recSet.has(key) ? ' recording' : ''));
+    lane.style.width = gridW + 'px';
+    ((strips[key] && strips[key].clips) || []).forEach((c) => {
+      if (!c.file) return;
+      const clip = h('div', 'tlclip');
+      clip.style.left = (c.startBar * PX) + 'px';
+      clip.style.width = ((c.bars || 1) * PX) + 'px';
+      for (let b = 1; b < (c.bars || 1); b++) { const ln = h('div', 'tlbarline'); ln.style.left = (b * PX) + 'px'; clip.appendChild(ln); }
+      if (deck.dupeSrc && deck.dupeSrc.key === key && deck.dupeSrc.clipId === c.id) clip.classList.add('picked');
+      clip.addEventListener('click', (e) => { e.stopPropagation(); act(e, key, c, lane); });
+      lane.appendChild(clip);
+    });
+    const lbl = h('div', 'tllabel', STEM_SHORT[key]); // overlays top-left, pointer-events:none
+    lane.appendChild(lbl);
+    lane.addEventListener('click', (e) => act(e, key, null, lane));
+    grid.appendChild(lane);
+  });
+
+  const headEl = h('div', 'tlhead ' + (armedSet.size ? 'rec' : 'play'));
+  headEl.style.left = ((deck.head || 0) * PX) + 'px';
+  grid.appendChild(headEl);
+
+  scroll.appendChild(grid);
+  box.appendChild(scroll);
+  // preserve + report the horizontal scroll across full re-renders
+  requestAnimationFrame(() => { scroll.scrollLeft = deck.scrollLeft || 0; });
+  scroll.addEventListener('scroll', () => handlers.onTimelineScroll(scroll.scrollLeft));
+
+  return { el: box, counter };
+}
+
 // ---- function row ----
 function functionRow(deck, handlers) {
   const wrap = h('div', 'col');
@@ -448,7 +578,7 @@ function takeLog(deck, handlers) {
 
 function filledCountOf(t) {
   if (!t || !t.stems) return 0;
-  return STEM_KEYS.reduce((n, k) => n + (t.stems[k] && t.stems[k].file ? 1 : 0), 0);
+  return STEM_KEYS.reduce((n, k) => n + (slotHasAudio(t.stems[k]) ? 1 : 0), 0);
 }
 function historyRow(t, deck, handlers) {
   if (t.status === 'discarded') {
