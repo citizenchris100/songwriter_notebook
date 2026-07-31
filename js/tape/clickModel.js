@@ -86,6 +86,15 @@ export function countInSeconds(bpm, timeSigIndex, bars = 2) {
   return bars * barSeconds(bpm, timeSigIndex);
 }
 
+// Bar-atomic Stop (round UP): the whole-bar count to keep when Stop is pressed `elapsedFrames`
+// into a recording whose bars are `barFrames` samples each. Completes the in-progress bar, min 1
+// bar — so a clip is always a whole number of bars, never less. The impure engine sets the capture
+// gate's endFrame = beginFrame + barsToCommit(...) * barFrames.
+export function barsToCommit(elapsedFrames, barFrames) {
+  if (!(barFrames > 0)) return 1;
+  return Math.max(1, Math.ceil(elapsedFrames / barFrames));
+}
+
 // Ticks in one bar of the given meter, at PPQ resolution: ppq * numerator * 4 / denominator
 // (4/4 -> 4*ppq, 6/8 -> 3*ppq). The drum-loop sequencer quantizes each loop into 16 EQUAL
 // cells of a bar, so a cell is barTicks/16 — meter-correct for any TIME_SIGS entry (the

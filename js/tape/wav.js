@@ -74,6 +74,34 @@ export function interleave(chArrays) {
   return out;
 }
 
+// Mono sample count from a PCM16 WAV's data-size header field (2 bytes/sample), clamped to the
+// bytes actually present. The timeline clip tools rely on byte 44 + 2N == sample N.
+export function wavSampleCount(bytes) {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const dataBytes = Math.min(view.getUint32(40, true), Math.max(0, u8.length - 44));
+  return Math.floor(dataBytes / 2);
+}
+
+// Byte-exact slice of a MONO PCM16 WAV: samples [fromSample, toSample) become a fresh WAV with a
+// recomputed 44-byte header. Since the data chunk starts at byte 44 and each mono sample is 2 bytes,
+// sample N lives at byte 44 + 2N — so a bar boundary (N = bar * barFrames) maps to an exact byte,
+// which is what makes slice/trim lossless. Ranges are clamped to the file. Returns a Uint8Array.
+export function sliceWavBytes(bytes, fromSample, toSample) {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const rate = view.getUint32(24, true);
+  const total = wavSampleCount(u8);
+  const from = Math.max(0, Math.min(total, Math.floor(fromSample)));
+  const to = Math.max(from, Math.min(total, Math.floor(toSample)));
+  const dataBytes = (to - from) * 2;
+  const header = new Uint8Array(wavHeader(1, rate, dataBytes));
+  const out = new Uint8Array(44 + dataBytes);
+  out.set(header, 0);
+  out.set(u8.subarray(44 + from * 2, 44 + to * 2), 44);
+  return out;
+}
+
 // Parse a PCM16 RIFF file this app wrote. Rejects anything else with a clear
 // error rather than trying to handle the general WAV format universe.
 export function parseWav(bytes) {

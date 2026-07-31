@@ -36,6 +36,8 @@ import {
   pendingOpfsSlotKeys, takeIsSaved, migrateTakeSlots, revertSlotToOpfs, midiRef, referencedMidiFiles, setDrumMidiFile,
   loopsRef, referencedLoopFiles, setDrumSequence,
   projectTakesForJson, hydrateSavedTakes, tapeDeckWithTakes, activeAudioTakeCount, rekeyManifest,
+  clipFileName, referencedClipFiles, takeLengthBars, MANIFEST_SCHEMA,
+  recordClip, sliceClip, trimClip, deleteClipFromLane, dupeClipInLane,
   defaultStemSettings, clampStemSettings, compressorParams, bounceGainDb,
   LUFS_TARGET, LUFS_FLOOR, BOUNCE_GAIN_DB_MIN, BOUNCE_GAIN_DB_MAX, LIMITER_CEILING_DB,
   STEM_KEYS, MAX_TRACKS, TAKE_STATUS,
@@ -44,7 +46,7 @@ import {
   resolveDeckRestore, reconcileTakelessSong, reconstructManifestFromFiles,
   planDupeTakes, pruneTapeDeckToCopied, runDeckRestore, manifestReferencesFolderAudio,
 } from './js/tape/deckRestore.js';
-import { wavHeader, floatToInt16, interleave, parseWav, SIZE_FIELDS } from './js/tape/wav.js';
+import { wavHeader, floatToInt16, interleave, parseWav, SIZE_FIELDS, wavSampleCount, sliceWavBytes } from './js/tape/wav.js';
 import { integratedLoudness } from './js/tape/lufs.js';
 import { limit } from './js/tape/limiter.js';
 import {
@@ -54,7 +56,7 @@ import {
 } from './js/tape/latency.js';
 import {
   TIME_SIGS, SUBS, MIN_BPM, MAX_BPM, computeLevels, accentGroups,
-  barSeconds, countInSeconds, barTicks, defaultAccentIndex, defaultClickConfig, clampClickConfig, lockClickEdit,
+  barSeconds, countInSeconds, barTicks, barsToCommit, defaultAccentIndex, defaultClickConfig, clampClickConfig, lockClickEdit,
 } from './js/tape/clickModel.js';
 import {
   CLIP_THRESHOLD, METER_TOP_DB, METER_FLOOR_DB, FALL_DB_PER_SEC, CLIP_HOLD_MS,
@@ -74,6 +76,10 @@ import {
 import {
   LOOP_NAME_RE, isLoopName, loopNumber, sortLoopNames, validateLoopFolderNames,
 } from './js/tape/loopFolder.js';
+import {
+  clipEndBar, clipsOverlap, laneLengthBars, clipsInRegion, firstFreeBarFrom,
+  replaceRegionWithClip, sliceClipAtBar, trimClipEdge, deleteClip, dupeClip,
+} from './js/tape/clipModel.js';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const readJSON = (p) => JSON.parse(readFileSync(here(p), 'utf8'));
@@ -239,6 +245,7 @@ const sw = readFileSync(here('./sw.js'), 'utf8');
 ok('sw.js caches the manifest', sw.includes('"./feels/index.json"'));
 for (const id of BUILTIN_IDS) ok('sw.js caches feel ' + id, sw.includes(`"./feels/${id}.json"`));
 ok('sw.js caches the roman.js module', sw.includes('"./js/theory/roman.js"'));
+ok('sw.js caches the clipModel.js module (timeline clips)', sw.includes('"./js/tape/clipModel.js"'));
 for (const f of ['dom', 'songs', 'songStore', 'songsView', 'sketches', 'audioStore', 'sketchesView']) ok('sw.js caches ' + f + '.js', sw.includes(`"./js/${f}.js"`));
 
 // ============================================================================
@@ -534,7 +541,7 @@ ok('normalizeSong omits the tapeDeck key entirely when absent', !('tapeDeck' in 
 
 // tapeDeck.takes — durable folder-saved take records embedded in the song (restore-on-open).
 const savedTakeRec = { take: 2, status: 'active', recovered: false, createdAt: 'T', durationSec: 5, sampleRate: 48000,
-  stems: { stem1: { file: 'my-song_2_stem1.wav', group: 1, durationSec: 5, loc: 'folder', vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0 }, stem2: null, stem3: null, stem4: null },
+  stems: { stem1: { vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0, clips: [{ id: 'g1', file: 'my-song_2_stem1_g1.wav', startBar: 0, bars: 3, durationSec: 5, loc: 'folder', group: 1 }] }, stem2: null, stem3: null, stem4: null },
   bounce: null };
 ok('validateSong accepts a tapeDeck with saved take records', validateSong({ ...goodSong, tapeDeck: { path: 'takes/my-song/', schemaVersion: 2, takes: [savedTakeRec] } }).ok);
 ok('validateSong rejects a non-array tapeDeck.takes', !validateSong({ ...goodSong, tapeDeck: { path: 'takes/my-song/', takes: 'nope' } }).ok);
@@ -543,8 +550,8 @@ ok('validateSong does not fail the song over a malformed take entry', validateSo
 const tdNorm = normalizeSong({ ...goodSong, tapeDeck: { path: 'takes/my-song/', takes: [savedTakeRec, { take: 'bogus' }] } });
 eq('normalizeSong drops invalid saved take entries, keeps valid ones', tdNorm.tapeDeck.takes.length, 1);
 eq('normalizeSong keeps the saved take number', tdNorm.tapeDeck.takes[0].take, 2);
-eq('normalizeSong keeps folder loc on a restored slot', tdNorm.tapeDeck.takes[0].stems.stem1.loc, 'folder');
-eq('normalizeSong stamps tapeDeck.schemaVersion 2', tdNorm.tapeDeck.schemaVersion, 2);
+eq('normalizeSong keeps folder loc on a restored clip', tdNorm.tapeDeck.takes[0].stems.stem1.clips[0].loc, 'folder');
+eq('normalizeSong stamps tapeDeck.schemaVersion 3', tdNorm.tapeDeck.schemaVersion, 3);
 ok('normalizeSong round-trips a bare { path } tapeDeck (back-compat, no takes key)', !('takes' in normalizeSong({ ...goodSong, tapeDeck: { path: 'takes/my-song/' } }).tapeDeck));
 
 // file link (additive, local-only — the .json a song is opened from / saved to; stays out
@@ -570,10 +577,10 @@ ok('toSongFile passes progressions through', sf.progressions.length === 1 && sf.
 ok('toSongFile passes sketches through', Array.isArray(sf.sketches));
 // THE RED-PROVING VECTOR — tapeDeck.takes must survive into the .json.
 ok('toSongFile embeds the tapeDeck', !!sf.tapeDeck && sf.tapeDeck.path === 'takes/my-song/');
-eq('toSongFile stamps tapeDeck.schemaVersion 2', sf.tapeDeck.schemaVersion, 2);
+eq('toSongFile stamps tapeDeck.schemaVersion 3', sf.tapeDeck.schemaVersion, 3);
 eq('toSongFile round-trips the saved take records', sf.tapeDeck.takes.length, 1);
 eq('toSongFile keeps the saved take number', sf.tapeDeck.takes[0].take, 2);
-eq('toSongFile keeps the folder loc on a restored slot', sf.tapeDeck.takes[0].stems.stem1.loc, 'folder');
+eq('toSongFile keeps the folder loc on a restored clip', sf.tapeDeck.takes[0].stems.stem1.clips[0].loc, 'folder');
 ok('toSongFile omits tapeDeck when the song has none', !('tapeDeck' in toSongFile(goodSong)));
 ok('toSongFile never writes the local file link', !('file' in toSongFile({ ...goodSong, file: { name: 'x.json' } })));
 ok('toSongFile normalizes a takeless tapeDeck path to takes:[]',
@@ -684,7 +691,7 @@ eq('bounceGainDb skips (0 dB) on silence', bounceGainDb(-Infinity), 0);
 // ---- takeModel: a take is a 4-track container filled over multiple passes ----
 let man = createManifest('blue-eyes');
 eq('createManifest starts empty', man.takes.length, 0);
-eq('createManifest schemaVersion 2', man.schemaVersion, 2);
+eq('createManifest schemaVersion 3', man.schemaVersion, 3);
 eq('nextTakeNumber on empty manifest', nextTakeNumber(man), 1);
 
 // Take 1: an empty container, then a first pass arms two of its four slots (group 1).
@@ -697,14 +704,16 @@ ok('a fresh container has no channels field', !('channels' in take1));
 
 eq('nextGroup on an empty take is 1', nextGroup(man.takes[0]), 1);
 man = appendPassTracks(man, 1, ['stem1', 'stem2'], 1);
-ok('appendPassTracks names + stamps the pass slots', man.takes[0].stems.stem1.file === 'blue-eyes_1_stem1.wav' && man.takes[0].stems.stem1.group === 1 && man.takes[0].stems.stem1.durationSec === null);
-ok('appendPassTracks leaves untargeted slots free', man.takes[0].stems.stem3 === null && man.takes[0].stems.stem4 === null);
+ok('appendPassTracks names + stamps the pass clip', man.takes[0].stems.stem1.clips[0].file === clipFileName('blue-eyes', 1, 'stem1', 'g1') && man.takes[0].stems.stem1.clips[0].group === 1 && man.takes[0].stems.stem1.clips[0].durationSec === null);
+ok('appendPassTracks leaves untargeted lanes free', man.takes[0].stems.stem3 === null && man.takes[0].stems.stem4 === null);
+ok('appendPassTracks arms a clip at bar 0', man.takes[0].stems.stem1.clips[0].startBar === 0);
 eq('freeSlotKeys after arming pass 1', freeSlotKeys(man.takes[0]).join(','), 'stem3,stem4');
 
 // Clean stop of the pass: per-slot durations, take length = max, status active.
 man = finalizePass(man, 1, { stem1: 12.5, stem2: 10.0 });
 eq('finalizePass sets active', man.takes[0].status, 'active');
-eq('finalizePass per-slot duration', man.takes[0].stems.stem1.durationSec, 12.5);
+eq('finalizePass per-clip duration', man.takes[0].stems.stem1.clips[0].durationSec, 12.5);
+eq('finalizePass sets integer bars from tempo (12.5s @ 2s/bar -> 6)', man.takes[0].stems.stem1.clips[0].bars, 6);
 eq('finalizePass take duration = max filled slot', man.takes[0].durationSec, 12.5);
 eq('filledSlotKeys after pass 1', filledSlotKeys(man.takes[0]).join(','), 'stem1,stem2');
 eq('maxSlotDuration', maxSlotDuration(man.takes[0]), 12.5);
@@ -713,7 +722,7 @@ ok('takeHasAudio true after a pass', takeHasAudio(man.takes[0]) === true);
 // Overdub pass 2 into the two remaining free slots (group 2, on the same take).
 eq('nextGroup after pass 1 is 2', nextGroup(man.takes[0]), 2);
 man = appendPassTracks(man, 1, defaultRouting(freeSlotKeys(man.takes[0]), 2), 2);
-ok('pass 2 arms stem3+stem4 at group 2', man.takes[0].stems.stem3.group === 2 && man.takes[0].stems.stem4.group === 2);
+ok('pass 2 arms stem3+stem4 at group 2', man.takes[0].stems.stem3.clips[0].group === 2 && man.takes[0].stems.stem4.clips[0].group === 2);
 man = finalizePass(man, 1, { stem3: 8.0, stem4: 20.0 });
 eq('take duration grows to the longest track', man.takes[0].durationSec, 20.0);
 eq('filledSlotKeys after pass 2', filledSlotKeys(man.takes[0]).join(','), 'stem1,stem2,stem3,stem4');
@@ -725,21 +734,22 @@ eq('lastGroupSlotKeys = the last pass', lastGroupSlotKeys(man.takes[0]).join(','
 // Retake→discard-last-group frees only that pass's slots, keeps the earlier group.
 let dg = discardGroup(man, 1, 2);
 eq('discardGroup frees the last group', freeSlotKeys(dg.takes[0]).join(','), 'stem3,stem4');
-ok('discardGroup keeps group 1 intact', dg.takes[0].stems.stem1.file === 'blue-eyes_1_stem1.wav');
+ok('discardGroup keeps group 1 intact', dg.takes[0].stems.stem1.clips[0].file === clipFileName('blue-eyes', 1, 'stem1', 'g1'));
 eq('discardGroup recomputes take duration', dg.takes[0].durationSec, 12.5);
 ok('discardGroup keeps the take active', dg.takes[0].status === 'active');
 
 // Ping-pong bounce: stem1 -> stem2. Source freed, dest neutral + new duration.
 const preComp = setStemSettings(man, 1, 'stem2', { vol: 0.5, comp: 0.8 });
 let pp = bounceTrackToTrack(preComp, 1, 'stem1', 'stem2', 13.0);
-ok('bounceTrackToTrack frees the source slot', pp.takes[0].stems.stem1 === null);
-ok('bounceTrackToTrack keeps the dest file', pp.takes[0].stems.stem2.file === 'blue-eyes_1_stem2.wav');
+ok('bounceTrackToTrack frees the source lane', pp.takes[0].stems.stem1 === null);
+ok('bounceTrackToTrack keeps the dest clip file', pp.takes[0].stems.stem2.clips[0].file === clipFileName('blue-eyes', 1, 'stem2', 'g1'));
 ok('bounceTrackToTrack resets dest settings to neutral', pp.takes[0].stems.stem2.vol === 1.0 && pp.takes[0].stems.stem2.comp === 0);
-eq('bounceTrackToTrack sets dest duration', pp.takes[0].stems.stem2.durationSec, 13.0);
-eq('bounceTrackToTrack frees a slot for recording', freeSlotKeys(pp.takes[0]).join(','), 'stem1');
+eq('bounceTrackToTrack sets dest clip duration', pp.takes[0].stems.stem2.clips[0].durationSec, 13.0);
+ok('bounceTrackToTrack collapses dest to ONE clip at bar 0', pp.takes[0].stems.stem2.clips.length === 1 && pp.takes[0].stems.stem2.clips[0].startBar === 0);
+eq('bounceTrackToTrack frees a lane for recording', freeSlotKeys(pp.takes[0]).join(','), 'stem1');
 // A group can span physically non-adjacent keys after a bounce-then-record — helpers key off stamps, never adjacency.
 let pp2 = appendPassTracks(pp, 1, ['stem1'], nextGroup(pp.takes[0]));
-eq('recording after ping-pong stamps a fresh group', pp2.takes[0].stems.stem1.group, 3);
+eq('recording after ping-pong stamps a fresh group', pp2.takes[0].stems.stem1.clips[0].group, 3);
 
 // A discarded number is never reused.
 eq('nextTakeNumber after take 1', nextTakeNumber(man), 2);
@@ -748,7 +758,7 @@ man = appendTake(man, take2);
 man = appendPassTracks(man, 2, ['stem1'], 1);
 man = discardTake(man, 2);
 eq('discardTake sets discarded (tombstone)', man.takes[1].status, 'discarded');
-ok('discardTake nulls every slot file field', STEM_KEYS.every((k) => !man.takes[1].stems[k] || man.takes[1].stems[k].file === null));
+ok('discardTake drops every lane\'s audio', STEM_KEYS.every((k) => !slotHasAudio(man.takes[1].stems[k])));
 eq('nextTakeNumber never reuses a discarded number', nextTakeNumber(man), 3);
 
 // A take that died mid-record still occupies its number; crash recovery per slot.
@@ -761,7 +771,7 @@ eq('nextTakeNumber counts a "recording" take too', nextTakeNumber(man), 4);
 const recovered = finalizeRecoveredPass(man, 3, { stem1: 48000 * 2 * 5, stem2: 0 }, 48000); // stem1 5s, stem2 empty
 const rt = recovered.takes.find((t) => t.take === 3);
 ok('finalizeRecoveredPass marks active+recovered', rt.status === 'active' && rt.recovered === true);
-eq('finalizeRecoveredPass finalizes the nonempty slot', rt.stems.stem1.durationSec, 5);
+eq('finalizeRecoveredPass finalizes the nonempty clip', rt.stems.stem1.clips[0].durationSec, 5);
 ok('finalizeRecoveredPass frees the empty pending slot', rt.stems.stem2 === null);
 // a pass where every slot captured nothing tombstones the whole (empty) take
 const empties = finalizeRecoveredPass(man, 3, { stem1: 0, stem2: 0 }, 48000);
@@ -779,8 +789,8 @@ eq('markBounced sets the bounce record', bouncedMan.takes[0].bounce.file, 'blue-
 // setStemSettings preserves the slot's group + durationSec (regression: earlier code dropped them).
 const settingsMan = setStemSettings(man, 1, 'stem1', { vol: 0.5, eq: { bass: 3 } });
 const s1 = settingsMan.takes[0].stems.stem1;
-ok('setStemSettings merges + clamps, keeps the file name', s1.vol === 0.5 && s1.eq.bass === 3 && s1.eq.mid === 0 && s1.file === 'blue-eyes_1_stem1.wav');
-ok('setStemSettings preserves group + durationSec', s1.group === 1 && s1.durationSec === 12.5);
+ok('setStemSettings merges + clamps, keeps the clips', s1.vol === 0.5 && s1.eq.bass === 3 && s1.eq.mid === 0 && s1.clips[0].file === clipFileName('blue-eyes', 1, 'stem1', 'g1'));
+ok('setStemSettings leaves the clips untouched (group + durationSec intact)', s1.clips[0].group === 1 && s1.clips[0].durationSec === 12.5);
 // A free (null) slot must stay null — never resurrected as a {file:undefined,...} object.
 eq('setStemSettings no-ops on a free slot', setStemSettings(man, 3, 'stem3', { vol: 0.9 }).takes.find((t) => t.take === 3).stems.stem3, null);
 
@@ -790,7 +800,7 @@ ok('validateManifest rejects a bad slug', !validateManifest({ slug: '', takes: [
 ok('validateManifest rejects a non-array takes', !validateManifest({ slug: 'x', takes: 'nope' }).ok);
 ok('validateTake rejects an empty object', !validateTake({}).ok);
 ok('validateTake accepts a normalized take', validateTake(normalizeTake(take1)).ok);
-ok('normalizeManifest emits schemaVersion 2', normalizeManifest({ slug: 'x', takes: [] }).schemaVersion === 2);
+ok('normalizeManifest emits schemaVersion 3', normalizeManifest({ slug: 'x', takes: [] }).schemaVersion === 3);
 ok('normalizeTake defaults a missing status to discarded', normalizeTake({ take: 1 }).status === 'discarded');
 
 // ---- takeModel: v1 -> v2 migration (real on-device takes must survive) ----
@@ -805,21 +815,21 @@ const v1Stereo = {
 ok('validateManifest accepts a raw v1 manifest', validateManifest(v1Stereo).ok);
 const migrated = normalizeManifest(v1Stereo);
 const mt = migrated.takes[0];
-eq('migration stamps schemaVersion 2', migrated.schemaVersion, 2);
-ok('migration keeps stem1/stem2 filenames (WAVs still resolve)', mt.stems.stem1.file === 'blue-eyes_1_stem1.wav' && mt.stems.stem2.file === 'blue-eyes_1_stem2.wav');
-ok('migration stamps group 1', mt.stems.stem1.group === 1 && mt.stems.stem2.group === 1);
-ok('migration sets per-slot durationSec from the take duration', mt.stems.stem1.durationSec === 12.5 && mt.stems.stem2.durationSec === 12.5);
-ok('migration opens stem3/stem4 as free slots', mt.stems.stem3 === null && mt.stems.stem4 === null);
-ok('migration preserves the effect settings', mt.stems.stem1.eq.bass === 3 && mt.stems.stem1.comp === 0.2 && mt.stems.stem2.vol === 0.8);
+eq('migration stamps schemaVersion 3', migrated.schemaVersion, 3);
+ok('migration keeps stem1/stem2 filenames verbatim (WAVs still resolve)', mt.stems.stem1.clips[0].file === 'blue-eyes_1_stem1.wav' && mt.stems.stem2.clips[0].file === 'blue-eyes_1_stem2.wav');
+ok('migration one-clip lane at bar 0, group 1', mt.stems.stem1.clips.length === 1 && mt.stems.stem1.clips[0].startBar === 0 && mt.stems.stem1.clips[0].group === 1 && mt.stems.stem2.clips[0].group === 1);
+ok('migration sets per-clip durationSec from the take duration', mt.stems.stem1.clips[0].durationSec === 12.5 && mt.stems.stem2.clips[0].durationSec === 12.5);
+ok('migration opens stem3/stem4 as free lanes', mt.stems.stem3 === null && mt.stems.stem4 === null);
+ok('migration preserves the effect settings (lane level)', mt.stems.stem1.eq.bass === 3 && mt.stems.stem1.comp === 0.2 && mt.stems.stem2.vol === 0.8);
 ok('migration drops the legacy channels field', !('channels' in mt));
-ok('migration marks migrated slots loc opfs', mt.stems.stem1.loc === 'opfs' && mt.stems.stem2.loc === 'opfs');
+ok('migration marks migrated clips loc opfs', mt.stems.stem1.clips[0].loc === 'opfs' && mt.stems.stem2.clips[0].loc === 'opfs');
 ok('migration marks the migrated bounce loc opfs', mt.bounce.loc === 'opfs');
 ok('migration is idempotent (re-normalize is stable)', JSON.stringify(normalizeManifest(migrated)) === JSON.stringify(migrated));
 eq('a migrated 2-track take opens as a partial 4-track take', freeSlotKeys(mt).join(','), 'stem3,stem4');
 // A mono v1 take -> stem1 only, stem2 stays null.
 const v1Mono = { schemaVersion: 1, slug: 's', takes: [{ take: 1, status: 'active', recovered: false, createdAt: 'T', durationSec: 6, sampleRate: 48000, channels: 1, stems: { stem1: { file: 's_1_stem1.wav', vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0 }, stem2: null }, bounce: null }] };
 const mm = normalizeManifest(v1Mono).takes[0];
-ok('mono v1 migrates stem1 only', mm.stems.stem1.file === 's_1_stem1.wav' && mm.stems.stem1.group === 1 && mm.stems.stem2 === null);
+ok('mono v1 migrates stem1 only', mm.stems.stem1.clips[0].file === 's_1_stem1.wav' && mm.stems.stem1.clips[0].group === 1 && mm.stems.stem2 === null);
 
 // ---- takeModel: folder-persistence loc model + Save-migration helpers ----
 let locMan = appendTake(createManifest('blue-eyes'), makeTake({ take: 1, sampleRate: 48000 }, 'T'));
@@ -864,9 +874,9 @@ eq('migrate with {bounce:true} flips the bounce to folder', bMan.takes[0].bounce
 // normalize: default absent loc -> opfs, preserve folder, clamp garbage -> opfs.
 const mkStem = (loc) => ({ file: 'x_1_stem1.wav', group: 1, durationSec: 5, ...(loc ? { loc } : {}), vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0 });
 const mkTake = (loc, bounceLoc) => ({ take: 1, status: 'active', createdAt: 'T', durationSec: 5, sampleRate: 48000, stems: { stem1: mkStem(loc), stem2: null, stem3: null, stem4: null }, bounce: bounceLoc ? { file: 'x_1_mix.wav', bouncedAt: 'T', lufs: -14, loc: bounceLoc } : null });
-eq('normalizeStem defaults absent loc to opfs', normalizeTake(mkTake(null)).stems.stem1.loc, 'opfs');
-eq('normalizeStem preserves loc folder', normalizeTake(mkTake('folder')).stems.stem1.loc, 'folder');
-eq('normalizeStem clamps a garbage loc to opfs', normalizeTake(mkTake('bogus')).stems.stem1.loc, 'opfs');
+eq('normalizeLane defaults a legacy slot\'s absent loc to opfs', normalizeTake(mkTake(null)).stems.stem1.clips[0].loc, 'opfs');
+eq('normalizeLane preserves a legacy slot\'s loc folder', normalizeTake(mkTake('folder')).stems.stem1.clips[0].loc, 'folder');
+eq('normalizeLane clamps a garbage loc to opfs', normalizeTake(mkTake('bogus')).stems.stem1.clips[0].loc, 'opfs');
 ok('validateManifest rejects a bad slot loc', !validateManifest({ slug: 'x', takes: [mkTake('nope')] }).ok);
 ok('validateManifest accepts loc folder + bounce loc opfs', validateManifest({ slug: 'x', takes: [mkTake('folder', 'opfs')] }).ok);
 
@@ -919,29 +929,29 @@ eq('activeAudioTakeCount over projected records', activeAudioTakeCount({ takes: 
 
 const hyd = hydrateSavedTakes('blue-eyes', proj);
 ok('hydrateSavedTakes yields a valid manifest', validateManifest(hyd).ok);
-eq('hydrate keeps schemaVersion 2', hyd.schemaVersion, 2);
+eq('hydrate keeps schemaVersion 3', hyd.schemaVersion, 3);
 eq('hydrate keeps the take numbers', hyd.takes.map((t) => t.take).join(','), '1,2');
 eq('hydrate selects the right most-recent take', mostRecentKeptTake(hyd).take, 2);
 eq('project/hydrate round-trip is idempotent', JSON.stringify(projectTakesForJson(hyd)), JSON.stringify(proj));
 
 const tdw = tapeDeckWithTakes('blue-eyes', projMan);
 eq('tapeDeckWithTakes carries the path ref', tdw.path, 'takes/blue-eyes/');
-eq('tapeDeckWithTakes stamps schemaVersion 2', tdw.schemaVersion, 2);
+eq('tapeDeckWithTakes stamps schemaVersion 3', tdw.schemaVersion, 3);
 eq('tapeDeckWithTakes projects the saved takes', tdw.takes.length, 2);
 
 // rekeyManifest (the "Dupe" feature) — re-key a manifest onto a new slug, re-deriving every
 // id-bearing stem/bounce filename; null (opfs-projected) slots stay null; immutable.
 const rekeyed = rekeyManifest({ schemaVersion: 2, slug: 'blue-eyes', takes: proj }, 'blue-eyes-copy');
 eq('rekeyManifest sets the new slug', rekeyed.slug, 'blue-eyes-copy');
-eq('rekeyManifest keeps schemaVersion 2', rekeyed.schemaVersion, 2);
+eq('rekeyManifest keeps schemaVersion 3', rekeyed.schemaVersion, 3);
 eq('rekeyManifest keeps the take numbers', rekeyed.takes.map((t) => t.take).join(','), '1,2');
 const rk1 = rekeyed.takes.find((t) => t.take === 1);
-eq('rekeyManifest re-derives a stem filename for the new slug', rk1.stems.stem1.file, stemFileName('blue-eyes-copy', 1, 'stem1'));
+eq('rekeyManifest re-derives a clip filename for the new slug', rk1.stems.stem1.clips[0].file, clipFileName('blue-eyes-copy', 1, 'stem1', 'g1'));
 eq('rekeyManifest re-derives the bounce filename', rk1.bounce.file, mixFileName('blue-eyes-copy', 1));
 const rk2 = rekeyed.takes.find((t) => t.take === 2);
-eq('rekeyManifest re-derives a partial take\'s surviving slot', rk2.stems.stem1.file, stemFileName('blue-eyes-copy', 2, 'stem1'));
-eq('rekeyManifest leaves an opfs-projected (null) slot null', rk2.stems.stem2, null);
-ok('rekeyManifest is immutable (source filename unchanged)', proj.find((t) => t.take === 1).stems.stem1.file === stemFileName('blue-eyes', 1, 'stem1'));
+eq('rekeyManifest re-derives a partial take\'s surviving clip', rk2.stems.stem1.clips[0].file, clipFileName('blue-eyes-copy', 2, 'stem1', 'g1'));
+eq('rekeyManifest leaves an opfs-projected (null) lane null', rk2.stems.stem2, null);
+ok('rekeyManifest is immutable (source filename unchanged)', proj.find((t) => t.take === 1).stems.stem1.clips[0].file === clipFileName('blue-eyes', 1, 'stem1', 'g1'));
 ok('a rekeyed manifest validates', validateManifest(rekeyed).ok);
 
 // ============================================================================
@@ -1013,7 +1023,7 @@ eq('R11 reconcile backfills 2 takes', drRc.tapeDeck.takes.length, 2);
 eq('R11 reconcile reports the take count', drRc.takeCount, 2);
 ok('R11 reconcile yields a valid working manifest', validateManifest(drRc.manifest).ok);
 eq('R15 reconcile tapeDeck path', drRc.tapeDeck.path, 'takes/everyday/');
-eq('R15 reconcile tapeDeck schemaVersion 2', drRc.tapeDeck.schemaVersion, 2);
+eq('R15 reconcile tapeDeck schemaVersion 3', drRc.tapeDeck.schemaVersion, 3);
 ok('R12 reconcile NEVER clobbers a song that already has takes',
    reconcileTakelessSong({ ...goodSong, id: 'everyday', tapeDeck: { path: 'takes/everyday/', schemaVersion: 2, takes: proj } }, drFolderMan).changed === false);
 ok('R13 reconcile no-op when the folder manifest is empty',
@@ -1036,7 +1046,7 @@ const drPlan = planDupeTakes({ embeddedTakes: proj, folderManifest: null, folder
 ok('R18 dupe needs the source folder granted (WAVs to copy)', drPlan.needsSourceGrant === true);
 eq('R18 dupe tapeDeck is rekeyed to the new slug', drPlan.tapeDeck.path, 'takes/ns-copy/');
 eq('R18 dupe carries both projected takes', drPlan.tapeDeck.takes.length, 2);
-ok('R18 dupe copies a rekeyed stem', drPlan.copies.some((c) => c.dstFile === 'ns-copy_1_stem1.wav'));
+ok('R18 dupe copies a rekeyed clip', drPlan.copies.some((c) => c.dstFile === 'ns-copy_1_stem1_g1.wav'));
 ok('R18 dupe copies the bounce', drPlan.copies.some((c) => c.dstFile === 'ns-copy_1_mix.wav'));
 const drPlanH1 = planDupeTakes({ embeddedTakes: [], folderManifest: drFolderMan, folderFiles: null, srcId: 'everyday', newId: 'everyday-2' });
 eq('H1 dupe of a LEGACY source recovers takes from the folder manifest', drPlanH1.tapeDeck.takes.length, 2);
@@ -1051,9 +1061,9 @@ eq('R19 takeless dupe copies nothing', drPlanNone.copies.length, 0);
 // -- pruneTapeDeckToCopied: embed only the takes whose WAVs actually copied (H2/H3) --
 const drCopiedAll = new Set(drPlan.copies.map((c) => c.dstFile));
 eq('H2 prune keeps every take when all WAVs copied', pruneTapeDeckToCopied(drPlan.tapeDeck, drCopiedAll).takes.length, 2);
-const drMissTake2 = new Set([...drCopiedAll]); drMissTake2.delete('ns-copy_2_stem1.wav');
+const drMissTake2 = new Set([...drCopiedAll]); drMissTake2.delete('ns-copy_2_stem1_g1.wav');
 ok('H3 prune drops a take whose only slot failed to copy', !pruneTapeDeckToCopied(drPlan.tapeDeck, drMissTake2).takes.some((t) => t.take === 2));
-const drMissStem2 = new Set([...drCopiedAll]); drMissStem2.delete('ns-copy_1_stem2.wav');
+const drMissStem2 = new Set([...drCopiedAll]); drMissStem2.delete('ns-copy_1_stem2_g1.wav');
 const drPruned1 = pruneTapeDeckToCopied(drPlan.tapeDeck, drMissStem2).takes.find((t) => t.take === 1);
 ok('H2 prune nulls a stem whose WAV did not copy', drPruned1.stems.stem2 === null);
 ok('H3 prune flags a partially-copied take recovered', drPruned1.recovered === true);
@@ -1153,6 +1163,141 @@ ok('cache is stale after an in-place bounce bumps the epoch',
    playbackCacheStale({ slug: 's', take: 3, epoch: 4 }, { slug: 's', take: 3, epoch: 5 }) === true);
 
 // ============================================================================
+// 14c. Tape deck (pure) — clipModel.js: timeline clip geometry
+// ============================================================================
+// A lane's clips are integer-bar regions that NEVER overlap and stay ordered by startBar.
+// These pure transforms own the geometry (record-replace, slice, trim, delete, dupe); the
+// impure shell injects ids/durations and does the WAV byte surgery.
+{
+  const C = (id, startBar, bars, x) => ({ id, file: id + '.wav', startBar, bars, durationSec: bars * 2, loc: 'opfs', group: 1, ...(x || {}) });
+  const noOverlaps = (cs) => cs.every((c, i) => cs.every((d, j) => i === j || !clipsOverlap(c, d)));
+
+  eq('clipEndBar = startBar + bars', clipEndBar(C('a', 2, 3)), 5);
+  ok('clipsOverlap true when intervals intersect', clipsOverlap(C('a', 0, 4), C('b', 2, 2)) === true);
+  ok('clipsOverlap false when adjacent (half-open)', clipsOverlap(C('a', 0, 4), C('b', 4, 2)) === false);
+  ok('clipsOverlap false when disjoint', clipsOverlap(C('a', 0, 2), C('b', 5, 2)) === false);
+  eq('laneLengthBars = max clipEnd', laneLengthBars({ clips: [C('a', 0, 2), C('b', 6, 3)] }), 9);
+  eq('laneLengthBars empty lane is 0', laneLengthBars({ clips: [] }), 0);
+  eq('laneLengthBars null lane is 0', laneLengthBars(null), 0);
+  eq('clipsInRegion collects only intersecting clips',
+     clipsInRegion([C('a', 0, 2), C('b', 4, 2), C('c', 8, 2)], 3, 3).map((c) => c.id).join(','), 'b');
+  eq('firstFreeBarFrom into a clear gap returns fromBar', firstFreeBarFrom([C('a', 0, 2)], 4, 2), 4);
+  eq('firstFreeBarFrom shifts right past an occupied region', firstFreeBarFrom([C('a', 0, 4)], 2, 2), 4);
+  eq('firstFreeBarFrom skips a straddled clip to its end', firstFreeBarFrom([C('a', 0, 2), C('b', 3, 2)], 1, 2), 5);
+
+  // replaceRegionWithClip — evict EVERY intersecting clip ENTIRELY, insert, keep ordered, invariant holds
+  const lane0 = { vol: 0.8, eq: { bass: 2, mid: 0, treble: 0 }, comp: 0.3, clips: [C('a', 0, 2), C('b', 4, 2), C('c', 8, 2)] };
+  const rr = replaceRegionWithClip(lane0, 3, 3, C('n', 3, 3));            // [3,6) hits b
+  eq('replaceRegion evicts only intersecting clips', rr.removed.map((c) => c.id).join(','), 'b');
+  eq('replaceRegion inserts + orders by startBar', rr.lane.clips.map((c) => c.id).join(','), 'a,n,c');
+  ok('replaceRegion preserves lane settings', rr.lane.vol === 0.8 && rr.lane.comp === 0.3 && rr.lane.eq.bass === 2);
+  ok('replaceRegion preserves non-overlap', noOverlaps(rr.lane.clips));
+  ok('replaceRegion is immutable (source untouched)', lane0.clips.length === 3);
+  const rrApp = replaceRegionWithClip(lane0, 12, 2, C('n2', 12, 2));      // record past the end
+  eq('replaceRegion past the end removes nothing', rrApp.removed.length, 0);
+  eq('replaceRegion past the end appends', rrApp.lane.clips.map((c) => c.id).join(','), 'a,b,c,n2');
+  ok('replaceRegion evicts a clip it only PARTIALLY covers, entirely',
+     !replaceRegionWithClip(lane0, 4, 1, C('n3', 4, 1)).lane.clips.some((c) => c.id === 'b'));
+
+  // sliceClipAtBar — [start,bar)+[bar,end); clamp so neither half is empty; reports source to cut
+  const laneS = { vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0, clips: [C('a', 2, 6)] }; // bars 2..8
+  const sl = sliceClipAtBar(laneS, 'a', 5, { leftId: 'aL', rightId: 'aR' });
+  eq('slice removes the original', sl.removed.map((c) => c.id).join(','), 'a');
+  eq('slice makes two ordered clips', sl.lane.clips.map((c) => c.id).join(','), 'aL,aR');
+  eq('slice left is [start,bar)', sl.lane.clips[0].startBar + '+' + sl.lane.clips[0].bars, '2+3');
+  eq('slice right is [bar,end)', sl.lane.clips[1].startBar + '+' + sl.lane.clips[1].bars, '5+3');
+  ok('slice reports the source WAV to cut', sl.copyFrom === 'a.wav');
+  ok('slice preserves non-overlap', noOverlaps(sl.lane.clips));
+  ok('sliced clips are fresh opfs with no file yet', sl.created.every((c) => c.file === null && c.loc === 'opfs'));
+  eq('slice clamps a boundary click so both halves survive',
+     sliceClipAtBar(laneS, 'a', 2, { leftId: 'x', rightId: 'y' }).lane.clips.map((c) => c.bars).join(','), '1,5');
+
+  // trimClipEdge
+  const laneT = { vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0, clips: [C('a', 2, 3)] }; // bars 2..5
+  const tf = trimClipEdge(laneT, 'a', 'first', { newId: 'a1' });
+  eq('trim first bumps startBar, drops a bar', tf.lane.clips[0].startBar + '+' + tf.lane.clips[0].bars, '3+2');
+  ok('trim first cuts a new file from the source', tf.copyFrom === 'a.wav' && tf.removed[0].id === 'a');
+  const tl = trimClipEdge(laneT, 'a', 'last', { newId: 'a2' });
+  eq('trim last keeps startBar, drops a bar', tl.lane.clips[0].startBar + '+' + tl.lane.clips[0].bars, '2+2');
+  const td = trimClipEdge({ vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0, clips: [C('z', 4, 1)] }, 'z', 'first', { newId: 'zz' });
+  eq('trim to zero bars deletes the clip', td.lane.clips.length, 0);
+  ok('trim-to-zero reports the removed file and creates nothing', td.removed[0].id === 'z' && td.created.length === 0);
+
+  // deleteClip
+  const dc = deleteClip({ vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0, clips: [C('a', 0, 2), C('b', 4, 2)] }, 'a');
+  eq('deleteClip removes the target', dc.lane.clips.map((c) => c.id).join(','), 'b');
+  eq('deleteClip reports the removed file', dc.removed.map((c) => c.file).join(','), 'a.wav');
+  ok('deleteClip keeps lane settings', dc.lane.vol === 1);
+
+  // dupeClip — snap+shift-right to non-overlapping fit; returns the source to copy
+  const laneD = { vol: 1, eq: { bass: 0, mid: 0, treble: 0 }, comp: 0, clips: [C('a', 0, 3)] }; // bars 0..3
+  const du = dupeClip(laneD, 'a', 1, { newId: 'a2' });                     // target 1 overlaps -> shift to 3
+  eq('dupeClip shifts right to the first free bar', du.lane.clips.find((c) => c.id === 'a2').startBar, 3);
+  eq('dupeClip copies the source length', du.lane.clips.find((c) => c.id === 'a2').bars, 3);
+  ok('dupeClip returns the source WAV to copy', du.copyFrom === 'a.wav');
+  ok('dupeClip preserves non-overlap', noOverlaps(du.lane.clips));
+  eq('dupeClip into a clear target keeps targetBar', dupeClip(laneD, 'a', 6, { newId: 'a3' }).lane.clips.find((c) => c.id === 'a3').startBar, 6);
+}
+
+// ============================================================================
+// 14d. Tape deck (pure) — takeModel clip transforms (manifest wrappers)
+// ============================================================================
+// The manifest-level wrappers over clipModel: they inject clipFileNames + measured durations
+// and return the removed/copy side-channels the impure shell needs for WAV I/O.
+{
+  eq('clipFileName suffixes the clip id', clipFileName('song', 3, 'stem2', 'k9'), 'song_3_stem2_k9.wav');
+  ok('clipFileName never collides with the legacy stem name', clipFileName('s', 1, 'stem1', 'x') !== stemFileName('s', 1, 'stem1'));
+
+  // A take at 120/4-4 (secPerBar 2.0). recordClip lands a finished timeline clip at a bar.
+  let cm = appendTake(createManifest('song'), makeTake({ take: 1, sampleRate: 48000 }, 'T'));
+  const rc = recordClip(cm, 1, 'stem1', { id: 'c1', startBar: 0, bars: 4, durationSec: 8, group: 1 });
+  cm = rc.manifest;
+  eq('recordClip creates the lane with one clip', cm.takes[0].stems.stem1.clips.length, 1);
+  eq('recordClip derives the clip filename', cm.takes[0].stems.stem1.clips[0].file, clipFileName('song', 1, 'stem1', 'c1'));
+  eq('recordClip places the clip at its bar', cm.takes[0].stems.stem1.clips[0].startBar + '+' + cm.takes[0].stems.stem1.clips[0].bars, '0+4');
+  ok('recordClip stamps a fresh opfs clip', cm.takes[0].stems.stem1.clips[0].loc === 'opfs');
+  ok('recordClip activates the take + sets its length', cm.takes[0].status === 'active' && cm.takes[0].durationSec === 8);
+  eq('recordClip removed nothing on a fresh lane', rc.removedFiles.length, 0);
+
+  // record AFTER the first clip -> a second clip on the same lane (no eviction)
+  const rc2 = recordClip(cm, 1, 'stem1', { id: 'c2', startBar: 6, bars: 2, durationSec: 4, group: 2 });
+  eq('recordClip after existing appends a second clip', rc2.manifest.takes[0].stems.stem1.clips.map((c) => c.id).join(','), 'c1,c2');
+  eq('recordClip after existing removes nothing', rc2.removedFiles.length, 0);
+  eq('take length spans the later clip (bar6 + 2 bars @ 2s = 16s)', rc2.manifest.takes[0].durationSec, 16);
+  eq('takeLengthBars = furthest clip end bar', takeLengthBars(rc2.manifest.takes[0]), 8);
+
+  // record OVER the first clip -> evict it entirely, report its file to delete
+  const rc3 = recordClip(cm, 1, 'stem1', { id: 'c3', startBar: 0, bars: 2, durationSec: 4, group: 2 });
+  eq('recordClip over an existing clip evicts it', rc3.manifest.takes[0].stems.stem1.clips.map((c) => c.id).join(','), 'c3');
+  eq('recordClip reports the evicted file', rc3.removedFiles.join(','), clipFileName('song', 1, 'stem1', 'c1'));
+
+  // referencedClipFiles collects every clip file across the take
+  eq('referencedClipFiles lists every clip file', [...referencedClipFiles(rc2.manifest)].sort().join(','),
+     [clipFileName('song', 1, 'stem1', 'c1'), clipFileName('song', 1, 'stem1', 'c2')].sort().join(','));
+
+  // A one-clip take to slice/trim/delete/dupe.
+  const sm = recordClip(appendTake(createManifest('song'), makeTake({ take: 1, sampleRate: 48000 }, 'T')), 1, 'stem1', { id: 'big', startBar: 0, bars: 6, durationSec: 12, group: 1 }).manifest;
+  const sr = sliceClip(sm, 1, 'stem1', 'big', 3, { leftId: 'L', rightId: 'R' });
+  eq('sliceClip splits into two ordered clips', sr.manifest.takes[0].stems.stem1.clips.map((c) => c.id).join(','), 'L,R');
+  ok('sliceClip names both halves', sr.manifest.takes[0].stems.stem1.clips.every((c) => !!c.file));
+  eq('sliceClip left file uses clipFileName', sr.manifest.takes[0].stems.stem1.clips[0].file, clipFileName('song', 1, 'stem1', 'L'));
+  eq('sliceClip reports the source WAV to cut', sr.copyFrom, clipFileName('song', 1, 'stem1', 'big'));
+
+  const tr = trimClip(sm, 1, 'stem1', 'big', 'first', { newId: 'T1' });
+  eq('trimClip first drops a bar', tr.manifest.takes[0].stems.stem1.clips[0].startBar + '+' + tr.manifest.takes[0].stems.stem1.clips[0].bars, '1+5');
+  eq('trimClip names the trimmed clip', tr.manifest.takes[0].stems.stem1.clips[0].file, clipFileName('song', 1, 'stem1', 'T1'));
+
+  const dr2 = deleteClipFromLane(sm, 1, 'stem1', 'big');
+  ok('deleteClipFromLane frees the lane', dr2.manifest.takes[0].stems.stem1 === null);
+  eq('deleteClipFromLane reports the removed file', dr2.removedFiles.join(','), clipFileName('song', 1, 'stem1', 'big'));
+
+  const dup = dupeClipInLane(sm, 1, 'stem1', 'big', 8, { newId: 'D1' });
+  eq('dupeClipInLane places a snapped copy', dup.manifest.takes[0].stems.stem1.clips.map((c) => c.id).join(','), 'big,D1');
+  eq('dupeClipInLane names the copy', dup.manifest.takes[0].stems.stem1.clips.find((c) => c.id === 'D1').file, clipFileName('song', 1, 'stem1', 'D1'));
+  eq('dupeClipInLane reports the source WAV to copy', dup.copyFrom, clipFileName('song', 1, 'stem1', 'big'));
+}
+
+// ============================================================================
 // 15. Tape deck (pure) — wav.js
 // ============================================================================
 eq('SIZE_FIELDS shape', JSON.stringify(SIZE_FIELDS), JSON.stringify([{ offset: 4, bias: 36 }, { offset: 40, bias: 0 }]));
@@ -1206,6 +1351,31 @@ ok('parseWav round-trips within one 16-bit quantization step (R)', maxErrR < 0.0
 let threwOnGarbage = false;
 try { parseWav(new Uint8Array(100)); } catch { threwOnGarbage = true; }
 ok('parseWav rejects a non-RIFF buffer', threwOnGarbage);
+
+// ---- wav byte-range ops: the exact clip surgery slice/trim/dupe compose (mono, byte 44+2N) ----
+function monoWav(int16vals, rate) {
+  const i16 = Int16Array.from(int16vals);
+  const header = new Uint8Array(wavHeader(1, rate, i16.byteLength));
+  const out = new Uint8Array(header.length + i16.byteLength);
+  out.set(header, 0);
+  out.set(new Uint8Array(i16.buffer, i16.byteOffset, i16.byteLength), header.length);
+  return out;
+}
+const ramp = monoWav([10, 20, 30, 40, 50, 60, 70, 80], 48000); // 8 mono samples
+eq('wavSampleCount reads the data size', wavSampleCount(ramp), 8);
+const slw = sliceWavBytes(ramp, 2, 5); // samples [2,5) = 30,40,50
+eq('sliceWavBytes yields the right sample count', wavSampleCount(slw), 3);
+eq('sliceWavBytes copies the exact samples', Array.from(new Int16Array(slw.buffer, slw.byteOffset + 44, 3)).join(','), '30,40,50');
+{
+  const v = new DataView(slw.buffer, slw.byteOffset, slw.byteLength);
+  eq('sliceWavBytes recomputes Subchunk2Size', v.getUint32(40, true), 6);
+  eq('sliceWavBytes recomputes ChunkSize', v.getUint32(4, true), 6 + 36);
+  eq('sliceWavBytes preserves the sample rate', v.getUint32(24, true), 48000);
+}
+eq('sliceWavBytes full-copy round-trips byte-identically', Array.from(sliceWavBytes(ramp, 0, 8)).join(','), Array.from(ramp).join(','));
+eq('sliceWavBytes clamps toSample past the end', wavSampleCount(sliceWavBytes(ramp, 6, 999)), 2);
+eq('sliceWavBytes clamps a reversed range to empty', wavSampleCount(sliceWavBytes(ramp, 5, 2)), 0);
+eq('sliceWavBytes drop-first-bar (barFrames 2) keeps samples 2..8', Array.from(new Int16Array(sliceWavBytes(ramp, 2, 8).buffer, 44, 6)).join(','), '30,40,50,60,70,80');
 
 // ============================================================================
 // 16. Tape deck (pure) — lufs.js
@@ -1347,6 +1517,12 @@ eq('accentGroups "Off" is null', accentGroups('Off', 4), null);
 eq('4/4 @120 bar is 2s', barSeconds(120, 2), 2);
 eq('2-bar count-in @120 4/4 is 4s', countInSeconds(120, 2), 4);
 eq('2-bar count-in @60 3/4 is 6s', countInSeconds(60, 1), 6);
+// barsToCommit: bar-atomic Stop rounds UP to complete the current bar, min 1 bar.
+eq('barsToCommit rounds a partial bar up', barsToCommit(2.5 * 4800, 4800), 3);
+eq('barsToCommit on an exact boundary is that bar count', barsToCommit(3 * 4800, 4800), 3);
+eq('barsToCommit of near-zero is at least 1 bar', barsToCommit(10, 4800), 1);
+eq('barsToCommit of zero is 1 bar', barsToCommit(0, 4800), 1);
+eq('barsToCommit guards a zero barFrames', barsToCommit(9999, 0), 1);
 
 // clampClickConfig: schema baseline is DISABLED; clamps every field into range.
 eq('defaultClickConfig is disabled', defaultClickConfig().enabled, false);
@@ -2279,7 +2455,8 @@ eq('sortLoopNames numeric order', sortLoopNames(['010.mid', '002.mid', '001.mid'
 
   const aeSrc = readFileSync(here('./js/tape/audioEngine.js'), 'utf8');
   ok('record() accepts autoStopSec', /record\(\{[^}]*autoStopSec/.test(aeSrc));
-  ok('record() sends endFrame in the begin message', /op: 'begin', beginFrame, endFrame/.test(aeSrc));
+  ok('record() sends endFrame in the begin message', /op: 'begin',[^}]*endFrame/.test(aeSrc));
+  ok('record() supports a bar-atomic Stop (requestStopAtBar)', aeSrc.includes('function requestStopAtBar') && aeSrc.includes('barsToCommit('));
   ok('record() starts drums finite for a sequence (not always Infinity)', aeSrc.includes('autoStopSec != null ? autoStopSec : Infinity'));
   ok('engine auto-stops on the worklet ended signal', aeSrc.includes("op === 'ended'") && aeSrc.includes("stop('sequence-end')"));
   ok('play/bounce drive drums off the EXACT sequence length', aeSrc.includes('drumSequenceSeconds') && /seqSec > 0 \? seqSec/.test(aeSrc));
@@ -2292,6 +2469,9 @@ eq('sortLoopNames numeric order', sortLoopNames(['010.mid', '002.mid', '001.mid'
   ok('commit applies the model-level click lock', mainSrc.includes('lockClickEdit(t.click'));
   ok('Save copies referenced loop files', mainSrc.includes('referencedLoopFiles(next)') && mainSrc.includes('loopsRef(slug)'));
   ok('song delete cleans the loops dir', mainSrc.includes('deleteSongLoops'));
+  ok('main.js records Timeline clips at the head with replace-region', mainSrc.includes('takeModel.recordClip(deckManifest') && mainSrc.includes('startBar: deckRecordHead'));
+  ok('main.js arms any lane on the Timeline tab', mainSrc.includes("deckTab === 'timeline'") && mainSrc.includes('armableKeys'));
+  ok('main.js timeline Stop is bar-atomic', mainSrc.includes('requestStopAtBar'));
 
   const dpSrc = readFileSync(here('./js/tape/drumPanel.js'), 'utf8');
   ok('drum panel branches on sequence mode', dpSrc.includes("mode === 'sequence'") && dpSrc.includes('buildSequenceSection'));

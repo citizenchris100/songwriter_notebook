@@ -128,6 +128,9 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
 
 /* ===== Songs tab ===== */
 .songswrap { max-width: 760px; margin: 0 auto; }
+/* The tape deck is desktop-Chrome only and uses the wider shell on both tabs (later rule + higher
+   specificity beats the 760 cap above; stays under .wrap's 1200). */
+.songswrap.tapewrap.tapewide { max-width: 1160px; }
 .songsec { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 11px 13px; margin: 12px 0; }
 .pchead { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .pchead .spacer { flex: 1; }
@@ -386,3 +389,53 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
   .pkey { min-height: 48px; }
   .fnbtn { min-height: 36px; }
 }
+
+/* ===== Mix | Timeline tab toggle ===== */
+.taptabs { gap: 6px; }
+.taptab { flex: 0 0 auto; padding: 8px 22px; border: 1px solid #333; border-radius: 8px; background: #1b1b1d; color: #9aa0a6; font: 600 12px/1 system-ui, sans-serif; letter-spacing: .12em; cursor: pointer; }
+.taptab.on { background: #2a2a2e; color: #ff6a00; border-color: #ff6a00; }
+
+/* ===== Timeline tab ===== */
+.tlwrap { padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+.tltoolbar { align-items: center; gap: 14px; flex-wrap: wrap; }
+.tltools { display: flex; gap: 6px; }
+.tltool { width: 40px; height: 36px; border: 1px solid #333; border-radius: 7px; background: #1b1b1d; color: #cfd2d6; font-size: 16px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.tltool.on { background: #2a2a2e; border-color: #39ff14; color: #39ff14; box-shadow: 0 0 0 1px #39ff14 inset; }
+.tltool:disabled { opacity: .4; cursor: not-allowed; }
+.tlhint { color: #8a9096; font-size: 12px; }
+.tlconfirm { display: flex; align-items: center; gap: 8px; }
+.tlconfirm-q { color: #e6c07b; font-size: 12px; }
+
+.tlscroll { overflow-x: auto; overflow-y: hidden; border: 1px solid #2a2a2e; border-radius: 8px; background: #141416; }
+.tlgrid { position: relative; }
+
+.tlruler { position: relative; height: 22px; border-bottom: 1px solid #2a2a2e; }
+.tltick { position: absolute; top: 0; bottom: 0; width: 1px; background: #262629; }
+.tltick.major { background: #3a3a3f; }
+.tlbarnum { position: absolute; left: 3px; top: 4px; font-size: 10px; color: #6b7077; }
+
+.tllane { position: relative; height: 60px; border-bottom: 1px solid #202024; }
+.tllane.armed { box-shadow: 0 0 0 1px #ff3b30 inset; }
+.tllane.recording { box-shadow: 0 0 0 2px #ff3b30 inset; }
+.tllanectrl { position: absolute; left: 4px; top: 4px; z-index: 3; display: flex; align-items: center; gap: 6px; background: rgba(18,18,20,.82); padding: 3px 6px; border-radius: 6px; }
+.tllanename { font: 600 10px/1 system-ui, sans-serif; letter-spacing: .1em; color: #7a8087; }
+.tllanerec { font: 700 9px/1 system-ui, sans-serif; padding: 3px 6px; border-radius: 5px; border: 1px solid #3a3a3f; background: #1b1b1d; color: #9aa0a6; cursor: pointer; }
+.tllanerec.on { border-color: #ff3b30; color: #ff3b30; box-shadow: 0 0 0 1px #ff3b30 inset; }
+.tllanerec:disabled { opacity: .4; cursor: not-allowed; }
+.tllaneinput { font-size: 10px; background: #1b1b1d; color: #cfd2d6; border: 1px solid #3a3a3f; border-radius: 5px; padding: 2px; }
+
+.tlclip { position: absolute; top: 8px; bottom: 8px; border-radius: 5px; cursor: pointer; box-sizing: border-box; border: 1px solid rgba(255,255,255,.35); overflow: hidden; }
+.tlclip.picked { outline: 2px solid #39ff14; outline-offset: 1px; }
+.tlbarline { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(255,255,255,.30); }
+/* lane colors: 1 blue / 2 orange / 3 violet / 4 teal (clip = translucent fill, contrasting bar lines) */
+.lane1 .tlclip { background: rgba(59,130,246,.55); border-color: #60a5fa; }
+.lane2 .tlclip { background: rgba(255,106,0,.50);  border-color: #ff8a3d; }
+.lane3 .tlclip { background: rgba(139,92,246,.55); border-color: #a78bfa; }
+.lane4 .tlclip { background: rgba(20,184,166,.55); border-color: #2dd4bf; }
+
+.tlhead { position: absolute; top: 0; bottom: 0; width: 2px; z-index: 4; pointer-events: none; }
+.tlhead.rec { background: #ff3b30; box-shadow: 0 0 6px #ff3b30; }
+.tlhead.play { background: #39ff14; box-shadow: 0 0 6px #39ff14; }
+.tlhead::before { content: ''; position: absolute; top: 0; left: -4px; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 7px solid currentColor; }
+.tlhead.rec::before { color: #ff3b30; }
+.tlhead.play::before { color: #39ff14; }

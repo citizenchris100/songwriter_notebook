@@ -34,7 +34,7 @@ import { loadBuiltinRulesets, loadUserRulesets, saveUserRulesets } from './tape/
 import * as takeStore from './tape/takeStore.js';
 import * as folderStore from './tape/folderStore.js';
 import { runDeckRestore, planDupeTakes, pruneTapeDeckToCopied } from './tape/deckRestore.js';
-import { SIZE_FIELDS } from './tape/wav.js';
+import { SIZE_FIELDS, sliceWavBytes, wavSampleCount } from './tape/wav.js';
 import { makeTapeDeck } from './tape/audioEngine.js';
 import { estimateMonitorLatencySec } from './tape/latency.js';
 import { mountApp } from './ui.js';
@@ -104,8 +104,17 @@ let deckPendingNewTake = false; // a "+ New take" container awaiting its first p
 let deckArmed = [];             // [{ slotKey, inputIndex }] — REC-armed strips for the next pass (normalized each render)
 let deckPanelOpen = null;       // 'drums' | 'cal' | 'share' | null — which flip-panel is open (UI-local, not persisted)
 let deckLogOpen = false;        // TAPE LOG <details> open state (UI-local; the <details> reflects it, no render on toggle)
+let deckTab = 'mix';            // 'mix' | 'timeline' — the deck's active tab (Mix mixer vs Timeline clips)
+let deckHead = 0;               // the timeline record/play HEAD bar (0 = song start); Timeline-only concept
+let deckTool = null;            // 'slice' | 'trim' | 'delete' | 'dupe' | null — the active timeline tool
+let deckDupeSrc = null;         // { key, clipId } — the clip the dupe tool picked, awaiting a target click
+let deckPendingClipAction = null; // { type:'delete'|'dupe', key, clipId, targetBar? } — awaiting the inline confirm
+let deckScrollLeft = 0;         // the timeline horizontal scroll offset, preserved across full re-renders
 let deckRecordingSlotKeys = []; // the in-flight pass's destination slot keys (meter routing + finalize)
 let deckRecordingGroup = null;  // the in-flight pass's group number
+let deckRecordTimeline = false; // the in-flight pass is a TIMELINE record: place clips at the head, replace-region
+let deckRecordHead = 0;         // the head bar the in-flight timeline clips land at
+let deckRecordClipIds = {};     // { slotKey: clipId } for the in-flight timeline pass
 let deckInputs = null;         // devices.probe() result: { inputs, preselectedId, warnMoreThanMax, isLikelyInterface, channels }
 let deckSelectedInputId = null;
 let deckSpaceWarning = false;
@@ -165,8 +174,17 @@ function resetTapeDeckUi() {
   deckArmed = [];
   deckPanelOpen = null;
   deckLogOpen = false;
+  deckTab = 'mix';
+  deckHead = 0;
+  deckTool = null;
+  deckDupeSrc = null;
+  deckPendingClipAction = null;
+  deckScrollLeft = 0;
   deckRecordingSlotKeys = [];
   deckRecordingGroup = null;
+  deckRecordTimeline = false;
+  deckRecordHead = 0;
+  deckRecordClipIds = {};
   deckInputs = null;
   deckSelectedInputId = null;
   deckClickDraft = null;
@@ -223,10 +241,13 @@ function tapeDeckViewModel(active) {
 
   const inputChannels = (deckInputs && deckInputs.channels) || 1;
   const freeSlots = freeSlotKeys.length;
-  const maxCapture = Math.min(inputChannels, freeSlots, takeModel.MAX_TRACKS);
+  // Timeline recording can arm ANY lane (existing clips the head reaches get replaced); Mix arms
+  // only free lanes (a filled Mix track must be bounced first).
+  const armableKeys = deckTab === 'timeline' ? takeModel.STEM_KEYS.slice() : freeSlotKeys;
+  const maxCapture = Math.min(inputChannels, armableKeys.length, takeModel.MAX_TRACKS);
 
-  // Normalize + cache the armed set (drops slots that filled, reassigns stale inputs).
-  const armed = normalizeArmed(deckArmed, freeSlotKeys, inputChannels, maxCapture);
+  // Normalize + cache the armed set (drops un-armable slots, reassigns stale inputs).
+  const armed = normalizeArmed(deckArmed, armableKeys, inputChannels, maxCapture);
   deckArmed = armed;
   const armedByKey = {};
   armed.forEach((a) => { armedByKey[a.slotKey] = a.inputIndex; });
@@ -243,7 +264,7 @@ function tapeDeckViewModel(active) {
     else if (armedByKey[key] != null) state = 'armed';
     else if (hasAudio) state = 'filled';
     else state = 'empty';
-    strips[key] = { state, inputIndex: armedByKey[key] != null ? armedByKey[key] : null, stem: hasAudio ? stem : null };
+    strips[key] = { state, inputIndex: armedByKey[key] != null ? armedByKey[key] : null, stem: hasAudio ? stem : null, clips: takeModel.laneClips(stem) };
   });
 
   // Metronome config: editable for a new take (the last-used draft), read-only once the
@@ -319,6 +340,14 @@ function tapeDeckViewModel(active) {
     maxCapture,
     armed,
     strips,
+    // Timeline tab state + the bar<->seconds scale for the ruler/clips.
+    tab: deckTab,
+    head: deckHead,
+    tool: deckTool,
+    dupeSrc: deckDupeSrc,
+    pendingClipAction: deckPendingClipAction,
+    scrollLeft: deckScrollLeft,
+    barSec: takeModel.secPerBar({ click: clickConfig }),
     recordingSlotKeys: deckRecordingSlotKeys,
     lastGroupKeys: (loadedTake && !deckRecording) ? takeModel.lastGroupSlotKeys(loadedTake) : [],
     canBounceTracks: !deckRecording && !deckBouncing && filledSlotKeys.length >= 2,
@@ -502,9 +531,10 @@ async function recoverInterruptedPasses(manifest, id) {
     if (t.status !== 'recording') continue;
     const slotBytes = {};
     for (const key of takeModel.STEM_KEYS) {
-      const slot = t.stems && t.stems[key];
-      if (!slot || !slot.file || slot.durationSec !== null) continue; // only pending slots
-      try { slotBytes[key] = await takeStore.finalizeExisting(dir + slot.file, SIZE_FIELDS); } catch { slotBytes[key] = 0; }
+      const lane = t.stems && t.stems[key];
+      const clip = lane && lane.clips && lane.clips.find((c) => c.file && c.durationSec === null); // the pending recording clip
+      if (!clip) continue;
+      try { slotBytes[key] = await takeStore.finalizeExisting(dir + clip.file, SIZE_FIELDS); } catch { slotBytes[key] = 0; }
     }
     m = takeModel.finalizeRecoveredPass(m, t.take, slotBytes, t.sampleRate);
   }
@@ -783,7 +813,7 @@ async function ensureFolderGrant(songId) {
 // dir handle)? Lets opfs-only takes stay frictionless (no handle fetch, no permission prompt).
 function takeHasFolderFile(take) {
   const stems = (take && take.stems) || {};
-  if (takeModel.STEM_KEYS.some((k) => stems[k] && stems[k].file && stems[k].loc === 'folder')) return true;
+  if (takeModel.STEM_KEYS.some((k) => takeModel.laneClips(stems[k]).some((c) => c.file && c.loc === 'folder'))) return true;
   return !!(take && take.bounce && take.bounce.file && take.bounce.loc === 'folder');
 }
 
@@ -810,9 +840,10 @@ function surfaceReadError(e) {
 // surfacing a clear status if the audio can't be read rather than half-loading.
 async function playTake(take, slug, isReplay) {
   const fh = takeHasFolderFile(take) ? await folderHandleForSong(slug) : null;
+  const headBar = deckTab === 'timeline' ? deckHead : 0; // Timeline plays from the head; Mix from 0
   try {
     const deck = ensureTapeDeck();
-    return await (isReplay ? deck.replay(take, slug, fh) : deck.play(take, slug, fh));
+    return await (isReplay ? deck.replay(take, slug, fh, headBar) : deck.play(take, slug, fh, headBar));
   } catch (e) { surfaceReadError(e); return false; }
 }
 
@@ -912,6 +943,45 @@ function persistDeckManifest() {
   const a = activeSong();
   if (a && deckManifest) takeStore.writeManifest(manifestPath(a.id), deckManifest).catch(() => { /* surfaced by onWriteError */ });
 }
+
+// ---- timeline clip editing (slice / trim / dupe / delete): the pure model op decides the geometry
+// + new filenames; here we do the impure WAV byte surgery for the created clips, delete orphans,
+// then persist + invalidate the cached playback graph. Clip ids are injected here (they land in
+// filenames), keeping takeModel pure. ----
+let deckClipSeq = 0;
+function newClipId() { deckClipSeq += 1; return 'c' + Date.now().toString(36) + deckClipSeq.toString(36); }
+async function readClipBytes(slug, clip) {
+  const rel = takeModel.tapeDeckRef(slug).path + clip.file;
+  if (clip.loc === 'folder') { const dir = await folderHandleForSong(slug); if (!dir) throw Object.assign(new Error('folder access needed'), { code: 'FOLDER_UNAVAILABLE' }); return await folderStore.readFile(dir, rel); }
+  return await takeStore.readFile(rel);
+}
+function writeClipBytes(slug, file, bytes) {
+  // takeStore.writeFile TRANSFERS the buffer to the worker, so it needs a transferable ArrayBuffer;
+  // sliceWavBytes returns a Uint8Array. Hand over its exact backing buffer (copy if it's a subview).
+  const buf = bytes instanceof Uint8Array
+    ? (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength ? bytes.buffer : bytes.slice().buffer)
+    : bytes;
+  return takeStore.writeFile(takeModel.tapeDeckRef(slug).path + file, buf);
+}
+function barFramesOf(take) { return Math.round(takeModel.secPerBar(take) * (take.sampleRate || 48000)); }
+// Run a clip edit: `build(take, slug)` returns { manifest, writes:[{file,bytes}], deletes:[file] }.
+async function runClipEdit(build) {
+  const a = activeSong();
+  const take = (a && deckManifest && currentTake != null) ? deckManifest.takes.find((t) => t.take === currentTake) : null;
+  if (!a || !take || deckRecording || deckBouncing || deckSaving) return;
+  try {
+    const plan = await build(take, a.id);
+    if (!plan) return;
+    for (const w of plan.writes || []) await writeClipBytes(a.id, w.file, w.bytes);
+    deckManifest = plan.manifest;
+    persistDeckManifest();
+    for (const f of plan.deletes || []) takeStore.deleteSlotFiles(a.id, [f]).catch(() => {});
+    if (tapeDeck) tapeDeck.invalidatePlayback();
+  } catch (e) { surfaceReadError(e); return; }
+  render();
+}
+const loadedLaneClips = (take, key) => takeModel.laneClips(take.stems[key]);
+const clipOnLane = (manifest, key, id) => takeModel.laneClips(manifest.takes.find((t) => t.take === currentTake).stems[key]).find((c) => c.id === id);
 // Commit an edited drum config to the loaded take (manifest + invalidate the cached playback graph
 // so the next play rebuilds with the new config) or the new-take draft (localStorage). Same for click.
 function commitDrums(next) {
@@ -1054,7 +1124,25 @@ async function finalizeStoppedTake(s, message) {
   let emptied = false;
   if (deckManifest && deckManifest.slug === s.slug) {
     const captured = (s.durationSec || 0) > 0;
-    if (!captured && passGroup != null) {
+    if (deckRecordTimeline) {
+      // Timeline pass: place each captured clip at the head, replacing whatever clips it reaches
+      // (recordClip references the file record() already wrote by its injected id). An empty pass
+      // just drops the pre-opened header-only files.
+      const take0 = deckManifest.takes.find((t) => t.take === s.take);
+      const spb = take0 ? takeModel.secPerBar(take0) : barSeconds(120, 2);
+      const orphans = [];
+      for (const k of (s.slotKeys || [])) {
+        const id = deckRecordClipIds[k];
+        const dur = (s.slotDurations && s.slotDurations[k]) || 0;
+        if (!id || dur <= 0 || !captured) { if (id) takeStore.deleteSlotFiles(s.slug, [takeModel.clipFileName(s.slug, s.take, k, id)]).catch(() => {}); continue; }
+        const bars = Math.max(1, Math.round(dur / spb));
+        const r = takeModel.recordClip(deckManifest, s.take, k, { id, startBar: deckRecordHead, bars, durationSec: dur, group: passGroup });
+        deckManifest = r.manifest;
+        for (const f of r.removedFiles) orphans.push(f);
+      }
+      for (const f of orphans) takeStore.deleteSlotFiles(s.slug, [f]).catch(() => {});
+      if (tapeDeck) tapeDeck.invalidatePlayback();
+    } else if (!captured && passGroup != null) {
       // Nothing was committed this pass — e.g. Stop during the count-in, before the
       // capture gate opened. Free the just-armed slots instead of leaving 0-length
       // stems: discard this group, then either re-activate the take (earlier passes
@@ -1067,7 +1155,7 @@ async function finalizeStoppedTake(s, message) {
         deckManifest = takeModel.discardTake(deckManifest, s.take);
         emptied = true;
       }
-      takeStore.deleteSlotFiles(s.slug, s.take, s.slotKeys || []).catch(() => {}); // best-effort: drop the empty header-only WAVs
+      takeStore.deleteSlotFiles(s.slug, (s.slotKeys || []).map((k) => takeModel.clipFileName(s.slug, s.take, k, 'g' + passGroup))).catch(() => {}); // best-effort: drop the empty header-only WAVs
     } else {
       // finalizePass sets this pass's per-slot durations, recomputes the take length,
       // and flips it active. Passes stay within one take now, so there's no take menu —
@@ -1084,9 +1172,14 @@ async function finalizeStoppedTake(s, message) {
     currentTake = s.take;
     deckPendingNewTake = false;
   }
+  const wasTimeline = deckRecordTimeline;
   deckRecordingSlotKeys = [];
   deckRecordingGroup = null;
-  deckArmed = [];             // the just-recorded slots are filled now — clear the arm set
+  deckRecordTimeline = false;
+  deckRecordClipIds = {};
+  // Mix: the just-recorded lanes are filled — clear the arm set. Timeline: keep the arm so you can
+  // move the head and record the next clip without re-arming.
+  if (!wasTimeline) deckArmed = [];
   deckStatus = message ? { type: 'warn', message } : null;
   await refreshSpaceWarning();
   render();
@@ -1197,13 +1290,16 @@ async function armRecording() {
   }
   const slug = a.id;
   const path = manifestPath(slug);
+  const isTimeline = deckTab === 'timeline'; // Timeline record: clips land at the head, replace-region, arm any lane
+  const headBar = isTimeline ? deckHead : 0;
   await refreshSpaceWarning(); // §5.8: "before each record", not just on deck open / after the last take
 
   // New take vs overdub into the current take. `baseTake` is the container being
   // filled (null for a fresh take); freeKeys are its recordable slots.
   const isNew = deckPendingNewTake || currentTake == null;
   const baseTake = isNew ? null : (deckManifest.takes.find((t) => t.take === currentTake) || null);
-  const freeKeys = isNew ? takeModel.STEM_KEYS.slice() : (baseTake ? takeModel.freeSlotKeys(baseTake) : []);
+  // Timeline arms ANY lane (filled clips get replaced at the head); Mix/new-take arms free lanes only.
+  const freeKeys = (isTimeline || isNew) ? takeModel.STEM_KEYS.slice() : (baseTake ? takeModel.freeSlotKeys(baseTake) : []);
   // Build the per-CHANNEL routing (indexed by interface input; null = that input isn't
   // armed to any track, captured only for its meter) from the armed set. Guard: nothing
   // armed -> nothing to record.
@@ -1215,10 +1311,12 @@ async function armRecording() {
   armedNow.forEach((x) => { routing[x.inputIndex] = x.slotKey; });
   // The take's already-recorded tracks play as backing while overdubbing (empty for
   // a first pass); latency-aligned via the measured monitor round-trip.
-  const existingTracks = (baseTake ? takeModel.filledSlotKeys(baseTake) : []).map((k) => ({ key: k, meta: baseTake.stems[k] }));
+  // Timeline v1 records without arrangement monitoring (no backing — the captured DI is what matters);
+  // Mix overdub plays the take's filled tracks as backing.
+  const existingTracks = isTimeline ? [] : (baseTake ? takeModel.filledSlotKeys(baseTake) : []).map((k) => ({ key: k, meta: baseTake.stems[k] }));
   // Overdub backing may include tracks already Saved to the folder — resolve (and require)
   // the folder handle when any backing track is folder-located, so it can be monitored.
-  const needsFolder = existingTracks.some((t) => t.meta && t.meta.loc === 'folder');
+  const needsFolder = existingTracks.some((t) => takeModel.slotLoc(t.meta) === 'folder');
   const folderHandle = needsFolder ? await folderHandleForSong(slug) : null;
   if (needsFolder && !folderHandle) {
     deckArming = false;
@@ -1229,15 +1327,15 @@ async function armRecording() {
   // The metronome config for this pass: the new-take draft for a first pass, else the
   // take's locked config (overdubs share the take's tempo). Drives the count-in + click
   // AND is stamped onto the take at creation.
-  const clickCfg = isNew ? (deckClickDraft || readClickDefault()) : (baseTake && baseTake.click);
+  const clickCfg = (baseTake && baseTake.click) || (deckClickDraft || readClickDefault()); // take's locked tempo, else the draft
   // The drum backing for this pass: the new-take draft for a first pass, else the take's locked
-  // drums (overdubs share the take's backing). Drives the record-time drum machine + is stamped
-  // onto the take at creation. bpm/meter come from the click config (shared tempo).
-  let drumCfg = isNew ? (deckDrumDraft || readDrumDefault()) : (baseTake && baseTake.drums);
+  // drums (overdubs share the take's backing). Timeline v1 uses no drum backing. bpm/meter come
+  // from the click config (shared tempo).
+  let drumCfg = isTimeline ? null : (isNew ? (deckDrumDraft || readDrumDefault()) : (baseTake && baseTake.drums));
   // A new take in SEQUENCE mode rolls + flattens the sequence NOW (fail-fast before recording),
   // freezing it onto the take; autoStopSec makes the record auto-stop at the sequence end.
   let autoStopSec = null;
-  if (isNew && deckDrumMode === 'sequence') {
+  if (isNew && !isTimeline && deckDrumMode === 'sequence') {
     const built = buildFrozenSequence(clickCfg);
     if (!built.ok) { deckArming = false; deckStatus = { type: 'warn', message: built.message }; render(); return; }
     drumCfg = built.drumConfig;
@@ -1267,11 +1365,27 @@ async function armRecording() {
           takeNo = takeModel.nextTakeNumber(deckManifest);
           group = 1;
           deckManifest = takeModel.appendTake(deckManifest, takeModel.makeTake({ take: takeNo, sampleRate, click: clickCfg, drums: drumCfg }, nowISO()));
+          if (isTimeline) deckManifest = takeModel.finalizePass(deckManifest, takeNo, {}); // a fresh timeline take starts active/empty; clips land at finalize
         } else {
           takeNo = currentTake;
           group = takeModel.nextGroup(baseTake);
         }
-        deckManifest = takeModel.appendPassTracks(deckManifest, takeNo, slotKeys, group);
+        const files = {};
+        if (isTimeline) {
+          // Timeline pass: allocate a fresh clip id + file per armed lane and open those files now;
+          // the lane clips are NOT touched until finalize, where recordClip places the clip at the
+          // head and replaces whatever it reaches (so the lane never holds an overlapping clip mid-record).
+          deckRecordTimeline = true;
+          deckRecordHead = headBar;
+          deckRecordClipIds = {};
+          for (const k of slotKeys) { const id = newClipId(); deckRecordClipIds[k] = id; files[k] = takeModel.clipFileName(slug, takeNo, k, id); }
+        } else {
+          deckRecordTimeline = false;
+          deckManifest = takeModel.appendPassTracks(deckManifest, takeNo, slotKeys, group);
+          // The clip filenames just armed — record() opens these (per-clip files, not stemFileName).
+          const armedTake = deckManifest.takes.find((t) => t.take === takeNo);
+          for (const k of slotKeys) { const c = armedTake && armedTake.stems[k] && armedTake.stems[k].clips[0]; if (c) files[k] = c.file; }
+        }
         await takeStore.writeManifest(path, deckManifest);
         deckRecording = true;
         deckPendingNewTake = false;
@@ -1279,7 +1393,7 @@ async function armRecording() {
         deckRecordingGroup = group;
         currentTake = takeNo;
         render();
-        return { take: takeNo, slotKeys };
+        return { take: takeNo, slotKeys, files };
       },
     });
     started = !!(result && result.ok);
@@ -1888,6 +2002,92 @@ const handlers = {
     // closes it. UI-local state, so it must live in the view-model (onSetClick renders).
     onTogglePanel: (name) => { deckPanelOpen = (deckPanelOpen === name) ? null : name; render(); },
 
+    // ---- Tape deck tabs (Mix mixer <-> Timeline clips) ----
+    // The whole deck re-renders; only the body node swaps. head/tool are Timeline-only + persist.
+    onTapeTab: (tab) => { deckTab = (tab === 'timeline') ? 'timeline' : 'mix'; if (deckTab === 'mix') deckTool = null; render(); },
+    // Move the timeline head to a bar (floor-snapped by the caller). Record/Play begin here.
+    onTimelineSeek: (bar) => { deckHead = Math.max(0, bar | 0); render(); },
+    // Activate/toggle a timeline tool (mutually exclusive); clears any pending dupe pick.
+    onTimelineTool: (tool) => { deckTool = (deckTool === tool) ? null : tool; deckDupeSrc = null; render(); },
+    // Preserve the timeline horizontal scroll across full re-renders (DOM-local, no render).
+    onTimelineScroll: (px) => { deckScrollLeft = Math.max(0, px | 0); },
+    // Set an armed Timeline lane's interface input to a specific channel (pulldown), swapping with
+    // whichever lane currently holds it so inputs stay unique.
+    onTimelineSetInput: (key, idx) => {
+      if (deckRecording || deckBouncing) return;
+      const channels = (deckInputs && deckInputs.channels) || 1;
+      if (!(idx >= 0 && idx < channels)) return;
+      const me = deckArmed.find((a) => a.slotKey === key);
+      if (!me) return;
+      const other = deckArmed.find((a) => a.slotKey !== key && a.inputIndex === idx);
+      deckArmed = deckArmed.map((a) => {
+        if (a.slotKey === key) return { ...a, inputIndex: idx };
+        if (other && a.slotKey === other.slotKey) return { ...a, inputIndex: me.inputIndex };
+        return a;
+      });
+      render();
+    },
+
+    // ---- timeline clip tools ----
+    // SLICE: split a clip at the END of the clicked bar into two self-contained WAVs.
+    onTimelineSlice: (key, clipId, bar) => runClipEdit(async (take, slug) => {
+      const src = loadedLaneClips(take, key).find((c) => c.id === clipId);
+      if (!src) return null;
+      const ids = { leftId: newClipId(), rightId: newClipId() };
+      const r = takeModel.sliceClip(deckManifest, currentTake, key, clipId, bar, ids);
+      const left = clipOnLane(r.manifest, key, ids.leftId), right = clipOnLane(r.manifest, key, ids.rightId);
+      if (!left || !right) return null;
+      const bytes = await readClipBytes(slug, src);
+      const split = left.bars * barFramesOf(take), total = wavSampleCount(bytes);
+      return { manifest: r.manifest, writes: [{ file: left.file, bytes: sliceWavBytes(bytes, 0, split) }, { file: right.file, bytes: sliceWavBytes(bytes, split, total) }], deletes: [src.file] };
+    }),
+    // TRIM: click a clip's first/last bar to drop that bar (middle bar = no-op).
+    onTimelineTrim: (key, clipId, bar) => runClipEdit(async (take, slug) => {
+      const src = loadedLaneClips(take, key).find((c) => c.id === clipId);
+      if (!src) return null;
+      const clickBar = Math.max(src.startBar, Math.min(src.startBar + src.bars - 1, bar));
+      const isFirst = clickBar === src.startBar, isLast = clickBar === src.startBar + src.bars - 1;
+      if (!isFirst && !isLast) return null; // a middle bar does nothing
+      const edge = isFirst ? 'first' : 'last';
+      const newId = newClipId();
+      const r = takeModel.trimClip(deckManifest, currentTake, key, clipId, edge, { newId });
+      const nw = clipOnLane(r.manifest, key, newId);
+      if (!nw) return { manifest: r.manifest, writes: [], deletes: [src.file] }; // trimmed a 1-bar clip away
+      const bytes = await readClipBytes(slug, src), bf = barFramesOf(take), total = wavSampleCount(bytes);
+      const out = edge === 'first' ? sliceWavBytes(bytes, bf, total) : sliceWavBytes(bytes, 0, total - bf);
+      return { manifest: r.manifest, writes: [{ file: nw.file, bytes: out }], deletes: [src.file] };
+    }),
+    // DELETE / DUPE: destructive/placement ops confirm inline first (the spec's "prompted if they
+    // want to..."). Click a clip -> a confirm bar; Confirm runs the op, Cancel drops it.
+    onTimelineDelete: (key, clipId) => { deckPendingClipAction = { type: 'delete', key, clipId }; render(); },
+    onTimelineDupePick: (key, clipId) => { deckDupeSrc = { key, clipId }; render(); },
+    onTimelineDupePlace: (key, targetBar) => {
+      if (!deckDupeSrc) return;
+      deckPendingClipAction = { type: 'dupe', key: deckDupeSrc.key, clipId: deckDupeSrc.clipId, targetBar };
+      render();
+    },
+    onCancelClipAction: () => { deckPendingClipAction = null; deckDupeSrc = null; render(); },
+    onConfirmClipAction: () => {
+      const p = deckPendingClipAction; deckPendingClipAction = null; deckDupeSrc = null;
+      if (!p) { render(); return; }
+      if (p.type === 'delete') {
+        runClipEdit(async () => {
+          const r = takeModel.deleteClipFromLane(deckManifest, currentTake, p.key, p.clipId);
+          return { manifest: r.manifest, writes: [], deletes: r.removedFiles };
+        });
+      } else if (p.type === 'dupe') {
+        runClipEdit(async (take, slug) => {
+          const src = loadedLaneClips(take, p.key).find((c) => c.id === p.clipId);
+          if (!src) return null;
+          const newId = newClipId();
+          const r = takeModel.dupeClipInLane(deckManifest, currentTake, p.key, p.clipId, p.targetBar, { newId });
+          const nw = clipOnLane(r.manifest, p.key, newId);
+          const bytes = await readClipBytes(slug, src);
+          return { manifest: r.manifest, writes: nw ? [{ file: nw.file, bytes }] : [], deletes: [] };
+        });
+      } else { render(); }
+    },
+
     // TAPE LOG <details> open state. The <details> element reflects `open` in the DOM
     // itself, so this only records the flag for the next rebuild — no render (which would
     // fight the native toggle).
@@ -2017,7 +2217,10 @@ const handlers = {
       // rejects, still clear the flag and re-render so the deck can't strand nav-locked
       // (every control is gated on deckRecording — the whole reason a stuck stop reads as
       // "the app crashed, hard-refresh to recover").
-      try { await tapeDeck.stop(); }
+      // Bar-atomic Stop: completes the current bar before finalizing (both Mix + Timeline), so a
+      // clip is always a whole number of bars. requestStopAtBar arms the endFrame gate and resolves
+      // once the worklet's {op:'ended'} runs the real stop()+finalize.
+      try { await tapeDeck.requestStopAtBar(); }
       finally { if (deckRecording) { deckRecording = false; deckRecordingSlotKeys = []; deckRecordingGroup = null; render(); } }
     },
 
@@ -2031,10 +2234,11 @@ const handlers = {
       if (!take) return;
       const keys = takeModel.lastGroupSlotKeys(take);
       if (!keys.length) return;
-      const group = Math.max.apply(null, keys.map((k) => (take.stems[k].group || 1)));
+      const group = takeModel.nextGroup(take) - 1; // the last recorded group
+      const groupFiles = keys.flatMap((k) => takeModel.laneClips(take.stems[k]).filter((c) => c.file && c.group === group).map((c) => c.file));
       deckManifest = takeModel.discardGroup(deckManifest, currentTake, group);
       await takeStore.writeManifest(manifestPath(a.id), deckManifest);
-      takeStore.deleteSlotFiles(a.id, currentTake, keys).catch(() => {}); // metadata first, best-effort delete second
+      takeStore.deleteSlotFiles(a.id, groupFiles).catch(() => {}); // metadata first, best-effort delete second
       if (tapeDeck) tapeDeck.stopPlay();
       deckArmed = keys.map((k, i) => ({ slotKey: k, inputIndex: i })); // re-arm exactly the freed slots
       render();
@@ -2050,9 +2254,10 @@ const handlers = {
       // deletes while any bounce is in flight (tapeView also disables the
       // buttons — this is the defense-in-depth backstop).
       if (!a || !deckManifest || deckBouncing || deckSaving) return;
+      const takeRec = deckManifest.takes.find((t) => t.take === takeNo); // capture clip files before the tombstone empties it
       deckManifest = takeModel.discardTake(deckManifest, takeNo);
       await takeStore.writeManifest(manifestPath(a.id), deckManifest);
-      takeStore.deleteTakeAudio(a.id, takeNo).catch(() => {});
+      takeStore.deleteTakeAudio(a.id, takeNo, takeRec).catch(() => {});
       // Make the delete DURABLE (H5): re-embed the surviving takes into the song .json + localStorage
       // so an OPFS-evicted reopen hydrates the reduced set and can't resurrect this take.
       await persistDeckTakes(a.id);
@@ -2146,7 +2351,8 @@ const handlers = {
       const take = deckManifest.takes.find((t) => t.take === currentTake);
       const src = take && take.stems[srcKey];
       const dst = take && take.stems[dstKey];
-      if (!src || !src.file || !dst || !dst.file) return;
+      if (!takeModel.slotHasAudio(src) || !takeModel.slotHasAudio(dst)) return;
+      const srcFiles = takeModel.laneClips(src).filter((c) => c.file).map((c) => c.file); // freed by the bounce
       const takeNo = take.take;
       tapeDeck.stopPlay();
       deckBouncing = true;
@@ -2164,7 +2370,7 @@ const handlers = {
       if (!stillActive) { render(); return; }
       deckManifest = takeModel.bounceTrackToTrack(deckManifest, takeNo, srcKey, dstKey, result.durationSec);
       await takeStore.writeManifest(manifestPath(a.id), deckManifest);
-      takeStore.deleteSlotFiles(a.id, takeNo, [srcKey]).catch(() => {}); // metadata first, best-effort file delete second
+      takeStore.deleteSlotFiles(a.id, srcFiles).catch(() => {}); // metadata first, best-effort file delete second
       await refreshSpaceWarning();
       render();
     },
@@ -2204,11 +2410,16 @@ const handlers = {
         for (const take of deckManifest.takes) {
           if (take.status === 'discarded') continue;
           const pending = takeModel.pendingOpfsSlotKeys(take);
+          let wrote = 0;
           for (const key of pending) {
-            const rel = dp + take.stems[key].file;
-            const bytes = await takeStore.readFile(rel);
-            await folderStore.writeFile(dir, rel, bytes);
-            if ((await folderStore.fileSize(dir, rel)) !== bytes.byteLength) throw new Error('verify failed: ' + take.stems[key].file);
+            for (const c of takeModel.laneClips(take.stems[key])) { // each opfs clip of the lane migrates
+              if (!c.file || c.loc === 'folder') continue;
+              const rel = dp + c.file;
+              const bytes = await takeStore.readFile(rel);
+              await folderStore.writeFile(dir, rel, bytes);
+              if ((await folderStore.fileSize(dir, rel)) !== bytes.byteLength) throw new Error('verify failed: ' + c.file);
+              wrote++;
+            }
           }
           const bouncePending = !!(take.bounce && take.bounce.file && take.bounce.loc !== 'folder');
           if (bouncePending) {
@@ -2217,7 +2428,7 @@ const handlers = {
             await folderStore.writeFile(dir, rel, bytes);
             if ((await folderStore.fileSize(dir, rel)) !== bytes.byteLength) throw new Error('verify failed: ' + take.bounce.file);
           }
-          if (pending.length || bouncePending) { next = takeModel.migrateTakeSlots(next, take.take, pending, { bounce: bouncePending }); migrated += pending.length + (bouncePending ? 1 : 0); }
+          if (pending.length || bouncePending) { next = takeModel.migrateTakeSlots(next, take.take, pending, { bounce: bouncePending }); migrated += wrote + (bouncePending ? 1 : 0); }
         }
 
         // 2. Copy each referenced imported MIDI from its OPFS temp into the folder, then drop the temp.
@@ -2265,7 +2476,7 @@ const handlers = {
         if (jsonWritten) {
           for (const take of deckManifest.takes) {
             if (take.status === 'discarded' || !takeModel.takeIsSaved(take)) continue;
-            takeStore.deleteTakeAudio(slug, take.take).catch(() => {});
+            takeStore.deleteTakeAudio(slug, take.take, take).catch(() => {});
           }
         }
 
@@ -2280,7 +2491,7 @@ const handlers = {
           const referenced = new Set();
           if (!jsonWritten) referenced.add('manifest.json');
           for (const t of next.takes) {
-            for (const k of takeModel.STEM_KEYS) { const s = t.stems[k]; if (s && s.file) referenced.add(s.file); }
+            for (const k of takeModel.STEM_KEYS) for (const c of takeModel.laneClips(t.stems[k])) { if (c.file) referenced.add(c.file); }
             if (t.bounce && t.bounce.file) referenced.add(t.bounce.file);
           }
           for (const name of await folderStore.listDir(dir, dp)) { if (!referenced.has(name)) folderStore.deleteFile(dir, dp + name).catch(() => {}); }
@@ -2328,13 +2539,12 @@ const handlers = {
         if (!r.ok) { deckStatus = { type: 'error', message: 'Export failed: ' + r.error }; return; }
         await folderStore.writeFile(dir, sub + takeModel.mixFileName(slug, take.take), r.bytes);
 
-        // (b) Clean stems copied verbatim (folder-located slots read from the folder, opfs from OPFS).
+        // (b) Clean stems — each lane's clips flattened (at their bar offsets) into one mono stem
+        //     WAV. renderStem reads folder-located clips from the folder and opfs clips from OPFS.
         const keys = takeModel.filledSlotKeys(take);
         for (const key of keys) {
-          const slot = take.stems[key];
-          const rel = dp + slot.file;
-          const bytes = slot.loc === 'folder' ? await folderStore.readFile(dir, rel) : await takeStore.readFile(rel);
-          await folderStore.writeFile(dir, sub + takeModel.stemFileName(slug, take.take, key), bytes);
+          const bytes = await tapeDeck.renderStem(take, key, slug, dir);
+          if (bytes) await folderStore.writeFile(dir, sub + takeModel.stemFileName(slug, take.take, key), bytes);
         }
 
         deckStatus = { type: 'info', message: 'Exported mix + ' + keys.length + ' stem' + (keys.length === 1 ? '' : 's') + ' to ' + slug + '-' + take.take + '/' };

@@ -1008,3 +1008,41 @@ hard-refresh on the devices to pull `sn-v17`.
 - Oversampled **true-peak** limiting.
 - Optional **auto-prune** retention cap (currently manual, D16/AC-22).
 - A storage view listing per-song take disc usage (the manual-management quality-of-life follow-up).
+
+---
+
+## 11. The Timeline tab (clip model) — supersedes "no timeline editing"
+
+The deck now has two tabs over the SAME take: **Mix** (the 4-strip channel mixer, unchanged)
+and **Timeline** (horizontal clip lanes). This deliberately crosses the earlier boundary
+("not a general DAW: no timeline editing, no per-clip trimming") — it is the sanctioned
+expansion, not scope creep. It stays **mono-forever** and **4 lanes max**; there is still no
+panning, no plugins, no zoom.
+
+**The one model change.** A lane is no longer one contiguous WAV at t=0; it is an ordered,
+**non-overlapping** list of **clips**, each a self-contained mono WAV positioned at an integer
+`startBar`, `bars` long. Pure geometry lives in `clipModel.js`; the lane/clip shape + transforms
+in `takeModel.js` (nested `schemaVersion` → **3**). A legacy v1/v2 slot migrates to a one-clip
+lane (filename kept verbatim, idempotent), so old takes just work. 1 clip = 1 WAV; slice/trim/dupe
+produce new WAVs via byte-exact `wav.sliceWavBytes`; delete removes the file.
+
+**Mix stays the source of Mix truth.** Mix records only into free tracks and bounces (ping-pong)
+collapse a lane's clips into ONE aggregate clip at bar 0 — so anything Mix produces is a one-clip
+lane; multi-clip lanes only arise on the Timeline. Bounce is Mix-only.
+
+**Timeline behaviors.** A bar ruler + 4 color-coded lanes (blue/orange/violet/teal) + a head
+(RED when armed, GREEN otherwise). Click a bar to floor-snap the head; Play/Record begin there.
+Recording is **bar-atomic** (Stop completes the current bar, min 1 — both views, `requestStopAtBar`).
+Recording lays a clip at the head and **replaces ENTIRELY** any clip it reaches, for every armed
+lane. Timeline arming is **per-lane REC** (any lane, filled or free) + a per-lane input pulldown
+(the interface DEVICE picker stays above, persistent). Tools: **slice** (split at the clicked bar),
+**trim** (drop a first/last edge bar), **delete** (confirm), **dupe** (pick → click → confirm,
+snapped + non-overlapping). RETAKE discards the last recording group's clips.
+
+**Persistence.** Unchanged in shape: the song `.json` `tapeDeck.takes` stays the durable SSOT
+(now carrying per-clip records + positions); OPFS scratch; folder Save. `reconstructManifestFromFiles`
+can't recover clip positions from filenames (defaults them, flags `recovered`) — acceptable because
+the `.json` carries them losslessly.
+
+**Known v1 limitations (flagged):** no arrangement monitoring while Timeline-recording (no backing);
+no drag-to-move clips; no undo. Timeline is **desktop-Chrome only**.
