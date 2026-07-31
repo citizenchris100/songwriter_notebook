@@ -2455,7 +2455,8 @@ eq('sortLoopNames numeric order', sortLoopNames(['010.mid', '002.mid', '001.mid'
 
   const aeSrc = readFileSync(here('./js/tape/audioEngine.js'), 'utf8');
   ok('record() accepts autoStopSec', /record\(\{[^}]*autoStopSec/.test(aeSrc));
-  ok('record() sends endFrame in the begin message', /op: 'begin', beginFrame, endFrame/.test(aeSrc));
+  ok('record() sends endFrame in the begin message', /op: 'begin',[^}]*endFrame/.test(aeSrc));
+  ok('record() supports a bar-atomic Stop (requestStopAtBar)', aeSrc.includes('function requestStopAtBar') && aeSrc.includes('barsToCommit('));
   ok('record() starts drums finite for a sequence (not always Infinity)', aeSrc.includes('autoStopSec != null ? autoStopSec : Infinity'));
   ok('engine auto-stops on the worklet ended signal', aeSrc.includes("op === 'ended'") && aeSrc.includes("stop('sequence-end')"));
   ok('play/bounce drive drums off the EXACT sequence length', aeSrc.includes('drumSequenceSeconds') && /seqSec > 0 \? seqSec/.test(aeSrc));

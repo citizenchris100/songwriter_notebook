@@ -2137,7 +2137,10 @@ const handlers = {
       // rejects, still clear the flag and re-render so the deck can't strand nav-locked
       // (every control is gated on deckRecording — the whole reason a stuck stop reads as
       // "the app crashed, hard-refresh to recover").
-      try { await tapeDeck.stop(); }
+      // Bar-atomic Stop: completes the current bar before finalizing (both Mix + Timeline), so a
+      // clip is always a whole number of bars. requestStopAtBar arms the endFrame gate and resolves
+      // once the worklet's {op:'ended'} runs the real stop()+finalize.
+      try { await tapeDeck.requestStopAtBar(); }
       finally { if (deckRecording) { deckRecording = false; deckRecordingSlotKeys = []; deckRecordingGroup = null; render(); } }
     },
 

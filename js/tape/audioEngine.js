@@ -20,7 +20,7 @@ import { makeClick } from './click.js';
 import { makeDrumMachine, renderDrumsOffline } from './drumMachine.js';
 import { loadKit, loadEffect } from './drumKits.js';
 import { CLIP_THRESHOLD } from './meterModel.js';
-import { barSeconds } from './clickModel.js';
+import { barSeconds, barsToCommit } from './clickModel.js';
 
 // The exact seconds a FLATTENED drum SEQUENCE take plays (its frozen intro+main+outro pattern,
 // once). 0 for a non-sequence take (single loop / grid), which loops for the take instead. This
@@ -347,11 +347,11 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     const node = new AudioWorkletNode(audioCtx, 'capture-processor', {
       numberOfInputs: 1, numberOfOutputs: 1,
       channelCount: capture, channelCountMode: 'explicit', channelInterpretation: 'discrete',
-      // beginFrame Infinity keeps the gate shut until we send the real begin frame AFTER
-      // the count-in / drum backing / overdub playback is scheduled (below), so setup
-      // latency can never desync them. Needed whenever anything is scheduled (overdub,
-      // count-in, or drums); a bare first pass (none enabled) records from frame 0.
-      processorOptions: { channelCount: capture, slots: slotNums, beginFrame: scheduled ? Number.MAX_SAFE_INTEGER : 0 },
+      // beginFrame Infinity keeps the gate shut until we send the real begin frame (below), so
+      // setup latency can never desync backing AND — for EVERY pass now — the file's sample 0 is a
+      // KNOWN absolute frame (the anchor the bar-atomic Stop needs). Even a bare first pass is
+      // scheduled: it just has no backing (shift 0).
+      processorOptions: { channelCount: capture, slots: slotNums, beginFrame: Number.MAX_SAFE_INTEGER },
     });
     workletNode = node;
 
@@ -410,12 +410,13 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     sink.connect(audioCtx.destination);
     captureSource = source; captureSink = sink; // kept so teardownCaptureGraph can sever the whole path
 
-    // Everything is wired; NOW pick a common t=0 in the near future. If a click is on,
-    // run a 2-bar count-in from there and treat its first recorded downbeat as the
-    // musical t=0; the backing (overdub) starts at that downbeat and the capture gate
-    // opens one round-trip later. Click-off keeps today's behavior exactly (a click-off
-    // first pass took the beginFrame:0 immediate path above and skips this block).
-    if (scheduled) {
+    // Everything is wired; NOW pick a common t=0 in the near future and send an explicit begin for
+    // EVERY pass. If a click is on, a 2-bar count-in establishes the downbeat; backing (overdub/drums)
+    // starts there and the capture gate opens one round-trip later. A bare first pass has no backing:
+    // shift 0, gate opens at musicStart (trims ~150 ms pre-roll so file-sample-0 == the downbeat).
+    const barFrames = Math.round(barSeconds(bpm, timeSigIndex) * audioCtx.sampleRate);
+    let beginFrameAnchor;
+    {
       const startAt = audioCtx.currentTime + 0.15;
       let musicStart = startAt; // ctx time of the first RECORDED bar's downbeat
 
@@ -449,23 +450,24 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
       // latency + the input track's reported latency + the comp lookahead (never a bare 0, which
       // left every uncalibrated take lagging the drums by the full round-trip). Monitor-only
       // sources (drums/count-in) are heard but never captured.
-      const shift = resolveMonitorLatencySec({
+      // Backing alignment shift (overdub/count-in/drums). A bare first pass has no backing -> 0.
+      const shift = scheduled ? resolveMonitorLatencySec({
         source: monitorLatencySource,
         storedSec: monitorLatencySec,
         outputLatency: audioCtx.outputLatency,
         baseLatency: audioCtx.baseLatency,
         inputLatency: settings.latency, // MediaTrackSettings.latency (seconds), may be undefined
-      });
-      const beginFrame = Math.round((musicStart + shift) * audioCtx.sampleRate);
+      }) : 0;
+      beginFrameAnchor = Math.round((musicStart + shift) * audioCtx.sampleRate);
       // Sequence auto-stop: close the capture gate exactly autoStopSec after it opens, so the
       // stem is EXACTLY the sequence length (sample-accurate), aligned to the drums. The worklet
       // posts {op:'ended'} when it crosses endFrame; 0 = no auto-stop (record until manual Stop).
-      const endFrame = autoStopSec != null ? beginFrame + Math.round(autoStopSec * audioCtx.sampleRate) : 0;
-      node.port.postMessage({ op: 'begin', beginFrame, endFrame });
+      const endFrame = autoStopSec != null ? beginFrameAnchor + Math.round(autoStopSec * audioCtx.sampleRate) : 0;
+      node.port.postMessage({ op: 'begin', beginFrame: beginFrameAnchor, endFrame });
     }
 
     recording = true;
-    recordMeta = { slug, take, sampleRate: audioCtx.sampleRate, slotKeys, overdub };
+    recordMeta = { slug, take, sampleRate: audioCtx.sampleRate, slotKeys, overdub, beginFrame: beginFrameAnchor, barFrames };
 
     try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen'); }
     catch { onStatus && onStatus({ type: 'no-wake-lock' }); } // AC-24: hint, not a blocker
@@ -485,6 +487,32 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     return { ok: true, capture, sampleRate: audioCtx.sampleRate, take, slotKeys };
   }
 
+  // Bar-atomic Stop (the user's decision: complete the current bar, min 1). Instead of stopping
+  // immediately, recompute the capture gate's endFrame to the next bar boundary and re-send begin
+  // (the worklet overwrites beginFrame on ANY begin msg, so we resend the stored anchor verbatim);
+  // when it crosses endFrame it posts {op:'ended'}, which runs the NORMAL stop() — so the stem is
+  // EXACTLY a whole number of bars, sample-accurate. Falls back to an immediate stop with no anchor.
+  let stopAtBarTimer = null;
+  let stopAtBarResolve = null;
+  function requestStopAtBar() {
+    if (!recording || autoStopping) return stop('manual');
+    const node = workletNode;
+    if (!node || !recordMeta || !(recordMeta.barFrames > 0)) return stop('manual');
+    const nowFrame = Math.round(ctx.currentTime * ctx.sampleRate);
+    const elapsed = Math.max(0, nowFrame - recordMeta.beginFrame);
+    const bars = barsToCommit(elapsed, recordMeta.barFrames);
+    const endFrame = recordMeta.beginFrame + bars * recordMeta.barFrames;
+    autoStopping = true; // the {op:'ended'} handler's !autoStopping guard prevents a double-stop
+    node.port.postMessage({ op: 'begin', beginFrame: recordMeta.beginFrame, endFrame });
+    // Resolve only once the ensuing {op:'ended'} -> stop() -> finalize has landed, so the caller
+    // (onStopTake) awaits the real finalize — not just the gate arming. The timer is the liveness net.
+    const waitMs = ((endFrame - nowFrame) / ctx.sampleRate + 0.6) * 1000;
+    return new Promise((resolve) => {
+      stopAtBarResolve = resolve;
+      stopAtBarTimer = setTimeout(() => { if (recording) stop('manual'); }, Math.max(0, waitMs));
+    });
+  }
+
   // Clean stop: flush the worklet's partial chunk (with an ack handshake so the
   // very last bytes are guaranteed written before we ask the worker to
   // finalize), patch+close the stem files, release the wake lock, then AWAIT
@@ -495,6 +523,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   async function stop(reason) {
     if (!recording) return null;
     recording = false;
+    if (stopAtBarTimer) { clearTimeout(stopAtBarTimer); stopAtBarTimer = null; }
     if (recordMeta && recordMeta.cleanup) recordMeta.cleanup();
     stopClick(); // silence the metronome the instant Stop is hit, before the flush wait
 
@@ -532,8 +561,9 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     teardownCaptureGraph();
     if (wakeLock) { try { await wakeLock.release(); } catch { /* already released */ } wakeLock = null; }
 
+    const settleStopAtBar = () => { if (stopAtBarResolve) { const r = stopAtBarResolve; stopAtBarResolve = null; r(); } };
     const rc = recordMeta; recordMeta = null;
-    if (!rc) return null;
+    if (!rc) { settleStopAtBar(); return null; }
     // Per-slot durations for exactly the slots this pass wrote (2 bytes/sample, mono
     // per track); the pass "length" is its longest slot.
     const slotDurations = {};
@@ -541,6 +571,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     const durs = Object.keys(slotDurations).map((k) => slotDurations[k]);
     const durationSec = durs.length ? Math.max.apply(null, durs) : 0;
     if (onStatus) await onStatus({ type: reason === 'interrupted' ? 'stopped-interrupted' : reason === 'storage-error' ? 'stopped-storage-error' : 'stopped', slug: rc.slug, take: rc.take, sampleRate: rc.sampleRate, slotKeys: rc.slotKeys, slotDurations, durationSec });
+    settleStopAtBar();
     return { slug: rc.slug, take: rc.take, sampleRate: rc.sampleRate, slotKeys: rc.slotKeys, slotDurations, durationSec, dataBytes };
   }
 
@@ -929,5 +960,5 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
     if (ctx) { try { ctx.close(); } catch { /* already closed */ } ctx = null; masterBus = null; }
   }
 
-  return { probe, record, stop, play, replay, stopPlay, invalidatePlayback: disposePlayback, renderMaster, renderStem, bounce, bounceTracks, applySettings, setMasterVol, calibrateLatency, getContextLatency, previewPattern, stopPreview, dispose };
+  return { probe, record, stop, requestStopAtBar, play, replay, stopPlay, invalidatePlayback: disposePlayback, renderMaster, renderStem, bounce, bounceTracks, applySettings, setMasterVol, calibrateLatency, getContextLatency, previewPattern, stopPreview, dispose };
 }
