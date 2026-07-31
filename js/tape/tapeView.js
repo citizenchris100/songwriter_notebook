@@ -449,8 +449,25 @@ function timelineBody(deck, handlers) {
       clip.addEventListener('click', (e) => { e.stopPropagation(); act(e, key, c, lane); });
       lane.appendChild(clip);
     });
-    const lbl = h('div', 'tllabel', STEM_SHORT[key]); // overlays top-left, pointer-events:none
-    lane.appendChild(lbl);
+    // Left-edge lane control: name + a per-lane REC arm (Timeline can arm ANY lane) + an input
+    // pulldown (which interface channel feeds this lane). The interface DEVICE picker is above,
+    // persistent. Overlays bar 0; its buttons stopPropagation so they don't seek/tool the lane.
+    const armInfo = (deck.armed || []).find((a) => a.slotKey === key);
+    const ctrl = h('div', 'tllanectrl');
+    ctrl.appendChild(h('div', 'tllanename', STEM_SHORT[key]));
+    const rec = h('button', 'tllanerec' + (armInfo ? ' on' : ''), '● REC');
+    rec.disabled = !!deck.recording;
+    rec.addEventListener('click', (e) => { e.stopPropagation(); handlers.onArmTrack(key); });
+    ctrl.appendChild(rec);
+    if (armInfo && (deck.inputChannels || 1) > 1) {
+      const insel = h('select', 'tllaneinput');
+      for (let i = 0; i < deck.inputChannels; i++) { const o = h('option', null, 'IN ' + (i + 1)); o.value = String(i); insel.appendChild(o); }
+      insel.value = String(armInfo.inputIndex);
+      insel.addEventListener('click', (e) => e.stopPropagation());
+      insel.addEventListener('change', (e) => { e.stopPropagation(); handlers.onTimelineSetInput(key, Number(insel.value)); });
+      ctrl.appendChild(insel);
+    }
+    lane.appendChild(ctrl);
     lane.addEventListener('click', (e) => act(e, key, null, lane));
     grid.appendChild(lane);
   });

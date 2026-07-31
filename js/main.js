@@ -111,6 +111,9 @@ let deckDupeSrc = null;         // { key, clipId } — the clip the dupe tool pi
 let deckScrollLeft = 0;         // the timeline horizontal scroll offset, preserved across full re-renders
 let deckRecordingSlotKeys = []; // the in-flight pass's destination slot keys (meter routing + finalize)
 let deckRecordingGroup = null;  // the in-flight pass's group number
+let deckRecordTimeline = false; // the in-flight pass is a TIMELINE record: place clips at the head, replace-region
+let deckRecordHead = 0;         // the head bar the in-flight timeline clips land at
+let deckRecordClipIds = {};     // { slotKey: clipId } for the in-flight timeline pass
 let deckInputs = null;         // devices.probe() result: { inputs, preselectedId, warnMoreThanMax, isLikelyInterface, channels }
 let deckSelectedInputId = null;
 let deckSpaceWarning = false;
@@ -177,6 +180,9 @@ function resetTapeDeckUi() {
   deckScrollLeft = 0;
   deckRecordingSlotKeys = [];
   deckRecordingGroup = null;
+  deckRecordTimeline = false;
+  deckRecordHead = 0;
+  deckRecordClipIds = {};
   deckInputs = null;
   deckSelectedInputId = null;
   deckClickDraft = null;
@@ -233,10 +239,13 @@ function tapeDeckViewModel(active) {
 
   const inputChannels = (deckInputs && deckInputs.channels) || 1;
   const freeSlots = freeSlotKeys.length;
-  const maxCapture = Math.min(inputChannels, freeSlots, takeModel.MAX_TRACKS);
+  // Timeline recording can arm ANY lane (existing clips the head reaches get replaced); Mix arms
+  // only free lanes (a filled Mix track must be bounced first).
+  const armableKeys = deckTab === 'timeline' ? takeModel.STEM_KEYS.slice() : freeSlotKeys;
+  const maxCapture = Math.min(inputChannels, armableKeys.length, takeModel.MAX_TRACKS);
 
-  // Normalize + cache the armed set (drops slots that filled, reassigns stale inputs).
-  const armed = normalizeArmed(deckArmed, freeSlotKeys, inputChannels, maxCapture);
+  // Normalize + cache the armed set (drops un-armable slots, reassigns stale inputs).
+  const armed = normalizeArmed(deckArmed, armableKeys, inputChannels, maxCapture);
   deckArmed = armed;
   const armedByKey = {};
   armed.forEach((a) => { armedByKey[a.slotKey] = a.inputIndex; });
@@ -1112,7 +1121,25 @@ async function finalizeStoppedTake(s, message) {
   let emptied = false;
   if (deckManifest && deckManifest.slug === s.slug) {
     const captured = (s.durationSec || 0) > 0;
-    if (!captured && passGroup != null) {
+    if (deckRecordTimeline) {
+      // Timeline pass: place each captured clip at the head, replacing whatever clips it reaches
+      // (recordClip references the file record() already wrote by its injected id). An empty pass
+      // just drops the pre-opened header-only files.
+      const take0 = deckManifest.takes.find((t) => t.take === s.take);
+      const spb = take0 ? takeModel.secPerBar(take0) : barSeconds(120, 2);
+      const orphans = [];
+      for (const k of (s.slotKeys || [])) {
+        const id = deckRecordClipIds[k];
+        const dur = (s.slotDurations && s.slotDurations[k]) || 0;
+        if (!id || dur <= 0 || !captured) { if (id) takeStore.deleteSlotFiles(s.slug, [takeModel.clipFileName(s.slug, s.take, k, id)]).catch(() => {}); continue; }
+        const bars = Math.max(1, Math.round(dur / spb));
+        const r = takeModel.recordClip(deckManifest, s.take, k, { id, startBar: deckRecordHead, bars, durationSec: dur, group: passGroup });
+        deckManifest = r.manifest;
+        for (const f of r.removedFiles) orphans.push(f);
+      }
+      for (const f of orphans) takeStore.deleteSlotFiles(s.slug, [f]).catch(() => {});
+      if (tapeDeck) tapeDeck.invalidatePlayback();
+    } else if (!captured && passGroup != null) {
       // Nothing was committed this pass — e.g. Stop during the count-in, before the
       // capture gate opened. Free the just-armed slots instead of leaving 0-length
       // stems: discard this group, then either re-activate the take (earlier passes
@@ -1142,9 +1169,14 @@ async function finalizeStoppedTake(s, message) {
     currentTake = s.take;
     deckPendingNewTake = false;
   }
+  const wasTimeline = deckRecordTimeline;
   deckRecordingSlotKeys = [];
   deckRecordingGroup = null;
-  deckArmed = [];             // the just-recorded slots are filled now — clear the arm set
+  deckRecordTimeline = false;
+  deckRecordClipIds = {};
+  // Mix: the just-recorded lanes are filled — clear the arm set. Timeline: keep the arm so you can
+  // move the head and record the next clip without re-arming.
+  if (!wasTimeline) deckArmed = [];
   deckStatus = message ? { type: 'warn', message } : null;
   await refreshSpaceWarning();
   render();
@@ -1255,13 +1287,16 @@ async function armRecording() {
   }
   const slug = a.id;
   const path = manifestPath(slug);
+  const isTimeline = deckTab === 'timeline'; // Timeline record: clips land at the head, replace-region, arm any lane
+  const headBar = isTimeline ? deckHead : 0;
   await refreshSpaceWarning(); // §5.8: "before each record", not just on deck open / after the last take
 
   // New take vs overdub into the current take. `baseTake` is the container being
   // filled (null for a fresh take); freeKeys are its recordable slots.
   const isNew = deckPendingNewTake || currentTake == null;
   const baseTake = isNew ? null : (deckManifest.takes.find((t) => t.take === currentTake) || null);
-  const freeKeys = isNew ? takeModel.STEM_KEYS.slice() : (baseTake ? takeModel.freeSlotKeys(baseTake) : []);
+  // Timeline arms ANY lane (filled clips get replaced at the head); Mix/new-take arms free lanes only.
+  const freeKeys = (isTimeline || isNew) ? takeModel.STEM_KEYS.slice() : (baseTake ? takeModel.freeSlotKeys(baseTake) : []);
   // Build the per-CHANNEL routing (indexed by interface input; null = that input isn't
   // armed to any track, captured only for its meter) from the armed set. Guard: nothing
   // armed -> nothing to record.
@@ -1273,7 +1308,9 @@ async function armRecording() {
   armedNow.forEach((x) => { routing[x.inputIndex] = x.slotKey; });
   // The take's already-recorded tracks play as backing while overdubbing (empty for
   // a first pass); latency-aligned via the measured monitor round-trip.
-  const existingTracks = (baseTake ? takeModel.filledSlotKeys(baseTake) : []).map((k) => ({ key: k, meta: baseTake.stems[k] }));
+  // Timeline v1 records without arrangement monitoring (no backing — the captured DI is what matters);
+  // Mix overdub plays the take's filled tracks as backing.
+  const existingTracks = isTimeline ? [] : (baseTake ? takeModel.filledSlotKeys(baseTake) : []).map((k) => ({ key: k, meta: baseTake.stems[k] }));
   // Overdub backing may include tracks already Saved to the folder — resolve (and require)
   // the folder handle when any backing track is folder-located, so it can be monitored.
   const needsFolder = existingTracks.some((t) => takeModel.slotLoc(t.meta) === 'folder');
@@ -1287,15 +1324,15 @@ async function armRecording() {
   // The metronome config for this pass: the new-take draft for a first pass, else the
   // take's locked config (overdubs share the take's tempo). Drives the count-in + click
   // AND is stamped onto the take at creation.
-  const clickCfg = isNew ? (deckClickDraft || readClickDefault()) : (baseTake && baseTake.click);
+  const clickCfg = (baseTake && baseTake.click) || (deckClickDraft || readClickDefault()); // take's locked tempo, else the draft
   // The drum backing for this pass: the new-take draft for a first pass, else the take's locked
-  // drums (overdubs share the take's backing). Drives the record-time drum machine + is stamped
-  // onto the take at creation. bpm/meter come from the click config (shared tempo).
-  let drumCfg = isNew ? (deckDrumDraft || readDrumDefault()) : (baseTake && baseTake.drums);
+  // drums (overdubs share the take's backing). Timeline v1 uses no drum backing. bpm/meter come
+  // from the click config (shared tempo).
+  let drumCfg = isTimeline ? null : (isNew ? (deckDrumDraft || readDrumDefault()) : (baseTake && baseTake.drums));
   // A new take in SEQUENCE mode rolls + flattens the sequence NOW (fail-fast before recording),
   // freezing it onto the take; autoStopSec makes the record auto-stop at the sequence end.
   let autoStopSec = null;
-  if (isNew && deckDrumMode === 'sequence') {
+  if (isNew && !isTimeline && deckDrumMode === 'sequence') {
     const built = buildFrozenSequence(clickCfg);
     if (!built.ok) { deckArming = false; deckStatus = { type: 'warn', message: built.message }; render(); return; }
     drumCfg = built.drumConfig;
@@ -1325,15 +1362,27 @@ async function armRecording() {
           takeNo = takeModel.nextTakeNumber(deckManifest);
           group = 1;
           deckManifest = takeModel.appendTake(deckManifest, takeModel.makeTake({ take: takeNo, sampleRate, click: clickCfg, drums: drumCfg }, nowISO()));
+          if (isTimeline) deckManifest = takeModel.finalizePass(deckManifest, takeNo, {}); // a fresh timeline take starts active/empty; clips land at finalize
         } else {
           takeNo = currentTake;
           group = takeModel.nextGroup(baseTake);
         }
-        deckManifest = takeModel.appendPassTracks(deckManifest, takeNo, slotKeys, group);
-        // The clip filenames just armed — record() opens these (per-clip files, not stemFileName).
-        const armedTake = deckManifest.takes.find((t) => t.take === takeNo);
         const files = {};
-        for (const k of slotKeys) { const c = armedTake && armedTake.stems[k] && armedTake.stems[k].clips[0]; if (c) files[k] = c.file; }
+        if (isTimeline) {
+          // Timeline pass: allocate a fresh clip id + file per armed lane and open those files now;
+          // the lane clips are NOT touched until finalize, where recordClip places the clip at the
+          // head and replaces whatever it reaches (so the lane never holds an overlapping clip mid-record).
+          deckRecordTimeline = true;
+          deckRecordHead = headBar;
+          deckRecordClipIds = {};
+          for (const k of slotKeys) { const id = newClipId(); deckRecordClipIds[k] = id; files[k] = takeModel.clipFileName(slug, takeNo, k, id); }
+        } else {
+          deckRecordTimeline = false;
+          deckManifest = takeModel.appendPassTracks(deckManifest, takeNo, slotKeys, group);
+          // The clip filenames just armed — record() opens these (per-clip files, not stemFileName).
+          const armedTake = deckManifest.takes.find((t) => t.take === takeNo);
+          for (const k of slotKeys) { const c = armedTake && armedTake.stems[k] && armedTake.stems[k].clips[0]; if (c) files[k] = c.file; }
+        }
         await takeStore.writeManifest(path, deckManifest);
         deckRecording = true;
         deckPendingNewTake = false;
@@ -1959,6 +2008,22 @@ const handlers = {
     onTimelineTool: (tool) => { deckTool = (deckTool === tool) ? null : tool; deckDupeSrc = null; render(); },
     // Preserve the timeline horizontal scroll across full re-renders (DOM-local, no render).
     onTimelineScroll: (px) => { deckScrollLeft = Math.max(0, px | 0); },
+    // Set an armed Timeline lane's interface input to a specific channel (pulldown), swapping with
+    // whichever lane currently holds it so inputs stay unique.
+    onTimelineSetInput: (key, idx) => {
+      if (deckRecording || deckBouncing) return;
+      const channels = (deckInputs && deckInputs.channels) || 1;
+      if (!(idx >= 0 && idx < channels)) return;
+      const me = deckArmed.find((a) => a.slotKey === key);
+      if (!me) return;
+      const other = deckArmed.find((a) => a.slotKey !== key && a.inputIndex === idx);
+      deckArmed = deckArmed.map((a) => {
+        if (a.slotKey === key) return { ...a, inputIndex: idx };
+        if (other && a.slotKey === other.slotKey) return { ...a, inputIndex: me.inputIndex };
+        return a;
+      });
+      render();
+    },
 
     // ---- timeline clip tools ----
     // SLICE: split a clip at the END of the clicked bar into two self-contained WAVs.

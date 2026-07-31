@@ -415,7 +415,12 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
 .tllane { position: relative; height: 60px; border-bottom: 1px solid #202024; }
 .tllane.armed { box-shadow: 0 0 0 1px #ff3b30 inset; }
 .tllane.recording { box-shadow: 0 0 0 2px #ff3b30 inset; }
-.tllabel { position: absolute; left: 6px; top: 4px; font: 600 10px/1 system-ui, sans-serif; letter-spacing: .1em; color: #7a8087; pointer-events: none; z-index: 3; }
+.tllanectrl { position: absolute; left: 4px; top: 4px; z-index: 3; display: flex; align-items: center; gap: 6px; background: rgba(18,18,20,.82); padding: 3px 6px; border-radius: 6px; }
+.tllanename { font: 600 10px/1 system-ui, sans-serif; letter-spacing: .1em; color: #7a8087; }
+.tllanerec { font: 700 9px/1 system-ui, sans-serif; padding: 3px 6px; border-radius: 5px; border: 1px solid #3a3a3f; background: #1b1b1d; color: #9aa0a6; cursor: pointer; }
+.tllanerec.on { border-color: #ff3b30; color: #ff3b30; box-shadow: 0 0 0 1px #ff3b30 inset; }
+.tllanerec:disabled { opacity: .4; cursor: not-allowed; }
+.tllaneinput { font-size: 10px; background: #1b1b1d; color: #cfd2d6; border: 1px solid #3a3a3f; border-radius: 5px; padding: 2px; }
 
 .tlclip { position: absolute; top: 8px; bottom: 8px; border-radius: 5px; cursor: pointer; box-sizing: border-box; border: 1px solid rgba(255,255,255,.35); overflow: hidden; }
 .tlclip.picked { outline: 2px solid #39ff14; outline-offset: 1px; }

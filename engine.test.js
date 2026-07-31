@@ -2469,6 +2469,9 @@ eq('sortLoopNames numeric order', sortLoopNames(['010.mid', '002.mid', '001.mid'
   ok('commit applies the model-level click lock', mainSrc.includes('lockClickEdit(t.click'));
   ok('Save copies referenced loop files', mainSrc.includes('referencedLoopFiles(next)') && mainSrc.includes('loopsRef(slug)'));
   ok('song delete cleans the loops dir', mainSrc.includes('deleteSongLoops'));
+  ok('main.js records Timeline clips at the head with replace-region', mainSrc.includes('takeModel.recordClip(deckManifest') && mainSrc.includes('startBar: deckRecordHead'));
+  ok('main.js arms any lane on the Timeline tab', mainSrc.includes("deckTab === 'timeline'") && mainSrc.includes('armableKeys'));
+  ok('main.js timeline Stop is bar-atomic', mainSrc.includes('requestStopAtBar'));
 
   const dpSrc = readFileSync(here('./js/tape/drumPanel.js'), 'utf8');
   ok('drum panel branches on sequence mode', dpSrc.includes("mode === 'sequence'") && dpSrc.includes('buildSequenceSection'));
