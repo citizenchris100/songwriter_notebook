@@ -38,6 +38,7 @@ import {
   projectTakesForJson, hydrateSavedTakes, tapeDeckWithTakes, activeAudioTakeCount, rekeyManifest,
   clipFileName, referencedClipFiles, takeLengthBars, MANIFEST_SCHEMA,
   recordClip, sliceClip, trimClip, deleteClipFromLane, dupeClipInLane,
+  recordPassPlan, clipPlayGeometry,
   defaultStemSettings, clampStemSettings, compressorParams, bounceGainDb,
   LUFS_TARGET, LUFS_FLOOR, BOUNCE_GAIN_DB_MIN, BOUNCE_GAIN_DB_MAX, LIMITER_CEILING_DB,
   STEM_KEYS, MAX_TRACKS, TAKE_STATUS,
@@ -1299,6 +1300,70 @@ ok('cache is stale after an in-place bounce bumps the epoch',
 }
 
 // ============================================================================
+// 14f. Tape deck (pure) — recordPassPlan + clipPlayGeometry (record-pass monitoring)
+// ============================================================================
+// recordPassPlan is the single pure decider armRecording() delegates to for "what plays as
+// backing + which drum config" on a pass. It replaces two inline isTimeline ternaries that
+// forced a Timeline record dry (count-in then silence on a retake). clipPlayGeometry is the
+// shared head-relative clip-scheduling geometry (play() + the record-time monitor).
+{
+  // A take with stems 1/2/3 filled as separate recording groups, drums enabled (mirrors the
+  // `everyday` take 6 the bug was reported against, once it is loaded from a Mix-made take).
+  let m = createManifest('song');
+  m = appendTake(m, makeTake({ take: 1, sampleRate: 48000, drums: { enabled: true } }, 'T'));
+  m = appendPassTracks(m, 1, ['stem1'], 1); m = finalizePass(m, 1, { stem1: 8 });
+  m = appendPassTracks(m, 1, ['stem2'], 2); m = finalizePass(m, 1, { stem2: 8 });
+  m = appendPassTracks(m, 1, ['stem3'], 3); m = finalizePass(m, 1, { stem3: 8 });
+
+  eq('lastGroupSlotKeys is the last recorded pass', lastGroupSlotKeys(m.takes[0]).join(','), 'stem3');
+  const base = discardGroup(m, 1, 3).takes[0]; // Retake frees stem3 first; stem1/stem2 survive.
+
+  // THE FIX: a retake into a filled take monitors the surviving lanes + the take's drums
+  // (was existingTracks=[] / drumConfig=null on the Timeline tab -> count-in then silence).
+  const plan = recordPassPlan(base, ['stem3'], null);
+  eq('recordPassPlan backs the surviving filled lanes', plan.existingTracks.map((t) => t.key).join(','), 'stem1,stem2');
+  ok('recordPassPlan carries each backing lane meta', plan.existingTracks.every((t) => t.meta && t.meta.clips));
+  ok('recordPassPlan passes the take drums through', plan.drumConfig && plan.drumConfig.enabled === true);
+
+  // Footgun guard: armedKeys must be the true WRITE set, not every free lane. Punch-in over a
+  // FILLED lane excludes exactly that lane (and only it) from its own backing. (If a caller
+  // wrongly passed freeKeys === all STEM_KEYS on the Timeline, filled∖armed would be [] and the
+  // bug would silently return — this case would then FAIL while every Mix test still passed.)
+  eq('an armed filled lane is excluded from its own backing', recordPassPlan(base, ['stem1'], null).existingTracks.map((t) => t.key).join(','), 'stem2');
+
+  // Equivalence with Mix overdub: Mix arms a FREE lane, so filled∖armed == filled (filter inert).
+  eq('Mix overdub (arm a free lane) backs every filled lane', recordPassPlan(base, ['stem4'], null).existingTracks.map((t) => t.key).join(','), 'stem1,stem2');
+
+  // Equivalence with a brand-new take: no backing; drums come from the passed draft, else null.
+  const planNew = recordPassPlan(null, ['stem1', 'stem2'], { enabled: true });
+  eq('a new take has no backing', planNew.existingTracks.length, 0);
+  ok('a new take uses the passed drum draft', planNew.drumConfig && planNew.drumConfig.enabled === true);
+  ok('a dry new take (null draft) yields null drums', recordPassPlan(null, ['stem1'], null).drumConfig === null);
+
+  // clipPlayGeometry — head-relative clip scheduling shared by play() + the record-time monitor.
+  // head=0, bar-0 clip: fires at the downbeat, no seek; endSec = its length.
+  { const g = clipPlayGeometry(0, 8, 0, 2);
+    ok('clipPlayGeometry head0 bar0 -> delay 0 / seek 0', g.delaySec === 0 && g.seekSec === 0);
+    eq('clipPlayGeometry head0 bar0 endSec', g.endSec, 8); }
+  // head=0, bar-4 clip: delay == startBar*barSec (parity proof with the old absolute startSec).
+  { const g = clipPlayGeometry(4, 8, 0, 2);
+    eq('clipPlayGeometry head0 bar4 delay == startBar*barSec', g.delaySec, 8);
+    ok('clipPlayGeometry head0 bar4 no seek', g.seekSec === 0);
+    eq('clipPlayGeometry head0 bar4 endSec', g.endSec, 16); }
+  // head straddling a clip (bars [2,6), head at bar 4): delay 0, seek 2 bars in.
+  { const g = clipPlayGeometry(2, 8, 4, 2);
+    ok('clipPlayGeometry straddle -> delay 0', g.delaySec === 0);
+    eq('clipPlayGeometry straddle seeks into the clip', g.seekSec, 4);
+    eq('clipPlayGeometry straddle endSec is seconds past the head', g.endSec, 4); }
+  // clip entirely before the head -> null (skip); boundary clipEnd === 0 also skips.
+  ok('clipPlayGeometry skips a clip ending before the head', clipPlayGeometry(0, 8, 8, 2) === null);
+  ok('clipPlayGeometry skips at the clipEnd == 0 boundary', clipPlayGeometry(0, 8, 4, 2) === null);
+  // 0.0005 straddle clamp: the seek can never reach the very end of the buffer.
+  { const g = clipPlayGeometry(0, 4, 1, 3.9996); // clipStart -3.9996, clipEnd 0.0004 (> 0.0001, kept)
+    ok('clipPlayGeometry clamps the straddle seek to durationSec - 0.0005', g.delaySec === 0 && g.seekSec === 4 - 0.0005); }
+}
+
+// ============================================================================
 // 14e. Tape deck (pure) — timelineNav.js: page-scroll geometry
 // ============================================================================
 // The horizontal nav-arrow math: one-screenful paging, clamped to [0, maxScroll].
@@ -2503,6 +2568,18 @@ eq('sortLoopNames numeric order', sortLoopNames(['010.mid', '002.mid', '001.mid'
   ok('main.js records Timeline clips at the head with replace-region', mainSrc.includes('takeModel.recordClip(deckManifest') && mainSrc.includes('startBar: deckRecordHead'));
   ok('main.js arms any lane on the Timeline tab', mainSrc.includes("deckTab === 'timeline'") && mainSrc.includes('armableKeys'));
   ok('main.js timeline Stop is bar-atomic', mainSrc.includes('requestStopAtBar'));
+
+  // Timeline record into a filled take now monitors the surviving lanes + the take's drums (was
+  // forced dry — count-in then silence on a retake). Decision goes through the pure recordPassPlan
+  // seam; backing is scheduled head-relative via clipPlayGeometry (shared with play()).
+  ok('armRecording delegates the record-pass decision to recordPassPlan', mainSrc.includes('recordPassPlan('));
+  ok('main.js no longer forces Timeline backing empty', !/isTimeline\s*\?\s*\[\]/.test(mainSrc));
+  ok('main.js no longer forces Timeline drums null', !/isTimeline\s*\?\s*null/.test(mainSrc));
+  ok('armRecording passes headBar into record()',
+     mainSrc.slice(mainSrc.indexOf('ensureTapeDeck().record('), mainSrc.indexOf('onPassOpen:')).includes('headBar'));
+  ok('record() accepts a headBar option', /async function record\(\{[^}]*headBar/.test(aeSrc));
+  ok('record() + play() schedule clips head-relative via clipPlayGeometry', aeSrc.includes('clipPlayGeometry('));
+  ok('startMonitorFromBuffers honors a per-clip seek offset', aeSrc.includes('it.seekSec'));
 
   const dpSrc = readFileSync(here('./js/tape/drumPanel.js'), 'utf8');
   ok('drum panel branches on sequence mode', dpSrc.includes("mode === 'sequence'") && dpSrc.includes('buildSequenceSection'));

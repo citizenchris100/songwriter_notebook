@@ -1309,11 +1309,15 @@ async function armRecording() {
   const maxIdx = Math.max.apply(null, armedNow.map((x) => x.inputIndex));
   const routing = new Array(maxIdx + 1).fill(null);
   armedNow.forEach((x) => { routing[x.inputIndex] = x.slotKey; });
-  // The take's already-recorded tracks play as backing while overdubbing (empty for
-  // a first pass); latency-aligned via the measured monitor round-trip.
-  // Timeline v1 records without arrangement monitoring (no backing — the captured DI is what matters);
-  // Mix overdub plays the take's filled tracks as backing.
-  const existingTracks = isTimeline ? [] : (baseTake ? takeModel.filledSlotKeys(baseTake) : []).map((k) => ({ key: k, meta: baseTake.stems[k] }));
+  // The record-pass monitoring plan (pure): the take's already-recorded lanes that are NOT being
+  // (re)recorded play as backing while overdubbing, plus the take's drums. Empty/dry for a brand-new
+  // take. Both Mix and Timeline records into a filled take monitor the arrangement now; a filled lane
+  // armed on the Timeline (retake/punch-in) is excluded from its own backing. Latency-aligned via the
+  // measured monitor round-trip; scheduled head-relative in record() (Mix always records at head 0).
+  const { existingTracks, drumConfig } = takeModel.recordPassPlan(
+    baseTake, armedNow.map((x) => x.slotKey),
+    (isNew && !isTimeline) ? (deckDrumDraft || readDrumDefault()) : null,
+  );
   // Overdub backing may include tracks already Saved to the folder — resolve (and require)
   // the folder handle when any backing track is folder-located, so it can be monitored.
   const needsFolder = existingTracks.some((t) => takeModel.slotLoc(t.meta) === 'folder');
@@ -1328,10 +1332,10 @@ async function armRecording() {
   // take's locked config (overdubs share the take's tempo). Drives the count-in + click
   // AND is stamped onto the take at creation.
   const clickCfg = (baseTake && baseTake.click) || (deckClickDraft || readClickDefault()); // take's locked tempo, else the draft
-  // The drum backing for this pass: the new-take draft for a first pass, else the take's locked
-  // drums (overdubs share the take's backing). Timeline v1 uses no drum backing. bpm/meter come
-  // from the click config (shared tempo).
-  let drumCfg = isTimeline ? null : (isNew ? (deckDrumDraft || readDrumDefault()) : (baseTake && baseTake.drums));
+  // The drum backing for this pass, from the plan above (new-take draft for a first pass, else the
+  // take's locked drums; null when dry). Kept `let` so the sequence-freeze below can overwrite it.
+  // bpm/meter come from the click config (shared tempo).
+  let drumCfg = drumConfig;
   // A new take in SEQUENCE mode rolls + flattens the sequence NOW (fail-fast before recording),
   // freezing it onto the take; autoStopSec makes the record auto-stop at the sequence end.
   let autoStopSec = null;
@@ -1351,6 +1355,7 @@ async function armRecording() {
       monitorLatencySec: getMonitorLatencySec(),
       monitorLatencySource: readLatency(deckSelectedInputId).source, // 'measured'|'manual'|'none' — 'none' -> record() auto-estimates
       existingTracks,
+      headBar, // Timeline records at the head; backing/clip scheduling is head-relative (Mix head = 0)
       clickConfig: clickCfg,
       drumConfig: drumCfg,
       autoStopSec,

@@ -188,6 +188,35 @@ export function takeHasAudio(take) {
   return filledSlotKeys(take).length > 0;
 }
 
+// The arrangement-monitoring plan for a record pass (pure). `baseTake` is the take being
+// recorded into (null for a brand-new take); `armedKeys` are the slot keys THIS pass will
+// write; `drumsForNewTake` is the drum config for a first pass (else null). Returns the
+// backing tracks to monitor + the drum config to play. Tab-agnostic by construction: Mix arms
+// only FREE lanes so filled∖armed == filled (the filter is inert); the Timeline may arm a
+// FILLED lane (retake/punch-in), which is excluded so we never monitor the lane we overwrite.
+export function recordPassPlan(baseTake, armedKeys, drumsForNewTake) {
+  const armed = new Set(armedKeys || []);
+  const existingTracks = (baseTake ? filledSlotKeys(baseTake) : [])
+    .filter((k) => !armed.has(k))
+    .map((k) => ({ key: k, meta: baseTake.stems[k] }));
+  const drumConfig = baseTake ? (baseTake.drums || null) : (drumsForNewTake || null);
+  return { existingTracks, drumConfig };
+}
+
+// Where/how to schedule a clip relative to the record/play HEAD (pure). Returns null when the
+// clip ends at or before the head (skip it), else { delaySec, seekSec, endSec }:
+//   delaySec  seconds after the shared startAt to fire the source (>= 0)
+//   seekSec   seconds into the buffer to begin (> 0 only for a clip straddling the head)
+//   endSec    seconds past the head where the clip ends (play() needs it for stem length + onended)
+// Keep the `(startBar - headBar)` operand order for bit-identical floats with play()'s old inline.
+export function clipPlayGeometry(startBar, durationSec, headBar, barSec) {
+  const clipStart = (startBar - headBar) * barSec;
+  const clipEnd = clipStart + durationSec;
+  if (clipEnd <= 0.0001) return null;
+  if (clipStart >= 0) return { delaySec: clipStart, seekSec: 0, endSec: clipEnd };
+  return { delaySec: 0, seekSec: Math.min(-clipStart, Math.max(0, durationSec - 0.0005)), endSec: clipEnd };
+}
+
 // The take's length in BARS: the furthest clip end across all lanes.
 export function takeLengthBars(take) {
   const stems = (take && take.stems) || {};

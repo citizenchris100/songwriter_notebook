@@ -13,7 +13,7 @@ import { limit } from './limiter.js';
 import {
   STEM_KEYS, MAX_TRACKS, stemFileName, mixFileName, clipFileName, compressorParams, bounceGainDb,
   EQ_BANDS, LIMITER_CEILING_DB, defaultStemSettings, playbackCacheStale,
-  laneClips, slotHasAudio, secPerBar,
+  laneClips, slotHasAudio, secPerBar, clipPlayGeometry,
 } from './takeModel.js';
 import { detectClickSample, rttSeconds, summarizeTrials, resolveMonitorLatencySec } from './latency.js';
 import { makeClick } from './click.js';
@@ -263,7 +263,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
       const source = audioCtx.createBufferSource();
       source.buffer = it.buffer;
       source.connect(chain.input);
-      source.start(startAt + (it.startSec || 0)); // backing clips honor their bar offset
+      source.start(startAt + (it.delaySec || 0), it.seekSec || 0); // head-relative delay; seek into a straddled clip
       sources.push(source);
     }
     monitorGraph = { sumBus, sources, taps };
@@ -293,7 +293,7 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
   // ('measured'|'manual'|'none'). A measured/manual value aligns the overdub verbatim; when
   // uncalibrated ('none') the gate offset is AUTO-ESTIMATED from the live context + input track
   // (resolveMonitorLatencySec) instead of defaulting to 0 — see the shift computation below.
-  async function record({ slug, deviceId, routing, monitorLatencySec = 0, monitorLatencySource = 'none', existingTracks = [], clickConfig = null, drumConfig = null, autoStopSec = null, folderHandle = null, onPassOpen }) {
+  async function record({ slug, deviceId, routing, monitorLatencySec = 0, monitorLatencySource = 'none', existingTracks = [], headBar = 0, clickConfig = null, drumConfig = null, autoStopSec = null, folderHandle = null, onPassOpen }) {
     autoStopping = false;
     const acquired = await devices.acquireForRecording(deviceId);
     if (!acquired.ok) { onStatus && onStatus({ type: 'blocked' }); return { ok: false, denied: true }; }
@@ -335,7 +335,11 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
       for (const t of existingTracks) {
         for (const c of laneClips(t.meta)) {
           if (!c.file) continue;
-          monitorItems.push({ key: t.key, meta: t.meta, buffer: await loadStemBuffer(audioCtx, slug, c, folderHandle), startSec: (c.startBar || 0) * monitorBarSec });
+          // Schedule each backing clip RELATIVE to the record head (the Timeline may record at any
+          // bar; Mix always at 0). A clip before the head is skipped; one straddling it is seeked into.
+          const geo = clipPlayGeometry(c.startBar || 0, c.durationSec || 0, headBar, monitorBarSec);
+          if (!geo) continue;
+          monitorItems.push({ key: t.key, meta: t.meta, buffer: await loadStemBuffer(audioCtx, slug, c, folderHandle), delaySec: geo.delaySec, seekSec: geo.seekSec });
         }
       }
     }
@@ -664,18 +668,16 @@ export function makeTapeDeck({ onLevels, onClock, onStatus, onWriteError } = {})
       const s = playChains.stems[key];
       if (!s) continue;
       for (const c of s.clips) {
-        const clipStart = (c.startBar - headBar) * barSec;   // seconds from the head
-        const clipEnd = clipStart + c.durationSec;
-        if (clipEnd <= 0.0001) continue;                     // entirely before the head
+        const geo = clipPlayGeometry(c.startBar, c.durationSec, headBar, barSec); // shared with the record-time monitor
+        if (!geo) continue;                                  // entirely before the head
         const source = audioCtx.createBufferSource();
         source.buffer = c.buffer;
         source.connect(s.chain.input);
-        if (clipStart >= 0) source.start(startAt + clipStart);
-        else source.start(startAt, Math.min(-clipStart, Math.max(0, c.durationSec - 0.0005))); // seek into a straddled clip
+        source.start(startAt + geo.delaySec, geo.seekSec);   // delay to the head; seek into a straddled clip
         c.activeSource = source;
         any = true;
-        if (clipEnd > stemDur) stemDur = clipEnd;
-        if (clipEnd > primaryEnd) { primaryEnd = clipEnd; primary = source; }
+        if (geo.endSec > stemDur) stemDur = geo.endSec;
+        if (geo.endSec > primaryEnd) { primaryEnd = geo.endSec; primary = source; }
       }
     }
     const seqSec = drumSequenceSeconds(take);   // >0 only for a sequence take (else it loops)
