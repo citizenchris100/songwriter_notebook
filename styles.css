@@ -403,6 +403,8 @@ details p { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 6px
 .tltool.on { background: #2a2a2e; border-color: #39ff14; color: #39ff14; box-shadow: 0 0 0 1px #39ff14 inset; }
 .tltool:disabled { opacity: .4; cursor: not-allowed; }
 .tlhint { color: #8a9096; font-size: 12px; }
+.tlconfirm { display: flex; align-items: center; gap: 8px; }
+.tlconfirm-q { color: #e6c07b; font-size: 12px; }
 
 .tlscroll { overflow-x: auto; overflow-y: hidden; border: 1px solid #2a2a2e; border-radius: 8px; background: #141416; }
 .tlgrid { position: relative; }

@@ -402,7 +402,19 @@ function timelineBody(deck, handlers) {
       ? (deck.dupeSrc ? 'DUPE — click an empty spot in the lane to place the copy' : 'DUPE — click a clip to copy')
       : deck.tool.toUpperCase() + ' — click a clip')
     : (armedSet.size ? 'Click a bar to move the ● record head, then ● REC' : 'Click a bar to move the ▶ play head, then ▶ PLAY');
-  toolbar.appendChild(h('div', 'tlhint', hintText));
+  if (deck.pendingClipAction) {
+    const p = deck.pendingClipAction;
+    const cb = h('div', 'tlconfirm');
+    cb.appendChild(h('span', 'tlconfirm-q', p.type === 'delete' ? 'Delete this clip?' : 'Place the duplicate here?'));
+    const yes = h('button', 'btn mini primary', p.type === 'delete' ? 'Delete' : 'Duplicate');
+    yes.addEventListener('click', () => handlers.onConfirmClipAction());
+    const no = h('button', 'btn mini', 'Cancel');
+    no.addEventListener('click', () => handlers.onCancelClipAction());
+    cb.append(yes, no);
+    toolbar.appendChild(cb);
+  } else {
+    toolbar.appendChild(h('div', 'tlhint', hintText));
+  }
   box.appendChild(toolbar);
 
   // ---- scrollable grid: ruler + 4 lanes + the head, all sharing bar-0 = x-0 ----

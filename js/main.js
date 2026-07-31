@@ -108,6 +108,7 @@ let deckTab = 'mix';            // 'mix' | 'timeline' — the deck's active tab 
 let deckHead = 0;               // the timeline record/play HEAD bar (0 = song start); Timeline-only concept
 let deckTool = null;            // 'slice' | 'trim' | 'delete' | 'dupe' | null — the active timeline tool
 let deckDupeSrc = null;         // { key, clipId } — the clip the dupe tool picked, awaiting a target click
+let deckPendingClipAction = null; // { type:'delete'|'dupe', key, clipId, targetBar? } — awaiting the inline confirm
 let deckScrollLeft = 0;         // the timeline horizontal scroll offset, preserved across full re-renders
 let deckRecordingSlotKeys = []; // the in-flight pass's destination slot keys (meter routing + finalize)
 let deckRecordingGroup = null;  // the in-flight pass's group number
@@ -177,6 +178,7 @@ function resetTapeDeckUi() {
   deckHead = 0;
   deckTool = null;
   deckDupeSrc = null;
+  deckPendingClipAction = null;
   deckScrollLeft = 0;
   deckRecordingSlotKeys = [];
   deckRecordingGroup = null;
@@ -343,6 +345,7 @@ function tapeDeckViewModel(active) {
     head: deckHead,
     tool: deckTool,
     dupeSrc: deckDupeSrc,
+    pendingClipAction: deckPendingClipAction,
     scrollLeft: deckScrollLeft,
     barSec: takeModel.secPerBar({ click: clickConfig }),
     recordingSlotKeys: deckRecordingSlotKeys,
@@ -2054,24 +2057,36 @@ const handlers = {
       const out = edge === 'first' ? sliceWavBytes(bytes, bf, total) : sliceWavBytes(bytes, 0, total - bf);
       return { manifest: r.manifest, writes: [{ file: nw.file, bytes: out }], deletes: [src.file] };
     }),
-    // DELETE: remove a clip + its WAV.
-    onTimelineDelete: (key, clipId) => runClipEdit(async () => {
-      const r = takeModel.deleteClipFromLane(deckManifest, currentTake, key, clipId);
-      return { manifest: r.manifest, writes: [], deletes: r.removedFiles };
-    }),
-    // DUPE: pick a clip, then click a spot in its lane to place a snapped, non-overlapping copy.
+    // DELETE / DUPE: destructive/placement ops confirm inline first (the spec's "prompted if they
+    // want to..."). Click a clip -> a confirm bar; Confirm runs the op, Cancel drops it.
+    onTimelineDelete: (key, clipId) => { deckPendingClipAction = { type: 'delete', key, clipId }; render(); },
     onTimelineDupePick: (key, clipId) => { deckDupeSrc = { key, clipId }; render(); },
-    onTimelineDupePlace: (key, targetBar) => runClipEdit(async (take, slug) => {
-      if (!deckDupeSrc) return null;
-      const src = loadedLaneClips(take, deckDupeSrc.key).find((c) => c.id === deckDupeSrc.clipId);
-      if (!src) { deckDupeSrc = null; return null; }
-      const newId = newClipId();
-      const r = takeModel.dupeClipInLane(deckManifest, currentTake, deckDupeSrc.key, deckDupeSrc.clipId, targetBar, { newId });
-      const nw = clipOnLane(r.manifest, deckDupeSrc.key, newId);
-      const bytes = await readClipBytes(slug, src);
-      deckDupeSrc = null;
-      return { manifest: r.manifest, writes: nw ? [{ file: nw.file, bytes }] : [], deletes: [] };
-    }),
+    onTimelineDupePlace: (key, targetBar) => {
+      if (!deckDupeSrc) return;
+      deckPendingClipAction = { type: 'dupe', key: deckDupeSrc.key, clipId: deckDupeSrc.clipId, targetBar };
+      render();
+    },
+    onCancelClipAction: () => { deckPendingClipAction = null; deckDupeSrc = null; render(); },
+    onConfirmClipAction: () => {
+      const p = deckPendingClipAction; deckPendingClipAction = null; deckDupeSrc = null;
+      if (!p) { render(); return; }
+      if (p.type === 'delete') {
+        runClipEdit(async () => {
+          const r = takeModel.deleteClipFromLane(deckManifest, currentTake, p.key, p.clipId);
+          return { manifest: r.manifest, writes: [], deletes: r.removedFiles };
+        });
+      } else if (p.type === 'dupe') {
+        runClipEdit(async (take, slug) => {
+          const src = loadedLaneClips(take, p.key).find((c) => c.id === p.clipId);
+          if (!src) return null;
+          const newId = newClipId();
+          const r = takeModel.dupeClipInLane(deckManifest, currentTake, p.key, p.clipId, p.targetBar, { newId });
+          const nw = clipOnLane(r.manifest, p.key, newId);
+          const bytes = await readClipBytes(slug, src);
+          return { manifest: r.manifest, writes: nw ? [{ file: nw.file, bytes }] : [], deletes: [] };
+        });
+      } else { render(); }
+    },
 
     // TAPE LOG <details> open state. The <details> element reflects `open` in the DOM
     // itself, so this only records the flag for the next rebuild — no render (which would
