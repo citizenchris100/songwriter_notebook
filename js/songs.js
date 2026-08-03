@@ -9,7 +9,6 @@
 // presets-only section label (Verse, Chorus, …).
 
 import { validateSketchMeta, normalizeSketch } from './sketches.js';
-import { validateTake, normalizeTake, MANIFEST_SCHEMA } from './tape/takeModel.js';
 
 const SLUG = /^[a-z0-9][a-z0-9-]*$/;
 
@@ -46,21 +45,8 @@ export function validateSong(s) {
     else s.sketches.forEach((sk, i) => { const v = validateSketchMeta(sk); if (!v.ok) errors.push('sketch ' + i + ': ' + v.errors[0]); });
   }
 
-  // tapeDeck is an additive optional field: the song's take directory ref (path) PLUS a
-  // durable copy of its folder-saved take records (tapeDeck.takes), so opening a song restores
-  // its takes even after OPFS is evicted (the take audio itself still lives out-of-band in the
-  // song folder). Deliberately do NOT hard-fail the whole song over one malformed take record —
-  // that would make loadSongs drop the entire song (lyrics + progressions) over a bad drum grid;
-  // normalizeSong repairs it by dropping just the invalid entries.
-  if ('tapeDeck' in s) {
-    const td = s.tapeDeck;
-    if (td == null || typeof td !== 'object' || Array.isArray(td)) errors.push('tapeDeck must be an object');
-    else {
-      if (typeof td.path !== 'string' || td.path.length < 1) errors.push('tapeDeck.path must be a non-empty string');
-      if ('schemaVersion' in td && typeof td.schemaVersion !== 'number') errors.push('tapeDeck.schemaVersion must be a number');
-      if ('takes' in td && !Array.isArray(td.takes)) errors.push('tapeDeck.takes must be an array');
-    }
-  }
+  // A legacy `tapeDeck` field (the retired tape deck) is tolerated as an unknown key and
+  // dropped by normalizeSong — validateSong does not reject it.
 
   // file is an additive optional field: the LOCAL link between this song and the .json
   // file it was opened from / last saved to (name only; the writable handle, where the
@@ -114,18 +100,8 @@ export function normalizeSong(s) {
     // strip-unknown-keys behavior would delete it on every relaunch and orphan the audio).
     sketches: (s.sketches || []).map(normalizeSketch),
   };
-  // Same reasoning for tapeDeck: a known field, present only when the deck has actually been
-  // opened once (absent key, not null, when there is no deck). Preserve the durable saved-take
-  // records (tapeDeck.takes) too — dropping them here would delete them on every relaunch and
-  // undo the whole restore-on-open feature. Each entry is re-normalized (normalizeTake) and any
-  // invalid entry is dropped rather than failing the load. A legacy bare { path } record round-
-  // trips unchanged (takes omitted).
-  if (s.tapeDeck && typeof s.tapeDeck === 'object' && typeof s.tapeDeck.path === 'string') {
-    out.tapeDeck = { path: s.tapeDeck.path, schemaVersion: MANIFEST_SCHEMA };
-    if (Array.isArray(s.tapeDeck.takes)) {
-      out.tapeDeck.takes = s.tapeDeck.takes.filter((t) => validateTake(t).ok).map(normalizeTake);
-    }
-  }
+  // A legacy `tapeDeck` field (the retired tape deck) is intentionally NOT carried forward:
+  // omitting it here drops it from the in-memory record, so the next Save writes a clean .json.
   // Same reasoning for the file link: a known field, present only once a song has been
   // opened from or saved to a .json (absent key when unlinked). name only — the handle is
   // out-of-band. Reduced to { name } so a stray extra key can't ride along.
@@ -138,14 +114,9 @@ export function normalizeSong(s) {
 // ---- .json serialization + open reconciliation (the single source of truth) ----
 
 // Build the export-shaped song file (metadata only; the impure caller adds the base64 `audio`
-// map for sketches). This is the ONE writer of the .json's shape — song Save, tape-deck Save,
-// and duplicate all go through it — so embedding the durable tape-deck take records HERE makes
-// the .json the single source of truth: opening a song restores its takes with no folder read.
-// The take AUDIO stays out-of-band in the song folder, referenced by filename (only folder-saved
-// slots are here — see takeModel.projectTakesForJson, which feeds song.tapeDeck.takes). A FOREIGN
-// import strips tapeDeck (importOneSong) and the local `file` link is never written. Pure — so
-// the engine test proves the embed (the bug this replaces lived in impure main.js, untested, and
-// silently dropped tapeDeck from every .json).
+// map for sketches). This is the ONE writer of the .json's shape — song Save and duplicate both
+// go through it. The local `file` link is never written into the exported file. Pure — so the
+// engine test can load and assert it.
 export function toSongFile(s) {
   const out = {
     '$schema': './song.schema.json',
@@ -164,30 +135,7 @@ export function toSongFile(s) {
       id: sk.id, filename: sk.filename, mimeType: sk.mimeType, format: sk.format, size: sk.size, addedAt: sk.addedAt, notes: sk.notes,
     })),
   };
-  if (s.tapeDeck && typeof s.tapeDeck.path === 'string') {
-    out.tapeDeck = { path: s.tapeDeck.path, schemaVersion: MANIFEST_SCHEMA, takes: Array.isArray(s.tapeDeck.takes) ? s.tapeDeck.takes : [] };
-  }
   return out;
-}
-
-// Decide which tapeDeck a freshly opened/imported song should carry, so OPENING a .json can
-// never DESTROY durable take records the file itself doesn't contain (the invariant that stops
-// a tapeDeck-less .json from wiping the localStorage copy on re-open). Rules:
-//  - a foreign import, or any id reslug -> undefined (strip: the take audio isn't present and the
-//    refs would point at a dead takes/<id>/);
-//  - a faithful own-open whose incoming .json carries a tapeDeck whose path matches this id ->
-//    keep the incoming records (the .json is authoritative);
-//  - a faithful own-open whose incoming .json has NO (or a mismatched) tapeDeck, but the EXISTING
-//    in-memory record still holds saved takes -> keep the existing ones (never wipe; a later Save
-//    or the grant-migration re-embeds them into the .json).
-// Returns the tapeDeck object to set, or undefined to omit the field. Pure.
-export function resolveOpenedTapeDeck(incoming, existing, mode, reslug) {
-  if (mode !== 'open' || reslug) return undefined;
-  const inTd = incoming && incoming.tapeDeck;
-  if (inTd && typeof inTd.path === 'string' && inTd.path === 'takes/' + incoming.id + '/') return inTd;
-  const exTd = existing && existing.tapeDeck;
-  if (exTd && Array.isArray(exTd.takes) && exTd.takes.length) return exTd;
-  return undefined;
 }
 
 function normalizeProgression(p) {
@@ -367,10 +315,7 @@ export function finalizeDraft(draft, name, takenIds, now) {
 // (old id -> new id; the impure caller copies the audio blobs under the new ids and only
 // puts a mapping in for a blob it actually copied, so a sketch with no surviving bytes is
 // dropped — matching importOneSong), and stamps createdAt = updatedAt = now with a fresh
-// file link. The take AUDIO copy is impure (folder I/O), so the caller computes the slug-rekeyed
-// tapeDeck (from the source's durable takes, pruned to the WAVs it actually copied) and passes it
-// as opts.tapeDeck; embedding it here keeps the copy's .json the single source of truth. Pure
-// (ids + time injected), so the engine test can load it.
+// file link. Pure (ids + time injected), so the engine test can load it.
 export function duplicateSong(src, opts) {
   const o = opts || {};
   const id = String(o.id);
@@ -394,10 +339,6 @@ export function duplicateSong(src, opts) {
     sketches,
     file: { name: id + '.json' },
   };
-  // Carry the caller-computed, slug-rekeyed tapeDeck (present only when the copy actually owns
-  // take audio — see deckRestore.planDupeTakes / pruneTapeDeckToCopied), so the copy's .json is
-  // self-contained. Absent opt => a takeless duplicate, exactly as before.
-  if (o.tapeDeck && typeof o.tapeDeck.path === 'string') out.tapeDeck = o.tapeDeck;
   return out;
 }
 

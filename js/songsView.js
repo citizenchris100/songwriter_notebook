@@ -7,7 +7,6 @@ import { h } from './dom.js';
 import { SECTION_LABELS } from './songs.js';
 import { CHROMATIC_TONES, chordForTone } from './theory/roman.js';
 import { sketchesSection, makeSketchPlayer } from './sketchesView.js';
-import { buildDeckView } from './tape/tapeView.js';
 
 export function mountSongsView(container, handlers) {
   const {
@@ -16,7 +15,6 @@ export function mountSongsView(container, handlers) {
     onLyricsChange, onRenameSong, onDeleteSong, onDupeSong,
     onOpenSongPicker, onOpenSongText, onSaveSongFile, onExportMd,
     onAddSketch, onSelectSketch, onDeleteSketch, onSketchNotesChange, onLoadSketchBlob,
-    onOpenTapeDeck, onDeckLiveRefs,
   } = handlers;
 
   // An "Open…" control: native file picker → load a song's .json. Uses the File System
@@ -54,19 +52,6 @@ export function mountSongsView(container, handlers) {
     closePicker();               // drop any open chord picker before the view is rebuilt
     player.stop();               // pause any inline sketch playback before the DOM is torn down
     container.textContent = '';
-
-    // ---- the tape deck fully replaces the normal song-detail content while
-    // open (§5.6) — this is what makes AC-27's "Back + top tabs inert while
-    // recording" true for free: the song picker / delete / etc. simply aren't
-    // in the rebuilt tree to begin with. The AudioContext-owning controller
-    // itself lives in main.js (never torn down by this rebuild); this view
-    // only hands back the current render's live timer/meter/status DOM nodes.
-    if (vm && vm.songSubView === 'tapedeck' && vm.activeSong) {
-      const built = buildDeckView(vm.deck, handlers, vm.currentSongName);
-      onDeckLiveRefs(built.live);
-      container.appendChild(built.el);
-      return;
-    }
 
     const wrap = h('div', 'songswrap');
 
@@ -145,11 +130,6 @@ export function mountSongsView(container, handlers) {
 
     // ---- sketches (audio attachments) ----
     wrap.appendChild(sketchesSection(song, vm, { onAddSketch, onSelectSketch, onDeleteSketch, onSketchNotesChange }, player));
-
-    // ---- tape deck ----
-    const deckBtn = h('button', 'btn', '🎛 Tape Deck');
-    deckBtn.addEventListener('click', () => onOpenTapeDeck());
-    wrap.appendChild(rowOf(deckBtn));
 
     // ---- save / rename / delete ----
     wrap.appendChild(actionRow(vm));
@@ -234,18 +214,12 @@ export function mountSongsView(container, handlers) {
     renCancel.addEventListener('click', () => renBar.classList.add('hidden'));
     btns.appendChild(renameBtn);
 
-    // Delete (inline confirm, no native dialog). §5.7: also GC the song's OPFS
-    // takes — an inline note says so, with a live count when it's cheaply known
-    // (the deck was already opened this session) and a generic note otherwise.
+    // Delete (inline confirm, no native dialog).
     const delBtn = h('button', 'btn danger', 'Delete');
     const delBar = h('div', 'namebar hidden');
     const delOk = h('button', 'btn mini danger', 'Delete song');
     const delCancel = h('button', 'btn mini', 'Cancel');
     const delHint = [h('span', 'savehint', 'Delete this song permanently?')];
-    if (vm.deckHasTapeDeck) {
-      const n = vm.deckTakeCountForDelete;
-      delHint.push(h('span', 'savehint', typeof n === 'number' ? ('Also deletes ' + n + ' take(s).') : 'Also deletes this song’s tape-deck takes.'));
-    }
     delBar.append(...delHint, delOk, delCancel);
     delBtn.addEventListener('click', () => delBar.classList.remove('hidden'));
     delOk.addEventListener('click', () => onDeleteSong(vm.activeSong.id));
@@ -253,9 +227,8 @@ export function mountSongsView(container, handlers) {
     btns.appendChild(delBtn);
 
     // Dupe (sits beside Delete, neutral styling — it isn't destructive). Names the copy in an
-    // inline bar (like Rename); ✓/Enter fires onDupeSong, which then prompts for the destination
-    // folder (native picker) and writes a full copy — progressions, lyrics, sketches, and any
-    // tape-deck recordings — under the new name, then switches to it.
+    // inline bar (like Rename); ✓/Enter fires onDupeSong, which prompts for a save location and
+    // writes a full copy — progressions, lyrics, and sketches — under the new name, then switches to it.
     const dupeBtn = h('button', 'btn', 'Dupe');
     const dupeBar = h('div', 'namebar hidden');
     const dupeInput = h('input', 'nameinput'); dupeInput.type = 'text';
