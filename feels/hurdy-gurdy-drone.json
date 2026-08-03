@@ -1,0 +1,13 @@
+{
+  "$schema": "./feel.schema.json",
+  "id": "hurdy-gurdy-drone",
+  "name": "Hurdy Gurdy Drone",
+  "sections": [
+    { "label": "Verse", "progression": ["I", "iii", "IV", "V7"] },
+    { "label": "Chorus", "progression": ["bVII", "IV", "I"] }
+  ],
+  "description": "Major-key mixolydian drone: an I-iii-IV-V7 verse resolving into a bVII-IV-I chorus. In G it is the Hurdy Gurdy Man record (G-Bm-C-D7 verse, F-C-G chorus). The major-key bVII is the hook.",
+  "tags": ["donovan", "mickie-most", "mixolydian", "bVII", "drone", "psych"],
+  "source": "Donovan + Mickie Most (1966-69), via Ultimate Guitar chord sheets, from Hurdy Gurdy Man",
+  "schemaVersion": 3
+}

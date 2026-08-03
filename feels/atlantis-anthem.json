@@ -1,0 +1,13 @@
+{
+  "$schema": "./feel.schema.json",
+  "id": "atlantis-anthem",
+  "name": "Atlantis Anthem",
+  "sections": [
+    { "label": "Main", "progression": ["I", "II", "IV", "I", "V"] },
+    { "label": "Coda", "progression": ["I", "VI", "II", "VII", "IV", "II", "V", "III"] }
+  ],
+  "description": "Bright major-II build: a I-II-IV-I-V main loop where the major II is the signature color, plus a parallel-major planing coda. In C it is the Atlantis record (C-D-F-C-G main; C-A-D-B-F-D-G-E fade).",
+  "tags": ["donovan", "mickie-most", "major-II", "anthem", "planing"],
+  "source": "Donovan + Mickie Most (1966-69), via Ultimate Guitar chord sheets, from Atlantis",
+  "schemaVersion": 3
+}

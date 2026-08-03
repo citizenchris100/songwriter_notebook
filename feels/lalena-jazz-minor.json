@@ -1,0 +1,10 @@
+{
+  "$schema": "./feel.schema.json",
+  "id": "lalena-jazz-minor",
+  "name": "Lalena (Jazz Minor)",
+  "progression": ["i", "v", "i", "v", "iv", "bVII7", "bIII", "V7"],
+  "description": "Functional jazzy minor: an i-v pendulum, a iv-bVII7-bIII cell that tonicizes the relative major, and a real V7 turnaround back to i. In Am it is the Lalena record (Am-Em-Dm-G7-C-E7).",
+  "tags": ["donovan", "mickie-most", "jazzy-minor", "functional-minor"],
+  "source": "Donovan + Mickie Most (1966-69), via Ultimate Guitar chord sheets, from Lalena",
+  "schemaVersion": 2
+}

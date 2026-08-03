@@ -1,0 +1,13 @@
+{
+  "$schema": "./feel.schema.json",
+  "id": "sunshine-raga-vamp",
+  "name": "Sunshine Raga Vamp",
+  "sections": [
+    { "label": "Main", "progression": ["I7", "IV7"] },
+    { "label": "Turnaround", "progression": ["IV7", "V7", "I7"] }
+  ],
+  "description": "Donovan and Mickie Most dominant-7 tonic drone: a static I7-IV7 raga vamp with a IV7-V7-I7 turnaround. In A it is Season of the Witch (A7-D7); in E it is Barabajagal (E7-A7). The dominant-quality tonic is the signature.",
+  "tags": ["donovan", "mickie-most", "dominant-vamp", "raga", "mixolydian"],
+  "source": "Donovan + Mickie Most (1966-69), via Ultimate Guitar chord sheets, 12-song aggregate (Sunshine Superman, Season of the Witch, Barabajagal)",
+  "schemaVersion": 3
+}
